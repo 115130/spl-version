@@ -1,0 +1,210 @@
+# 第 5 章 · 时钟系统（SPL版）
+
+> **本章产出**：看懂时钟树、手写 72MHz 时钟配置、用 SysTick 实现精确延时
+>
+> **用到项目的哪里**：时钟是系统心跳——USB 需要 48MHz、UART 波特率依赖时钟精度、低功耗需要切时钟源、所有外设使用前必须开时钟
+
+---
+
+## 5.1 为什么需要时钟树
+
+你 PC 的 CPU 有一个主频。但 PC 里还有很多其他频率：内存总线、PCIe、USB、SATA——它们都跑不同的频率。
+
+STM32 也一样。不同外设需要不同频率：
+
+| 外设 | 需要的时钟 | 为什么 |
+|------|-----------|--------|
+| CPU 内核 | 尽量快 | 程序跑得快 |
+| USB | 精确 48MHz | USB 协议要求 |
+| USART | 精确时钟 | 波特率（115200）需要时钟分频 |
+| 定时器 | 灵活 | 有时要快（PWM），有时要慢（秒级） |
+| IWDG | 独立于系统时钟 | 系统时钟挂了，看门狗还要能复位 |
+
+所以 STM32 设计了一套**时钟树**——多时钟源 + PLL 倍频 + 多级分频器 = 给每个部件提供恰当的频率。
+
+## 5.2 STM32F103 时钟树全解析
+
+### 时钟源
+
+| 时钟 | 全称 | 频率 | 特点 |
+|------|------|------|------|
+| **HSI** | 高速内部 RC 振荡器 | 8MHz | 芯片内置，精度差（±1%），上电默认 |
+| **HSE** | 高速外部晶振 | 4-16MHz（常用 8MHz） | 板上晶振，精度高（±几十 ppm） |
+| **LSI** | 低速内部 RC 振荡器 | ~40kHz | 给独立看门狗和 RTC 用 |
+| **LSE** | 低速外部晶振 | 32.768kHz | 给 RTC 提供精确 1 秒时基（2¹⁵ = 32768） |
+
+> **ppm**（百万分之一）：±30ppm 的 8MHz 晶振实际偏差不超过 240Hz，做 UART 通信够用。HSI 的 ±1% = 10,000 ppm，做高波特率通信可能出错。
+
+### 时钟流向
+
+```
+HSI (8MHz) ──┐
+HSE (8MHz) ──→ /1 ──→ PLL ──×2~16──→ PLLCLK (最高 72MHz)
+                                    │
+                                    ├──→ SYSCLK ──→ HCLK ──→ CPU / SRAM / DMA
+                                    │       │
+                                    │       ├──→ PCLK1 (APB1, 最大36MHz)
+                                    │       │     → TIM2-7, USART2-5, I2C, SPI2/3
+                                    │       │
+                                    │       └──→ PCLK2 (APB2, 最大72MHz)
+                                    │             → GPIO, TIM1/8, USART1, SPI1, ADC
+                                    │
+                                    └──→ USB 预分频器 ──→ 48MHz to USB
+
+LSE (32.768kHz) ──→ RTC
+LSI (~40kHz)     ──→ 独立看门狗 IWDG
+```
+
+**关键约束**：
+- PCLK1 (APB1) 最大 36MHz
+- USB 必须用 PLL 输出 48MHz
+- 所有外设使用前必须先开时钟——GPIO/APB2 上的 `RCC_APB2PeriphClockCmd`，APB1 上的 `RCC_APB1PeriphClockCmd`
+
+### ⚠️ Flash 等待周期（Core Coupling）
+
+系统时钟 > 24MHz 时，必须配置 Flash 等待周期：
+
+| SYSCLK 范围 | Flash Latency |
+|-------------|---------------|
+| 0 - 24MHz   | 0 WS |
+| 24 - 48MHz  | 1 WS |
+| 48 - 72MHz  | 2 WS |
+
+**忘了配 → 72MHz 下读 Flash 出错 → 程序随机崩溃！**
+
+---
+
+## 5.3 SPL 手写 72MHz 时钟配置
+
+HAL 版用 CubeMX 自动生成 `SystemClock_Config()`。SPL 版自己写，每一个参数都显式指定：
+
+```c
+#include "stm32f10x_rcc.h"
+#include "stm32f10x_flash.h"
+
+void SystemClock_Config(void) {
+    // ① 开启 HSE（外部 8MHz），等稳定
+    RCC_HSEConfig(RCC_HSE_ON);
+    while (RCC_GetFlagStatus(RCC_FLAG_HSERDY) == RESET);
+
+    // ② Flash 等待周期——72MHz 必须 2 WS
+    FLASH_SetLatency(FLASH_Latency_2);
+    FLASH_PrefetchBufferCmd(ENABLE);
+
+    // ③ PLL：HSE 8MHz × 9 = 72MHz
+    RCC_PLLConfig(RCC_PLLSource_HSE_Div1, RCC_PLLMul_9);
+
+    // ④ 开启 PLL，等锁定
+    RCC_PLLCmd(ENABLE);
+    while (RCC_GetFlagStatus(RCC_FLAG_PLLRDY) == RESET);
+
+    // ⑤ AHB/APB1/APB2 分频
+    RCC_HCLKConfig(RCC_SYSCLK_Div1);   // HCLK  = 72MHz
+    RCC_PCLK1Config(RCC_HCLK_Div2);    // PCLK1 = 36MHz
+    RCC_PCLK2Config(RCC_HCLK_Div1);    // PCLK2 = 72MHz
+
+    // ⑥ 切换系统时钟到 PLL
+    RCC_SYSCLKConfig(RCC_SYSCLKSource_PLLCLK);
+    while (RCC_GetSYSCLKSource() != 0x08);  // 等 SWS = PLL
+}
+```
+
+在 `main()` 开头调用：
+
+```c
+int main(void) {
+    SystemClock_Config();  // ← 系统跑在 72MHz
+    // ...
+}
+```
+
+> ⚠️ SPL 自带的 `SystemInit()`（在 `system_stm32f10x.c`）默认保持 HSI 8MHz。你要在 `main()` 手动调上面的 `SystemClock_Config()` 切到 72MHz。
+
+---
+
+## 5.4 SysTick 定时器原理
+
+SysTick 是 **Cortex-M3 内核内置**的 24 位递减定时器，不属于 ST 的外设。所有 Cortex-M 芯片都有，用起来一样：
+
+```
+LOAD 寄存器（24 位计数初值）
+   ↓
+VAL  寄存器（当前值）—— 每个时钟周期减 1
+   ↓ 减到 0
+   触发 SysTick 中断（如果使能了）
+   ↓
+VAL 自动重装载为 LOAD 的值，继续递减...
+```
+
+时钟源可选：
+- **HCLK**（72MHz）：每周期 ~13.9ns
+- **HCLK/8**（9MHz）：每周期 ~111ns
+
+## 5.5 SPL 实现 SysTick 精确延时
+
+```c
+#include "stm32f10x.h"
+
+static volatile uint32_t sys_tick_ms = 0;
+
+// SysTick 中断服务函数——每个 tick 加 1
+void SysTick_Handler(void) {
+    sys_tick_ms++;
+}
+
+// 初始化——每 1ms 中断一次
+void SysTick_Init(void) {
+    // SysTick 时钟 = HCLK/8 = 9MHz, 1ms = 9000 个周期
+    SysTick_Config(SystemCoreClock / 8 / 1000);
+}
+
+// 获取运行毫秒数
+uint32_t GetTick(void) {
+    return sys_tick_ms;
+}
+
+// 毫秒延时（精确，不依赖空循环的 CPU 频率）
+void Delay_ms(uint32_t ms) {
+    uint32_t start = sys_tick_ms;
+    while ((sys_tick_ms - start) < ms);
+}
+```
+
+在 `main()` 中初始化：
+
+```c
+int main(void) {
+    SystemClock_Config();
+    SysTick_Init();
+
+    while (1) {
+        GPIO_ResetBits(GPIOB, GPIO_Pin_5);
+        Delay_ms(500);   // 精确 500ms
+        GPIO_SetBits(GPIOB, GPIO_Pin_5);
+        Delay_ms(500);
+    }
+}
+```
+
+**`Delay_ms` 仍然是阻塞的**——CPU 在 `while` 里空转。后面学中断（第 6 章）和 RTOS（第 14 章）来解决阻塞问题。
+
+### ⚠️ SysTick_Handler 名字不能改
+
+它是启动文件 `startup_stm32f10x_hd.s` 里写死的弱符号——改了就 Hard Fault。
+
+---
+
+## 5.6 SPL vs HAL 时钟对照
+
+| 操作 | SPL | HAL |
+|------|-----|-----|
+| 时钟配置 | 手写 `SystemClock_Config()` | CubeMX 生成 |
+| SysTick 初始化 | `SysTick_Config(9000)` | `HAL_Init()` 内部自动 |
+| 延时 | `Delay_ms()`（自己写） | `HAL_Delay()` |
+| 获取 tick | `GetTick()`（自己写） | `HAL_GetTick()` |
+
+---
+
+> **下一章**：[第 6 章 · 中断系统（SPL版）](./06-chapter.md)
+>
+> Delay_ms 太蠢了——CPU 卡在那什么都干不了。中断就是来解决这个的：事件发生 → 打断 CPU → 处理完 → 回去。这是嵌入式最核心的机制。
