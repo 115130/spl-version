@@ -1,10 +1,12 @@
 # 第 16 章 · FreeRTOS 实战（SPL版）
 
-> 多任务传感器系统：用 FreeRTOS 管理数据采集任务，用 SPL 初始化 I2C/SPI/UART 外设。任务架构和 FreeRTOS API 调用是通用的，本章给 SPL 版完整代码。
+> 用 FreeRTOS 搭建一个四任务传感器采集系统：SensorTask → Queue → DisplayTask + LogTask，外加按键 ISR → 信号量 → ButtonTask。完整的 SPL 版项目代码，可直接编译运行。
 
 ---
 
-## 四任务系统（SPL 外设 + FreeRTOS）
+## 16.1 四任务架构
+
+## 16.2 完整代码
 
 ```
 SensorTask(prio 3, 256w)  ──Queue──→ DisplayTask(prio 2, 256w)
@@ -179,7 +181,7 @@ int main(void) {
 }
 ```
 
-### 编译运行
+## 16.3 编译运行
 
 ```bash
 make

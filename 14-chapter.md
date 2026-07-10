@@ -1,240 +1,373 @@
 # 第 14 章 · 为什么需要 RTOS（SPL版）
 
-> 裸机只有一个 while(1)——复杂项目里多任务协调困难。RTOS 用抢占式调度解决这个问题。FreeRTOS 和 SPL/HAL 无关——它的 API 在两个库里调用方式完全一样。
+## 14.1 裸机 while(1) 的局限
 
----
-
-## SPL 版和 HAL 版的不同
-
-HAL 版第 14 章提到「CubeMX 一键配置 FreeRTOS」。SPL 版没有 CubeMX——你需要**手动把 FreeRTOS 源码加入工程**。
-
-这听起来更麻烦，但手动移植 FreeRTOS 有一个巨大的好处：**你彻底理解了 RTOS 是怎么跑在 MCU 上的**。你会知道：
-- `FreeRTOSConfig.h` 里每一项配置的含义
-- SysTick 是怎么被 FreeRTOS 劫持的
-- 为什么 `vTaskDelay` 能工作而你的 `Delay_ms` 不能共存了
-
----
-
-## 手动添加 FreeRTOS 到 SPL 工程
-
-### Step 1：下载 FreeRTOS
-
-```bash
-git clone https://github.com/FreeRTOS/FreeRTOS-Kernel.git
-cd FreeRTOS-Kernel
-git checkout V10.5.1  # 稳定版本
-```
-
-只需要这几个文件：
-
-```
-FreeRTOS-Kernel/
-├── croutine.c
-├── event_groups.c
-├── list.c
-├── queue.c
-├── stream_buffer.c
-├── tasks.c
-├── timers.c
-├── include/
-│   ├── FreeRTOS.h
-│   ├── task.h
-│   ├── queue.h
-│   ├── semphr.h
-│   └── ...
-└── portable/
-    └── GCC/ARM_CM3/          ← 你要这个！
-        ├── port.c
-        ├── portmacro.h
-        └── portasm.c  (或 .s)
-```
-
-### Step 2：拷贝到 SPL 工程
-
-```bash
-mkdir ~/stm32/your-project/freertos
-cp -r FreeRTOS-Kernel/*.c ~/stm32/your-project/freertos/
-cp -r FreeRTOS-Kernel/include ~/stm32/your-project/freertos/
-cp -r FreeRTOS-Kernel/portable/GCC/ARM_CM3/* ~/stm32/your-project/freertos/
-```
-
-### Step 3：写 `FreeRTOSConfig.h`
-
-这是最关键的一步——告诉 FreeRTOS 你的 MCU 参数：
+前 13 章你写的程序都是这种结构：
 
 ```c
-#ifndef FREERTOS_CONFIG_H
-#define FREERTOS_CONFIG_H
+int main(void) {
+    // 初始化全部外设
+    LED_Init();
+    USART1_Init();
+    ADC1_Init();
 
-#define configUSE_PREEMPTION            1
-#define configUSE_TIME_SLICING          1
-#define configUSE_PORT_OPTIMISED_TASK_SELECTION 0
-#define configUSE_TICKLESS_IDLE         0
-#define configCPU_CLOCK_HZ              (72000000UL)  // ← 你的系统时钟
-#define configTICK_RATE_HZ              (1000)         // 1ms tick
-#define configMAX_PRIORITIES            (8)
-#define configMINIMAL_STACK_SIZE        ((unsigned short)128)
-#define configTOTAL_HEAP_SIZE           ((size_t)(10 * 1024))  // 10KB 堆
-#define configMAX_TASK_NAME_LEN         (16)
-#define configUSE_16_BIT_TICKS          0
-#define configIDLE_SHOULD_YIELD         1
-#define configUSE_MUTEXES               1
-#define configUSE_COUNTING_SEMAPHORES   1
-#define configQUEUE_REGISTRY_SIZE       8
-
-// 钩子函数
-#define configUSE_IDLE_HOOK             0
-#define configUSE_TICK_HOOK             0
-#define configCHECK_FOR_STACK_OVERFLOW  2  // 检测栈溢出
-
-// 软件定时器
-#define configUSE_TIMERS               1
-#define configTIMER_TASK_PRIORITY      (2)
-#define configTIMER_QUEUE_LENGTH       10
-#define configTIMER_TASK_STACK_DEPTH   (256)
-
-// 内存管理方案——用 heap_4.c（合并相邻空闲块）
-#define configSUPPORT_DYNAMIC_ALLOCATION 1
-
-// 中断优先级（Cortex-M3 特定）
-#define configKERNEL_INTERRUPT_PRIORITY   (15 << 4)
-#define configMAX_SYSCALL_INTERRUPT_PRIORITY (5 << 4)
-
-// 钩子声明
-void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName);
-void vAssertCalled(const char *file, int line);
-
-#define configASSERT(x) if((x)==0) vAssertCalled(__FILE__, __LINE__)
-
-#endif
-```
-
-### Step 4：修改 SysTick 中断
-
-FreeRTOS 会接管 SysTick 做系统心跳。你的 `SysTick_Handler` 需要改成：
-
-```c
-// 在 main.c 中（替换你第 5 章写的 SysTick_Handler）
-void SysTick_Handler(void) {
-    // 告诉 FreeRTOS tick 到了
-    if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
-        xPortSysTickHandler();
+    while (1) {
+        LED_Toggle();              // 每 500ms 闪灯
+        uint16_t adc = ADC1_Read(); // 读 ADC
+        printf("ADC=%d\r\n", adc);
+        Delay_ms(100);
     }
 }
 ```
 
-**同时删掉你自己写的 `GetTick()` 和 `Delay_ms()`**——FreeRTOS 提供了 `xTaskGetTickCount()` 和 `vTaskDelay()` 来替代它们。
+这个 `while(1)` 大循环在项目简单时够用。但随着你加入越来越多的功能，问题开始暴露：
 
-### Step 5：修改 Makefile
+### 场景 1：一件事阻塞了所有事
 
-```makefile
-# FreeRTOS 源文件加入编译
-FREERTOS_DIR = freertos
-C_SRCS += $(FREERTOS_DIR)/tasks.c
-C_SRCS += $(FREERTOS_DIR)/queue.c
-C_SRCS += $(FREERTOS_DIR)/list.c
-C_SRCS += $(FREERTOS_DIR)/timers.c
-C_SRCS += $(FREERTOS_DIR)/port.c
-C_SRCS += $(FREERTOS_DIR)/heap_4.c
-
-# FreeRTOS 头文件路径
-CFLAGS += -I$(FREERTOS_DIR)/include
-CFLAGS += -I$(FREERTOS_DIR)
-```
-
----
-
-## SPL + FreeRTOS 的 Task 代码
-
-和 HAL 版第 15-16 章对比一下——核心逻辑**完全一样**，只是底层外设操作走 SPL：
+假设你加了一个「每 30 秒写一次 SD 卡日志」的功能：
 
 ```c
-#include "FreeRTOS.h"
-#include "task.h"
-#include "queue.h"
-#include "semphr.h"
-
-#include "stm32f10x_gpio.h"
-#include "stm32f10x_rcc.h"
-
-// ===== LED 初始化（SPL 风格）=====
-void LED_Init(void) {
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
-    GPIO_InitTypeDef gpio;
-    GPIO_StructInit(&gpio);
-    gpio.GPIO_Pin   = GPIO_Pin_13;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
-    GPIO_Init(GPIOC, &gpio);
-}
-
-// ===== LED 闪烁任务 =====
-void Task_LED(void *arg) {
-    for (;;) {
-        GPIOC->ODR ^= GPIO_Pin_13;                     // SPL 风格翻转
-        vTaskDelay(pdMS_TO_TICKS(500));                 // FreeRTOS 延时
+while (1) {
+    LED_Toggle();          // ① 闪灯
+    ProcessUART();         // ② 处理串口命令
+    if (uwTick % 30000 == 0) {
+        WriteSD_Log();     // ③ 写 SD 卡——耗时 200ms！
     }
 }
+```
 
-// ===== 按键检测任务（中断 → 信号量 → 任务）=====
-SemaphoreHandle_t button_sem;
+**问题**：`WriteSD_Log()` 执行的那 200ms 里，LED 不闪了（卡在灭或亮的状态），串口来了命令也不处理了。因为裸机是**顺序执行**——一个函数不返回，后面的代码永远轮不到。
 
-// EXTI 中断 ISR
-void EXTI0_IRQHandler(void) {
-    if (EXTI_GetITStatus(EXTI_Line0) != RESET) {
-        EXTI_ClearITPendingBit(EXTI_Line0);
-        BaseType_t wake = pdFALSE;
-        xSemaphoreGiveFromISR(button_sem, &wake);
-        portYIELD_FROM_ISR(wake);
-    }
-}
+### 场景 2：定时任务不准
 
-void Task_Button(void *arg) {
-    for (;;) {
-        if (xSemaphoreTake(button_sem, portMAX_DELAY) == pdTRUE) {
-            vTaskDelay(pdMS_TO_TICKS(30));  // 消抖
-            if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_RESET) {
-                // 按键处理...
-            }
+用 `uwTick % 500 == 0` 来做 LED 定时翻转——但如果某次循环因为等 ADC、等 UART 耗时超过了 500ms，LED 的翻转时机就会乱掉。所有「定时」在裸机里都是**近似值**，取决于大循环里最慢的那个函数。
+
+### 场景 3：代码越改越乱
+
+当你有「收到串口 AT 命令 → 读温度 → 显示到 OLED → 同时 LED 呼吸指示模式」，你会写成：
+
+```c
+while (1) {
+    if (UART_DataReady()) {
+        ParseCMD();         // 解析命令
+        switch (mode) {
+            case SHOW_TEMP: ReadTemp(); break;
+            case SHOW_OLED: OLED_Update(); break;
         }
+    }
+    LED_Breath();            // 呼吸灯
+    OLED_Update();           // 刷新显示
+    CheckKey();              // 检测按键
+    // 这里顺序和优先级不可控……
+}
+```
+
+所有逻辑混在一起。想加一个新功能就要改这个大循环，怕改崩旧功能。**项目的复杂度从「能不能跑」变成「能不能维护」了。**
+
+### 你前 13 章做过的项目，哪些会碰到这些问题？
+
+| 项目 | 裸机能搞定吗 | 为什么 |
+|------|------------|--------|
+| 第 3 章：按键点灯 | ✅ 简单 | 就一件事 |
+| 第 8 章：UART 指令控制台 | ⚠️ 勉强 | 加个定时器读传感器就开始乱了 |
+| 第 8 章实验②：WiFi 发数据 | ❌ 痛苦 | 配网 10 秒 → 发数据 500ms，期间按键、LED 全挂 |
+| 第 10 章：I2C 读 MPU6050 + OLED 显示 | ❌ 混乱 | 要同时读传感器、刷新显示、处理命令 |
+| 物联网网关（后面 21-24 章）| ❌ 不可能 | 同时跑 WiFi、MQTT、传感器、OLED、按键 |
+
+## 14.2 RTOS 的解法：从一个大循环拆成多个小循环
+
+RTOS（Real-Time Operating System，实时操作系统）做的事很简单：**让你把程序拆成多个独立的死循环（称为 Task/任务），每个任务只关心自己那一件事。内核帮你决定哪个任务占用 CPU、什么时候切换。**
+
+裸机的思维：
+
+```c
+while (1) {
+    做A();
+    做B();
+    做C();
+}
+```
+
+RTOS 的思维：
+
+```c
+void TaskA(void *pv) { while (1) { 做A(); } }   // 独立
+void TaskB(void *pv) { while (1) { 做B(); } }   // 独立
+void TaskC(void *pv) { while (1) { 做C(); } }   // 独立
+```
+
+### 具体对比：第 8 章 WiFi 实验的裸机 vs RTOS
+
+**裸机版**（你第 8 章写的）：
+
+```c
+int main(void) {
+    USART1_Init(); USART2_Init();
+    WiFi_AT_Setup();                     // 配网——耗时长
+    while (1) {
+        temp = ReadTemp();
+        WiFi_SendData(temp);              // 发数据——阻塞
+        Delay_ms(5000);
+        // 这时候按键不响应、LED 不闪
+    }
+}
+```
+
+**RTOS 版**：
+
+```c
+void TaskWiFi(void *pv) {                // 任务 A：只管 WiFi
+    WiFi_AT_Setup();
+    while (1) {
+        WiFi_SendData(ReadTemp());
+        vTaskDelay(5000);
+    }
+}
+
+void TaskLED(void *pv) {                 // 任务 B：只管闪灯
+    while (1) {
+        LED_Toggle();
+        vTaskDelay(500);
+    }
+}
+
+void TaskKey(void *pv) {                 // 任务 C：只管按键
+    while (1) {
+        if (Key_Pressed()) mode++;
+        vTaskDelay(20);
     }
 }
 
 int main(void) {
-    SystemClock_Config();
-    LED_Init();
-    Button_EXTI_Init();
-
-    // 创建信号量
-    button_sem = xSemaphoreCreateBinary();
-
-    // 创建任务
-    xTaskCreate(Task_LED,   "LED",   128, NULL, 2, NULL);
-    xTaskCreate(Task_Button,"Button",256, NULL, 3, NULL);
-
-    // 启动调度器——此函数永不返回
-    vTaskStartScheduler();
-
-    while (1);  // 永远不会执行到这里
+    xTaskCreate(TaskWiFi, "WiFi", ...);
+    xTaskCreate(TaskLED,  "LED",  ...);
+    xTaskCreate(TaskKey,  "Key",  ...);
+    vTaskStartScheduler();               // 启动！三个任务「同时」跑
+    while (1);                           // 永不执行到这里
 }
 ```
 
+三个任务各跑各的。当 TaskWiFi 在 `vTaskDelay(5000)` 睡眠时，CPU 自动去跑 TaskLED 和 TaskKey。当 TaskWiFi 的 `WiFi_SendData()` 在执行时，它也在跑——但 500ms 后 TaskLED 的时间到了，**内核会强行打断** WiFi 任务，让 LED 先翻转，再回来继续发 WiFi。这就是**抢占式调度**。
+
+### RTOS 解决的核心问题总结
+
+| 裸机问题 | RTOS 的解法 |
+|---------|------------|
+| 一个函数阻塞，全系统卡住 | **多任务**：一个任务阻塞，其他任务继续运行 |
+| 定时不精确 | **调度器**：内核强制切换，高优先级任务准时执行 |
+| 代码难以维护 | **职责分离**：每个 task 只干一件事，改一个不影响其他 |
+| 新功能难加 | **即插即用**：新建一个 task 文件，跟已有 task 零耦合 |
+
+### 什么时候用 RTOS，什么时候不用
+
+| 适合裸机 | 适合 RTOS |
+|---------|----------|
+| 只有一个独立功能 | 多个任务需要「同时」运行 |
+| 逻辑简单（读按键→亮灯）| 涉及无线通信（WiFi/BLE 有长延迟）|
+| 实时性要求不高 | 有严格的时序要求 |
+| 代码 < 1000 行 | 代码 > 5000 行，多人协作 |
+
+对于后面第 17-30 章（WiFi、MQTT、网关、三个综合项目），**没有 RTOS 几乎不可能组织代码**。这就是现在学 FreeRTOS 的原因。
+
 ---
 
-## 关键区别总结
+## 14.3 自己动手：一个最简抢占式调度器（50 行）
 
-| | HAL 版 Part 4 | SPL 版 Part 4 |
+FreeRTOS 几千行。但抢占式多任务的核心，只靠 **SysTick + PendSV + 任务控制块** 三个机制就能实现。Cortex-M3 为此提供了完美的硬件支持。
+
+### 核心数据结构
+
+每个任务只需要保存自己的栈指针：
+
+```c
+#define MAX_TASKS  4
+struct TCB {
+    uint32_t *sp;                  // 栈指针——任务切换时只需换这个
+    uint32_t  stack[128];          // 每个任务 512 字节栈
+};
+struct TCB tasks[MAX_TASKS];
+volatile int current_task = 0;
+```
+
+### SysTick——触发调度
+
+```c
+void SysTick_Handler(void) {
+    // 设 PendSV 位——等当前 ISR 处理完再切换
+    SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
+}
+```
+
+SysTick 只设一个标志位。PendSV 是 Cortex-M3 优先级最低的异常，它会等所有更高级的中断处理完才执行——**绝不会在另一个 ISR 中间切任务**。
+
+### PendSV——真正的上下文切换
+
+汇编写，约 20 行：
+
+```asm
+PendSV_Handler:
+    MRS r0, PSP              ; 读当前任务的栈指针
+    STMDB r0!, {r4-r11}      ; 保存 r4~r11 到栈上
+                             ; r0~r3, r12, LR, PC, xPSR 已被硬件自动压栈
+    ; 保存当前任务的 sp 到 TCB
+    LDR r1, =current_task
+    LDR r2, [r1]             ; current_task id
+    LDR r3, =tasks
+    MOV r4, #16              ; sizeof(struct TCB) = 16
+    MLA r2, r2, r4, r3
+    STR r0, [r2]             ; tasks[id].sp = current SP
+
+    ; 选下一个任务（轮转）
+    LDR r2, [r1]             ; 重新加载 current_task
+    ADD r2, r2, #1
+    CMP r2, #MAX_TASKS-1
+    ITT GT
+    MOVGT r2, #0
+    STR r2, [r1]             ; current_task = (current_task+1) % MAX_TASKS
+
+    ; 恢复新任务的寄存器
+    MOV r4, #16
+    MLA r2, r2, r4, r3
+    LDR r0, [r2]             ; 新任务的 sp
+    LDMIA r0!, {r4-r11}      ; 弹出 r4~r11
+    MSR PSP, r0              ; 设 PSP 为新任务的栈
+    BX LR                    ; 返回→硬件自动弹出 r0~r3, PC, xPSR→新任务跑起来了
+```
+
+**硬件帮了大忙**：进入 PendSV 时，CPU 自动把 r0-r3、r12、LR、PC、xPSR 压栈了；`BX LR` 返回时硬件自动弹出。你只需要手动保存/恢复 r4-r11。
+
+### 创建任务
+
+创建任务本质是**伪造一个栈帧**——看起来刚刚被中断过：
+
+```c
+void TaskCreate(void (*func)(void), int id) {
+    uint32_t *sp = &tasks[id].stack[128];
+    *--sp = 0x01000000;              // xPSR（Thumb 位 = 1，必须）
+    *--sp = (uint32_t)func;           // PC = 任务入口地址
+    *--sp = 0xFFFFFFFD;               // LR = 异常返回 magic 值（回到线程模式+PSP）
+    *--sp = 0x0C; *--sp = 0x03;      // r12, r3, r2, r1, r0
+    *--sp = 0x02; *--sp = 0x01;
+    *--sp = 0x00;
+    for (int i = 0; i < 8; i++) *--sp = 0;   // r4~r11
+    tasks[id].sp = sp;
+}
+```
+
+### 启动调度器
+
+```c
+void StartScheduler(void) {
+    __set_PSP((uint32_t)tasks[0].sp);        // 设 PSP 指向任务 0 的栈
+    SysTick_Config(SystemCoreClock / 1000);  // 1ms tick
+    SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;     // 触发一次切换→跑任务 0
+    __set_CONTROL(0x03);                     // 切换到线程模式+PSP
+    __ISB();
+    asm("SVC 0");                            // 触发 SVC→跳 PendSV→第一个任务开始
+}
+```
+
+### 两个任务跑起来
+
+```c
+void Task1(void) {
+    while (1) { GPIOC->ODR ^= GPIO_Pin_13;  /* LED toggle */  }
+}
+void Task2(void) {
+    while (1) { /* 另一个任务 */ }
+}
+
+int main(void) {
+    TaskCreate(Task1, 0);
+    TaskCreate(Task2, 1);
+    StartScheduler();
+    while (1);   // 永不执行到这里
+}
+```
+
+### 这个迷你 RTOS vs FreeRTOS
+
+| 功能 | 迷你 RTOS | FreeRTOS |
+|------|----------|----------|
+| 抢占式调度 | ✅ 轮转 | ✅ 可配优先级 8~32 级 |
+| vTaskDelay | ❌ 自己加链表 | ✅ |
+| 信号量/队列 | ❌ | ✅ |
+| 代码量 | **~50 行** | ~8000 行 |
+| 工业级可靠性 | ❌ | ✅ 数亿设备验证 |
+
+这证明了抢占式调度的本质就那么几行——SysTick 里设 PendSV 位，PendSV 里保存寄存器+换 SP。FreeRTOS 在这之上加了优先级、阻塞、同步、十年来的 bug 修复和几十种芯片的移植层。
+
+---
+
+## 14.4 FreeRTOS 内部：SysTick → PendSV 切换流程
+
+上面的迷你 RTOS 帮你理解了核心机制。FreeRTOS 的上下文切换也是完全相同的原理：
+
+```
+SysTick_Handler（每 1ms）
+    │
+    └── 设置 PendSV 位（SCB->ICSR |= PENDSVSET）
+        │
+        └── 系统 PendSV 优先级最低，等所有中断处理完
+            │
+            └── PendSV_Handler 执行：
+                1. 保存 r4~r11 到当前任务栈
+                2. 调用 vTaskSwitchContext() 选下一个任务
+                3. 恢复下一个任务的 r4~r11
+                4. BX LR → 硬件弹出剩下的寄存器→新任务跑
+```
+
+唯一区别是第 2 步——FreeRTOS 用优先级就绪位图而不是简单的 `(current+1)%N` 来选下一个任务，O(1) 时间找到最高优先级的就绪任务。
+
+### 为什么裸机的 Delay_ms 不能和 FreeRTOS 共存
+
+你的 `Delay_ms` 是这样做的：
+
+```c
+void Delay_ms(uint32_t ms) {
+    uint32_t start = uwTick;       // 读 SysTick 计数值
+    while (uwTick - start < ms);   // 忙等
+}
+```
+
+问题在执行 `while` 忙等时，**任务切换不会发生**——因为 PendSV 也是在 SysTick 中断里触发的，但 `Delay_ms` 的 while 循环不在中断里，SysTick 照常触发，PendSV 也照常执行。
+
+真正的问题是：**`Delay_ms` 阻塞了当前任务的全部执行时间**。如果 Task1 调了 `Delay_ms(1000)`，这一秒里 Task1 占用 CPU——FreeRTOS 的调度器只在每个 SysTick 中断里切换，如果 Task1 不主动让出（`vTaskDelay` 或阻塞），且优先级最高，它就一直跑。
+
+**`vTaskDelay` 和 `Delay_ms` 的区别**：
+
+| | `Delay_ms(1000)` | `vTaskDelay(1000)` |
+|--|-----------------|-------------------|
+| 行为 | CPU 忙等 1 秒 | 任务进入 Blocked 状态，不占 CPU |
+| 其他任务 | 不能运行 | ❓ 可以运行 |
+| 调度器效果 | 无 | 任务被移出就绪队列，调度器选其他任务 |
+
+RTOS 里的延时**不是忙等**——是把任务从就绪队列移到延时队列，然后调度其他任务。延时到后自动回到就绪队列。
+
+### FreeRTOS 占用资源
+
+| 资源 | 用量 |
+|------|------|
+| ROM（Flash） | ~5KB（内核源码）|
+| RAM | 每个任务 ~200-500 字节栈 + 内核堆 ~1-10KB |
+| CPU | 每 1ms 进入 SysTick ~1µs，约 0.1% 开销 |
+
+STM32F103 ZET6（512KB Flash / 64KB RAM）跑 FreeRTOS 绰绰有余。
+
+---
+
+## 14.5 SPL 版和 HAL 版的不同
+
+HAL 版用 CubeMX 勾选「FreeRTOS」即可自动生成配置代码。SPL 版需要你**手动完成** CubeMX 自动做的事：
+
+| | HAL 版 | SPL 版 |
 |---|---|---|
-| FreeRTOS 添加方式 | CubeMX 勾选 | 手动拷贝源码 + 写 `FreeRTOSConfig.h` |
-| 外设初始化 | `MX_GPIO_Init()` | `GPIO_Init()` |
-| ISR | `HAL_GPIO_EXTI_Callback` | 直接写 `EXTIx_IRQHandler` |
-| 延时 | `HAL_Delay` / `vTaskDelay` | 只有 `vTaskDelay`（SysTick 被 FreeRTOS 接管了） |
-| 编译 | CubeIDE Build 按钮 | `make` |
+| FreeRTOS 添加 | CubeMX 勾选 | 手动下载源码、写 `FreeRTOSConfig.h`、改 Makefile |
+| 外设初始化 | `MX_GPIO_Init()` 自动生成 | 自己 `GPIO_Init()` |
+| ISR 写法 | `HAL_GPIO_EXTI_Callback` 回调 | 直接写 `EXTIx_IRQHandler` |
+| 延时 | `HAL_Delay` 或 `vTaskDelay` | 只有 `vTaskDelay`（SysTick 被 FreeRTOS 接管） |
+| 编译 | CubeIDE | `make` |
 
-**FreeRTOS 本身没变**——`xTaskCreate`、`xQueueSend`、`vTaskDelay` 这些 API 在两个版本里完全一样。SPL 版只是让你手动完成了 HAL 版 CubeMX 自动做的那部分工作。
+**FreeRTOS 的 API 本身在两个版本中一模一样**——`xTaskCreate`、`xQueueSend`、`vTaskDelay` 是 FreeRTOS 的函数，不是 HAL 或 SPL 的。
 
----
-
-> **下一章**：[第 15 章 · FreeRTOS 核心概念](./15-chapter.md)
->
-> FreeRTOS 的 Task、Queue、Semaphore、Mutex API 在 SPL 和 HAL 中调用方式完全一样——因为这些不是 HAL/SPL 的函数，是 FreeRTOS 自己的。下面的骨架代码可以直接编译运行。
+> 下一步 → **第 15 章** 详细讲解 FreeRTOS 的 Task/Queue/Semaphore/Mutex API，以及如何将 FreeRTOS 手动移植到你的 SPL 工程中。

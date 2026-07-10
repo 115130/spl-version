@@ -331,6 +331,6 @@ int main(void) {
 
 > **上一章**：[第 12 章 · DMA 控制器](./12-chapter.md)
 >
-> **下一章**：[第 14 章 · FreeRTOS 入门（SPL版）](./14-chapter.md)
+> **下一章**：[第 14 章 · 为什么需要 RTOS（SPL版）](./14-chapter.md)
 >
 > 裸机部分告一段落。接下来进入多任务世界——让你的 MCU 同时做多件事。
