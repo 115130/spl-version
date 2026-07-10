@@ -36,6 +36,10 @@ sudo pacman -S arm-none-eabi-gcc arm-none-eabi-binutils
 # Fedora
 sudo dnf install arm-none-eabi-gcc arm-none-eabi-binutils
 
+# NixOS（通过 flake，推荐）
+# 在项目的 flake.nix 中声明 buildInputs，然后 direnv allow 自动加载
+# 详见本目录下的 flake.nix 和 .envrc 示例
+
 # 验证安装
 arm-none-eabi-gcc --version
 # arm-none-eabi-gcc (15:13.3.rel1-2) 13.3.1 20240614
@@ -53,6 +57,8 @@ sudo pacman -S openocd
 # Fedora
 sudo dnf install openocd
 
+# NixOS：同上，flake.nix 的 buildInputs 已包含 openocd
+
 # 验证
 openocd --version
 # Open On-Chip Debugger 0.12.0
@@ -60,21 +66,26 @@ openocd --version
 
 ### Step 3：解决 USB 权限问题
 
-Linux 默认不允许普通用户访问 USB 调试器：
+Linux 默认不允许普通用户访问 USB 调试器。需要一条 udev 规则把设备文件设为 0666 权限：
 
 ```bash
-# 方法一：安装 udev 规则（推荐）
 # 创建文件 /etc/udev/rules.d/99-stlink.rules
 sudo tee /etc/udev/rules.d/99-stlink.rules << 'EOF'
-# ST-Link V2
+# ST-Link V2 (0483:3748 旧版 / 0483:374b 新版)
 ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3748", MODE="0666"
+ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374b", MODE="0666"
+
+# CMSIS-DAP / DAP-Link
+ATTRS{idVendor}=="0d28", ATTRS{idProduct}=="0204", MODE="0666"
 EOF
 
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 
-# 拔插 ST-Link
+# 拔插调试器使规则生效
 ```
+
+> **NixOS 用户**：不能直接写 `/etc/udev/rules.d/`。将上述规则放到 `/etc/nixos/hardware.nix` 的 `services.udev.extraRules` 中，然后 `sudo nixos-rebuild switch`。详见附录 D。
 
 ## 0.3 准备 SPL 标准外设库
 
@@ -233,8 +244,8 @@ CFLAGS += -O0 -g3 -Wall -fmessage-length=0
 #         优化0  调试信息3  所有警告  不截断错误信息
 #         ↑ O0 不做优化，每行 C 对应明确的汇编，方便调试
 
-CFLAGS += -DSTM32F10X_MD
-#         定义宏 STM32F10X_MD（告诉 stm32f10x.h 你的芯片是中容量）
+CFLAGS += -DSTM32F10X_HD
+#         定义宏 STM32F10X_HD（告诉 stm32f10x.h 你的芯片是大容量）
 
 CFLAGS += -I./inc
 #         头文件搜索路径：-I 后面跟目录，-I./inc 表示也在 ./inc 里找 .h
@@ -255,7 +266,7 @@ C_SRCS  = main.c stm32f10x_it.c                     # 你的代码
 C_SRCS += lib/system_stm32f10x.c lib/core_cm3.c     # CMSIS 内核
 C_SRCS += lib/stm32f10x_rcc.c lib/stm32f10x_gpio.c  # SPL 外设驱动
 
-ASM_SRCS = lib/startup_stm32f10x_md.s  # 启动汇编
+ASM_SRCS = lib/startup_stm32f10x_hd.s  # 启动汇编（大容量芯片用 _hd）
 
 # 把 .c 和 .s 分别替换成 .o
 OBJS = $(C_SRCS:.c=.o) $(ASM_SRCS:.s=.o)
@@ -346,12 +357,12 @@ SIZE    = arm-none-eabi-size
 MCU     = cortex-m3
 FPU     =
 FLOAT   = -msoft-float
-CHIP    = STM32F103C8
+CHIP    = STM32F103VE          # ← 改成你的芯片型号（普中玄武 = VE/ZET6）
 
 # 编译选项
 CFLAGS  = -mcpu=$(MCU) -mthumb $(FLOAT)
 CFLAGS += -O0 -g3 -Wall -fmessage-length=0
-CFLAGS += -D$(CHIP) -DSTM32F10X_MD  # ← Medium Density（64KB Flash）
+CFLAGS += -D$(CHIP) -DSTM32F10X_HD  # ← HD = High Density（512KB Flash）
 CFLAGS += -I./inc
 
 LDFLAGS = -T link.ld -mcpu=$(MCU) -mthumb $(FLOAT)
@@ -362,7 +373,7 @@ C_SRCS  = main.c stm32f10x_it.c
 C_SRCS += lib/system_stm32f10x.c lib/core_cm3.c
 C_SRCS += lib/stm32f10x_rcc.c lib/stm32f10x_gpio.c
 
-ASM_SRCS = lib/startup_stm32f10x_md.s
+ASM_SRCS = lib/startup_stm32f10x_hd.s
 
 OBJS = $(C_SRCS:.c=.o) $(ASM_SRCS:.s=.o)
 
@@ -443,15 +454,16 @@ SECTIONS
 }
 ```
 
-> ⚠️ **芯片型号差异**：上面的 Makefile 和链接脚本是基于 **STM32F103C8T6**（MD, Medium Density, 64KB Flash / 20KB SRAM）。如果你用的是其他型号，需要改 3 处：
+> ⚠️ **芯片型号差异**：上面的 Makefile 是基于 **普中玄武 F103ZET6**（HD, High Density, 512KB Flash / 64KB SRAM）编写的。如果你用其他型号，需要改 3 处：
 >
 > | 你的芯片 | 密度 | 启动文件 | 编译宏 | Flash/SRAM |
 > |---------|------|---------|--------|-----------|
-> | STM32F103C8 (蓝色小板) | MD | `startup_stm32f10x_md.s` | `-DSTM32F10X_MD` | 64K / 20K |
-> | **STM32F103ZE (野火板)** | **HD** | **`startup_stm32f10x_hd.s`** | **`-DSTM32F10X_HD`** | **512K / 64K** |
+> | **STM32F103ZET6（普中玄武，推荐）** | **HD** | **`startup_stm32f10x_hd.s`** | **`-DSTM32F10X_HD`** | **512K / 64K** |
+> | STM32F103ZE (野火板) | HD | `startup_stm32f10x_hd.s` | `-DSTM32F10X_HD` | 512K / 64K |
+> | STM32F103C8（蓝色小板） | MD | `startup_stm32f10x_md.s` | `-DSTM32F10X_MD` | 64K / 20K |
 > | STM32F103VG | HD | `startup_stm32f10x_hd.s` | `-DSTM32F10X_HD` | 1024K / 96K |
 >
-> 野火 ZET6 用户只需把 Makefile 里的 `_MD` 改成 `_HD`，链接脚本里的 `64K`/`20K` 改成 `512K`/`64K` 即可。启动文件 (`startup_stm32f10x_hd.s`) 在 SPL 包的 `CMSIS/CM3/DeviceSupport/ST/STM32F10x/startup/arm/` 目录下。
+> 普中玄武 VET6 和野火 ZET6 都只需确认 Makefile 里的 `_HD`、链接脚本里的 `512K`/`64K`、以及使用 `startup_stm32f10x_hd.s` 即可。启动文件在 SPL 包的 `CMSIS/CM3/DeviceSupport/ST/STM32F10x/startup/arm/` 目录下。
 
 ### `stm32f10x_conf.h`（精简版）
 
@@ -546,7 +558,7 @@ HAL 版第 0 章做了同样的事——点亮 LED。对比一下：
 | 现象 | 可能原因 |
 |------|---------|
 | `make` 报 `arm-none-eabi-gcc: command not found` | 工具链没装好。跑 `which arm-none-eabi-gcc` |
-| `make flash` 报 `Error: open failed` | ST-Link 没插好或者没权限。跑 `lsusb` 确认 ST-Link 被识别 |
+| `make flash` 报 `Error: open failed` | 调试器没插好或没权限。`lsusb` 确认设备被识别，检查 udev 规则是否正确加载 |
 | 编译通过但 LED 不闪 | `SystemInit()` 没被调用（默认启动文件里会调）。检查 `startup` 文件是否正确 |
 | LED 一直亮 | PC13 低电平有效（灯亮）——注意 `GPIO_ResetBits` = 亮, `GPIO_SetBits` = 灭 |
 

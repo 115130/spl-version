@@ -1,6 +1,6 @@
 # 第 3 章 · GPIO 与寄存器编程（SPL版）
 
-> **本章产出**：用 SPL 函数 + 纯寄存器两种方式控制 GPIO、驱动按键输入、实现软件消抖
+> **本章产出**：用 SPL 函数 + 纯寄存器两种方式控制 GPIO、驱动流水灯、驱动按键输入并理解消抖
 >
 > **用到项目的哪里**：GPIO 是嵌入式开发的起点——LED、按键、继电器、蜂鸣器、片选信号，所有项目的第一步都要配 GPIO
 
@@ -137,90 +137,165 @@ void spl_led_init(void) {
 GPIO_ToggleBits(GPIOB, GPIO_Pin_5);   // PB5 翻转
 ```
 
-## 3.5 动手：按键输入 + 软件消抖
+## 3.5 动手：流水灯
 
-### 硬件连接
+有了单 LED 的控制，扩展到多个——做个经典流水灯。
 
-```
-3.3V ───[10kΩ 上拉电阻]───┬─── PA0
-                          │
-                      [按键开关]
-                          │
-                         GND
-```
+### 接线
 
-未按下：PA0 被拉到 3.3V → 读到 1。按下：PA0 接地 → 读到 0。STM32 内部有弱上拉（~40kΩ），你可以不用外部电阻，初始化时启用内部上拉即可。
+将板载的多个 LED（或外接 LED 到 PB0-PB3）依次点亮：
 
-### SPL 初始化键盘输入
+| 引脚 | 颜色（依板子）|
+|------|-------------|
+| PB0 | 红 |
+| PB1 | 绿 |
+| PB2 | 蓝 |
+| PB3 | 黄（或其他）|
+
+普中玄武板上通常有 3-4 个可编程 LED，查原理图确认引脚。
+
+### 代码
 
 ```c
-void key_init(void) {
+#define LED_PORT  GPIOB
+#define LED_PINS  (GPIO_Pin_0 | GPIO_Pin_1 | GPIO_Pin_2 | GPIO_Pin_3)
+
+void LED_All_Init(void) {
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+
+    GPIO_InitTypeDef gpio;
+    GPIO_StructInit(&gpio);
+    gpio.GPIO_Pin   = LED_PINS;
+    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(LED_PORT, &gpio);
+
+    // 初始全灭（推挽输出默认高电平还是低电平要看电路设计）
+    LED_PORT->ODR |= LED_PINS;
+}
+```
+
+主循环：
+
+```c
+const uint8_t pin_order[] = {GPIO_Pin_0, GPIO_Pin_1, GPIO_Pin_2, GPIO_Pin_3};
+
+while (1) {
+    for (int i = 0; i < 4; i++) {
+        GPIO_ResetBits(LED_PORT, pin_order[i]);     // 亮
+        Delay_ms(200);                               // 保持
+        GPIO_SetBits(LED_PORT, pin_order[i]);        // 灭
+    }
+}
+```
+
+LED 像水一样「流」过——这就是嵌入式初体验中最有成就感的 10 行代码。
+
+> **如果只有一个 LED 或引脚不同**：用 `GPIO_ToggleBits` 配合 `Delay_ms` 做呼吸节奏也行。流水灯的思想是「一组引脚依次输出」——你学会了 `ODR` 批量操作。
+
+---
+
+## 3.6 动手：按键输入与消抖
+
+### 3.6.1 最简单按键读取
+
+先不关心抖动——先让 MCU「读到按键状态」：
+
+```c
+void Key_Init(void) {
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
 
     GPIO_InitTypeDef gpio;
     GPIO_StructInit(&gpio);
     gpio.GPIO_Pin  = GPIO_Pin_0;
-    gpio.GPIO_Mode = GPIO_Mode_IPU;   // 输入 + 内部上拉（Input Pull-Up）
+    gpio.GPIO_Mode = GPIO_Mode_IPU;        // 输入 + 内部上拉
     GPIO_Init(GPIOA, &gpio);
+}
+
+uint8_t Key_Read(void) {
+    return GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0);
 }
 ```
 
-### 抖动与消抖
-
-机械按键按下时信号不是干净跳变：
-
-```
-理想：1 ──────┐         ┌────── 1
-              └─────────┘
-
-现实：1 ──────┐┌┐┌┐┌┐┌──┐┌┐┌┐┌──── 1
-              └┘└┘└┘└┘  └┘└┘└┘
-              抖动 5-20ms   抖动
-```
-
-消抖思路：**检测到变化 → 等 30ms → 再读一次，电平稳定才算有效**。
+最简单的「按键点灯」：
 
 ```c
-// SPL 版消抖按键读取（用 SysTick 计时，不阻塞 CPU）
-uint8_t key_debounce(void) {
+while (1) {
+    if (Key_Read() == 0)          // 按下
+        GPIO_ResetBits(GPIOB, GPIO_Pin_5);   // 亮
+    else
+        GPIO_SetBits(GPIOB, GPIO_Pin_5);     // 灭
+}
+```
+
+烧进去试试——大概率发现：**按一次 LED 闪烁多次、反应不灵敏、甚至按住时 LED 忽亮忽暗**。这就是下面要说的抖动问题。
+
+### 3.6.2 按键的物理抖动
+
+机械按键按下过程不是干净的电平变化：
+
+```
+理想波形（按下 -> 释放）：
+    +------------------+         +--
+    |                  |         |
+----+                  +---------+
+
+实际波形（按下 -> 释放）：
+    + ++--++--+  +-+-+  ++-+
+    |                   |
+----+                   +--------
+        抖动 5-20ms       抖动
+```
+
+机械触点在接触瞬间会弹跳几次——每次弹跳持续几微秒到几毫秒。CPU 跑 72MHz，几十微秒内能采样几百次——读到的不是干净的一次按下，而是一串 0 和 1 的交替。
+
+### 3.6.3 软件消抖
+
+思路：**检测到电平变化 -> 跳过抖动期（等 20-50ms）-> 再读一次确认**。
+
+```c
+uint8_t Key_Debounce(void) {
     static uint32_t last_tick = 0;
-    static uint8_t  last_state = 1;   // 1 = 未按下（上拉）
+    static uint8_t  last_state = 1;     // 上拉初始 = 1
 
     uint8_t cur = GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0);
 
+    // 状态变化：记录时间，暂不确认
     if (cur != last_state) {
-        last_tick  = uwTick;          // SysTick 计数值（见第 5 章）
+        last_tick  = uwTick;            // SysTick 计数值，见第 5 章
         last_state = cur;
         return 0;
     }
 
-    if ((uwTick - last_tick) > 30) {  // 稳定 30ms
-        if (cur == 0 && last_state == 0) {  // 确认为按下
-            last_state = 2;            // 标记已处理，避免重复触发
-            return 1;
+    // 状态稳定超过 30ms -> 确认是有效按压（非抖动）
+    if ((uwTick - last_tick) > 30) {
+        if (cur == 0 && last_state == 0) {
+            last_state = 2;             // 标记已处理
+            return 1;                   // 确认为一次有效按下
         }
-        if (cur == 1) last_state = 1;  // 释放后重置
+        if (cur == 1) last_state = 1;   // 释放后复位
     }
-
     return 0;
 }
 ```
 
-### 按键控制 LED 模式切换
+核心：不阻塞（`Delay_ms(30)` 会让 CPU 原地等 30ms——太浪费了），而是用 `uwTick` 计时。这就是第 6 章要讲的中断思路的雏形。
+
+### 3.6.4 完整实验：按键切换 LED 模式
 
 ```c
 typedef enum { MODE_OFF, MODE_ON, MODE_BLINK } led_mode_t;
 
 int main(void) {
-    led_init();   // GPIOB PB5 推挽输出
-    key_init();   // GPIOA PA0 上拉输入
+    LED_Init();         // GPIOB PB5
+    Key_Init();         // GPIOA PA0
 
     led_mode_t mode = MODE_OFF;
     uint32_t last_blink = 0;
 
     while (1) {
-        if (key_debounce()) {
-            mode = (mode + 1) % 3;     // 短按切换模式
+        if (Key_Debounce()) {
+            mode = (mode + 1) % 3;
         }
 
         switch (mode) {
@@ -241,11 +316,15 @@ int main(void) {
 }
 ```
 
-**效果**：每按一次按键，LED 循环切换「灭 → 常亮 → 闪烁」。
+**效果**：每按一次按键（确认一次有效按下，排除了抖动干扰），LED 在「灭 -> 常亮 -> 闪烁」之间循环切换。
+
+### 使用场景
+
+消抖不止在按键：继电器触点、拨码开关、限位开关——任何机械触点都有抖动。学会这个模式，你以后所有「接了一个物理开关」的场景都能套用。
 
 ---
 
-## 3.6 GPIO_InitTypeDef 结构体解析
+## 3.7 GPIO_InitTypeDef 结构体解析
 
 你每次调用 `GPIO_Init` 都要传一个 `GPIO_InitTypeDef`，它长这样：
 
@@ -286,7 +365,7 @@ void GPIO_Init(GPIO_TypeDef *GPIOx, GPIO_InitTypeDef *cfg) {
 
 ---
 
-## 3.7 本章要点
+## 3.8 本章要点
 
 - GPIO 推挽驱动 LED/按键，开漏用于 I2C；上拉给悬空引脚默认高电平
 - CRL/CRH 配制模式，IDR 读输入，ODR/BSRR 写输出；BSRR 原子写优于 ODR
@@ -296,7 +375,10 @@ void GPIO_Init(GPIO_TypeDef *GPIOx, GPIO_InitTypeDef *cfg) {
 - 使用任何 GPIO 前必须 `RCC_APB2PeriphClockCmd()` 使能对应时钟——忘了就全部不响应
 
 ---
+> **上一章**：[第 2 章 · STM32F103 硬件概览](./02-chapter.md)
 
 > **下一章**：[第 4 章 · C 语言嵌入式视角回顾（SPL版）](./04-chapter.md)
 >
 > 你刚才写了不少位操作和 `volatile`。我们停下来，系统回顾嵌入式 C——位运算、volatile 的深层含义、链接脚本、结构体映射寄存器的魔法。
+
+---

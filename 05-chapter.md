@@ -205,6 +205,63 @@ int main(void) {
 
 ---
 
+## 5.7 动手：用 Delay 做流水灯
+
+回到第 3 章的流水灯——当时我们用了一个基础的 `Delay_ms`，但那个 `Delay_ms` 只是简单让 CPU 空转。现在你有了 `SysTick_Config` + `uwTick` 的精确定时，可以做出节奏稳定的流水灯。
+
+```c
+int main(void) {
+    // 时钟 + SysTick + GPIO 初始化
+    SystemClock_Config();           // 72MHz
+    SysTick_Init();                 // SysTick → 1ms tick
+    LED_All_Init();                 // PB0-PB3 推挽输出
+
+    const uint8_t pins[] = {GPIO_Pin_0, GPIO_Pin_1, GPIO_Pin_2, GPIO_Pin_3};
+
+    while (1) {
+        for (int i = 0; i < 4; i++) {
+            GPIO_ResetBits(GPIOB, pins[i]);     // 亮
+            Delay_ms(150);                        // 精确 150ms
+            GPIO_SetBits(GPIOB, pins[i]);         // 灭
+        }
+        // 反向流一次
+        for (int i = 3; i >= 0; i--) {
+            GPIO_ResetBits(GPIOB, pins[i]);
+            Delay_ms(150);
+            GPIO_SetBits(GPIOB, pins[i]);
+        }
+    }
+}
+```
+
+**相比第 3 章的区别**：
+
+| | 第 3 章的流水灯 | 这里的流水灯 |
+|--|---------------|-------------|
+| 延时精度 | 取决于 CPU 频率 | **精确 1ms**（基于 SysTick）|
+| CPU 占用 | 空转（实际 ≈ 死循环） | 同样空转——但计时**精准** |
+| 可预测性 | 换芯片频率不同，节奏飘移 | 72MHz 下准时 150ms |
+| 能读到的时间 | 无 | `uwTick` 全局变量，随时可查 |
+
+> 尽管 `Delay_ms` 本质上还是「CPU 原地等」的阻塞方式——但现在的 `Delay_ms` 是基于硬件定时器的，**时间准确且不受编译优化影响**。第 6 章的中断会帮你从「等待」中解放出来。
+
+---
+
+## 5.8 本章要点
+
+- 时钟树决定整个系统的速度。HSI（8MHz）+ PLL ×9 = 72MHz（SYSCLK）
+- AHB 分频后给 CPU/SRAM/DMA, APB1(/2)=36MHz, APB2(/1)=72MHz
+- SysTick = Cortex-M3 自带的 24 位递减定时器，1ms 中断更新 `uwTick`
+- SPL 手写时钟配置比 CubeMX 慢 5 分钟，但让你看懂了芯片的每一处配置
+- 延时有两种：`Delay_ms`（阻塞，简单精准）和中断延时（非阻塞，后面讲）
+- **精确定时**是所有外设时序的基础——UART 波特率、PWM 频率、ADC 采样时间都依赖它
+
+---
+> **上一章**：[第 4 章 · C 语言与 Makefile](./04-chapter.md)
 > **下一章**：[第 6 章 · 中断系统（SPL版）](./06-chapter.md)
 >
 > Delay_ms 太蠢了——CPU 卡在那什么都干不了。中断就是来解决这个的：事件发生 → 打断 CPU → 处理完 → 回去。这是嵌入式最核心的机制。
+
+---
+
+

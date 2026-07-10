@@ -303,7 +303,284 @@ MyGPIO_Reset(MY_GPIOB, 5);     // PB5 低电平
 
 ---
 
-## 4.8 本章要点
+## 4.8 动手：单总线（1-Wire）与 DS18B20 / DHT11
+
+普中玄武板上焊着 DHT11（温湿度）和 DS18B20（精密温度）两个传感器。它们都用**单总线（1-Wire）协议**——这是你能用 GPIO 实现的最简单的通信协议。
+
+### 单总线通信：一根 GPIO 怎么又发又收
+
+I2C 是两根线，SPI 是三根线——1-Wire 只有**一根数据线**。没有时钟线，不上拉时默认高电平。
+
+```
+一根线又当爹又当妈：
+主机（MCU）─────┬────── 从机（DS18B20 或 DHT11）
+                │
+             4.7kΩ 上拉到 3.3V（空闲高电平）
+```
+
+单总线的核心是**时序**——用脉冲的宽度表示 0 和 1：
+
+```
+写 1：┌────┐  ──────────  （拉低 ~6μs 后释放，总线自行变高）
+      │    │
+      └────┘
+
+写 0：┌──────────────┐──  （拉低 ~60μs）
+      │              │
+      └──────────────┘
+
+读    主机拉低 ~3μs → 释放 → 从机决定总线电平
+      ┌──┐  ┌─────┐           ┌──┐  ┌─────┐
+      │  │  │     │    ← 1    │  │  │  ← 0
+      └──┘  └─────┘           └──┘  └──┘
+```
+
+关键在于 **微秒级的精确定时**。你不能用 `Delay_ms(1)`——太粗了。需要 `Delay_us(10)` 或纯 CPU 空转循环（用 NOP 指令数计算时间）。
+
+### 延时微秒函数
+
+```c
+// 72MHz 下一条 NOP 约 14ns，粗略循环 10 次 ≈ 1μs
+// （精确值不关键——只要时序在 DS18B20/DHT11 容差范围内就行）
+void Delay_us(uint32_t us) {
+    while (us--) {
+        for (volatile uint8_t i = 0; i < 10; i++);  // volatile 防止编译器优化掉
+    }
+}
+```
+
+> 这个 `Delay_us` 精度不高——72MHz 下编译器优化级别会影响实际延时。这里先用着，第 5 章学了 SysTick 之后再回来升级成精确延时。
+
+### 电气连接
+
+| 传感器 | 引脚 | 接 STM32 |
+|--------|------|---------|
+| DS18B20 | VDD → 3.3V, GND → GND, DQ → **PB0** | 单总线脚，需 4.7kΩ 上拉 |
+| DHT11 | VDD → 3.3V, GND → GND, DATA → **PB1** | 单总线脚，需 4.7kΩ 上拉 |
+
+普中玄武板上的 DS18B20 和 DHT11 已经带好上拉电阻和 PCB 走线——你不需要额外接线，直接用 GPIO 控制对应的引脚就行。查原理图确认具体引脚。
+
+### DS18B20 读取温度
+
+DS18B20 是达拉斯半导体的高精度数字温度传感器（±0.5°C）。通信流程：
+
+```
+1. 复位脉冲：主机拉低 480μs → 释放 → 从机拉低 60-240μs 回应存在脉冲
+2. 发 ROM 命令：0xCC（跳过 ROM 搜索，只有一个 DS18B20 时用）
+3. 发功能命令：0x44（启动温度转换）
+4. 等待转换完成（~750ms）
+5. 再次复位 → 发 0xCC → 发 0xBE（读暂存器）
+6. 读 9 字节：温度值在 byte[0]（低 8 位）+ byte[1]（高 8 位）
+```
+
+```c
+// 单总线引脚宏（DS18B20 在 PB0）
+#define DQ_PORT     GPIOB
+#define DQ_PIN      GPIO_Pin_0
+#define DQ_LOW()    GPIO_ResetBits(DQ_PORT, DQ_PIN)
+#define DQ_HIGH()   GPIO_SetBits(DQ_PORT, DQ_PIN)
+#define DQ_READ()   GPIO_ReadInputDataBit(DQ_PORT, DQ_PIN)
+
+// 复位 + 检测存在
+uint8_t DS18B20_Reset(void) {
+    // 配为推挽输出
+    GPIO_InitTypeDef gpio;
+    GPIO_StructInit(&gpio);
+    gpio.GPIO_Pin  = DQ_PIN;
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(DQ_PORT, &gpio);
+
+    DQ_LOW();
+    Delay_us(480);       // 拉低 480μs
+    DQ_HIGH();
+    Delay_us(70);        // 等从机响应
+
+    // 切换为输入（开漏模式）——让上拉电阻拉高总线
+    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(DQ_PORT, &gpio);
+    Delay_us(10);
+
+    uint8_t presence = (DQ_READ() == 0) ? 1 : 0;  // 从机拉低 = 存在
+    Delay_us(410);
+
+    // 切回输出
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_Init(DQ_PORT, &gpio);
+
+    return presence;  // 1=检测到 DS18B20
+}
+
+// 写一个位
+void DS18B20_WriteBit(uint8_t bit) {
+    DQ_LOW();
+    Delay_us(2);    // 起始信号
+    if (bit) {
+        DQ_HIGH();  // 写 1 → 拉高
+        Delay_us(60);
+    } else {
+        Delay_us(60);  // 写 0 → 继续保持低
+        DQ_HIGH();
+    }
+}
+
+// 读一个位
+uint8_t DS18B20_ReadBit(void) {
+    uint8_t val = 0;
+    DQ_LOW();
+    Delay_us(2);      // 主机起始信号
+    DQ_HIGH();
+    Delay_us(2);      // 释放总线，等从机响应
+
+    // 切换输入读电平
+    GPIO_InitTypeDef gpio;
+    GPIO_StructInit(&gpio);
+    gpio.GPIO_Pin  = DQ_PIN;
+    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(DQ_PORT, &gpio);
+    Delay_us(1);
+
+    val = DQ_READ();   // 从机写 0 会拉低总线
+
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_Init(DQ_PORT, &gpio);
+    Delay_us(55);
+
+    return val;
+}
+
+// 写一个字节（LSB 先行）
+void DS18B20_WriteByte(uint8_t byte) {
+    for (uint8_t i = 0; i < 8; i++) {
+        DS18B20_WriteBit(byte & (1 << i));
+    }
+}
+
+// 读一个字节
+uint8_t DS18B20_ReadByte(void) {
+    uint8_t byte = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        if (DS18B20_ReadBit()) byte |= (1 << i);
+    }
+    return byte;
+}
+
+// 读取温度（摄氏度 × 16，转为浮点）
+float DS18B20_ReadTemp(void) {
+    DS18B20_Reset();
+    DS18B20_WriteByte(0xCC);   // 跳过 ROM
+    DS18B20_WriteByte(0x44);   // 启动转换
+    Delay_ms(750);               // 等 750ms
+
+    DS18B20_Reset();
+    DS18B20_WriteByte(0xCC);   // 跳过 ROM
+    DS18B20_WriteByte(0xBE);   // 读暂存器
+
+    int16_t raw = DS18B20_ReadByte() | (DS18B20_ReadByte() << 8);
+    return raw * 0.0625f;       // 分辨率 0.0625°C
+}
+```
+
+使用：
+
+```c
+if (DS18B20_Reset()) {
+    float temp = DS18B20_ReadTemp();
+    printf("DS18B20: %.2f°C\r\n", temp);
+} else {
+    printf("DS18B20 未连接\r\n");
+}
+```
+
+### DHT11 读取温湿度
+
+DHT11 比 DS18B20 更简单（精度更低但带湿度）。通信流程：
+
+```
+1. 主机拉低 ≥18ms（启动信号）→ 释放 → 上拉电阻拉高
+2. 从机拉低 80μs → 拉高 80μs（响应信号）
+3. 从机发送 40 位数据（每 1 位 = 50μs 低 + 26-28μs高=0 / 70μs高=1）
+```
+
+数据格式 = 8bit 湿度整数 + 8bit 湿度小数 + 8bit 温度整数 + 8bit 温度小数 + 8bit 校验和
+
+```c
+uint8_t DHT11_Read(uint8_t buf[5]) {
+    // 启动信号：拉低 ≥18ms
+    GPIO_InitTypeDef gpio;
+    GPIO_StructInit(&gpio);
+    gpio.GPIO_Pin   = GPIO_Pin_1;  // DHT11 在 PB1
+    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOB, &gpio);
+
+    GPIO_ResetBits(GPIOB, GPIO_Pin_1);
+    Delay_ms(20);                      // 拉低 20ms ≥ 18ms
+    GPIO_SetBits(GPIOB, GPIO_Pin_1);  // 释放
+    Delay_us(30);
+
+    // 切输入，等从机响应
+    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(GPIOB, &gpio);
+
+    // 等 DHT11 拉低（80μs）
+    uint16_t timeout = 0;
+    while (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1))
+        if (++timeout > 500) return 0;  // 超时
+
+    // 等 DHT11 拉高（80μs）
+    while (!GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1))
+        if (++timeout > 500) return 0;
+
+    // 读 40 位
+    for (uint8_t i = 0; i < 40; i++) {
+        while (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1) == 0);  // 等低结束
+        Delay_us(40);  // 等 40μs
+        // 此时如果在高电平区 → 看持续多久
+        // 26-28μs = 0, 70μs = 1
+        if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1))
+            buf[i / 8] = (buf[i / 8] << 1) | 1;
+        else
+            buf[i / 8] = (buf[i / 8] << 1) | 0;
+        while (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1));  // 等高结束
+    }
+
+    // 校验和验证（前 4 字节和 = 第 5 字节）
+    if ((uint8_t)(buf[0] + buf[1] + buf[2] + buf[3]) != buf[4])
+        return 0;  // 校验失败
+
+    return 1;  // 成功
+}
+```
+
+读取：
+
+```c
+uint8_t data[5];
+if (DHT11_Read(data)) {
+    printf("湿度: %d.%d%%  温度: %d.%d°C\r\n",
+           data[0], data[1], data[2], data[3]);
+}
+```
+
+### 1-Wire vs I2C vs SPI 对比
+
+| | 1-Wire | I2C | SPI |
+|--------|--------|-----|-----|
+| 信号线数 | **1**（DQ） | 2（SCL+SDA） | 3-4（SCK+MOSI+MISO+CS）|
+| 速度 | 低速（~16kbps） | 100k-400kHz | 最高 18MHz |
+| 时序要求 | **严格**（μs 级精确，CPU 空转） | 硬件外设自动处理 | 硬件外设自动处理 |
+| 协议复杂度 | 简单（但实现繁琐） | 中等 | 简单 |
+| 多设备支持 | 可级联（ROM 搜索复杂） | 地址区分 | 片选区分 |
+| 嵌入式初学 | **非常适合**（逼你理解时序） | 一般（外设自动处理） | 一般（外设自动处理） |
+
+**1-Wire 最底层的魅力**：你写 `DQ_LOW()` 的那一瞬间，就是在零延迟操作硅片上的晶体管。I2C/SPI 的硬件外设屏蔽了这些细节，但 1-Wire 让你**亲手触碰到物理层的每一次电压变化**。
+
+这就是为什么把 1-Wire 放在 GPIO 之后、其他通信协议之前——它会彻底教会你「时序」这两个字意味着什么。
+
+---
+
+## 4.9 本章要点
 
 - **位运算**是嵌入式日常：置位 `|=`，清零 `&= ~`，翻转 `^=`
 - **`volatile`** 阻止编译器优化掉硬件读写——所有外设寄存器、中断共享变量都需要
@@ -314,7 +591,10 @@ MyGPIO_Reset(MY_GPIOB, 5);     // PB5 低电平
 - 写嵌入式 C 时，始终在想「这个变量在 Flash 还是 SRAM」
 
 ---
-
+> **上一章**：[第 3 章 · GPIO 与寄存器操作](./03-chapter.md)
 > **下一章**：[第 5 章 · 时钟系统、SysTick 与精确延时（SPL版）](./05-chapter.md)
 >
 > 你现在有了精确的位操作能力。接下来给 MCU 配一个准确的心跳——系统时钟和 SysTick 定时器。
+
+---
+
