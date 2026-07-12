@@ -329,7 +329,7 @@ int main(void) {
 
 ---
 
-> **上一章**：[第 12 章 · DMA 控制器](./12-chapter.md)
+> **上一章**：[第 12.5 章 · RS485 与 Modbus RTU](./12b-chapter.md)
 >
 > **下一章**：[第 14 章 · 为什么需要 RTOS（SPL版）](./14-chapter.md)
 >

@@ -18,7 +18,7 @@
 | **API 风格** | `GPIO_SetBits(GPIOC, GPIO_Pin_13)` | `HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, SET)` |
 | **适合谁** | 想从底层理解外设、喜欢命令行工具链、Linux 用户 | 想快速上手、喜欢图形化工具、Windows 用户 |
 
-两个版本**章节结构完全一致**——30 章 + 6 个阶段项目 + 3 个综合项目 + 4 个附录。同一本书，两种库实现方式。
+两个版本**章节结构完全一致**——31 章 + 6 个阶段项目 + 3 个综合项目 + 4 个附录。同一本书，两种库实现方式。
 
 ---
 
@@ -32,7 +32,7 @@ SPL 版特别之处：
 PART 0 · 启程（SPL 工程搭建）
 PART 1 · 入门（SPL GPIO + 寄存器）
 PART 2 · 核心外设（SPL TIM/UART/ADC + 中断）
-PART 3 · 总线与存储（SPL I2C/SPI/DMA + FatFs）
+PART 3 · 总线与存储（SPL I2C/SPI/DMA/RS485 + FatFs）
 PART 4 · RTOS（FreeRTOS——库无关，两边一样）
 PART 5 · 无线连接（AT 指令——库无关，两边一样）
 PART 6 · 网关与云（MQTT/HTTP——库无关，两边一样）
