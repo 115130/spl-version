@@ -1,0 +1,21 @@
+# Embedded build artifacts
+build/
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.o
+*.d
+
+# Local hardware and cloud credentials
+device_config.h
+wifi_credentials.h
+cloud_credentials.h
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
