@@ -164,7 +164,66 @@ typedef struct {
 
 练习：用 UART 同时模拟一个“每秒温度”的来源和一个“突发 100 帧”的来源；证明它们的错误计数、来源 ID 和 Queue 策略都可见。
 
-## 27.10 本章要点
+## 27.10 命令关联、设备注册与规则隔离
+
+网关既要处理遥测，也要处理“下发控制后到底发生了什么”。为命令建立关联 ID，而不是只打印一条字符串：
+
+~~~c
+typedef struct {
+    uint32_t correlation_id;   /* 云端/本地发起一次命令的编号 */
+    uint16_t target_source;
+    uint16_t command;
+    uint32_t deadline_tick;
+} GatewayCommand;
+
+typedef enum {
+    CMD_ACCEPTED,
+    CMD_REJECTED,
+    CMD_TIMEOUT,
+    CMD_COMPLETED
+} CommandResult;
+~~~
+
+当一个控制命令到达时：
+
+1. 检查来源、设备状态和参数范围；
+2. 创建 `GatewayCommand` 并放入该适配器的受限队列；
+3. 适配器产生 `CMD_ACCEPTED/REJECTED/COMPLETED` 事件；
+4. 网络层根据 `correlation_id` 上报结果；
+5. 超时后明确报 `CMD_TIMEOUT`，而不是无声消失。
+
+### 规则引擎只消费事件
+
+本地规则应是纯函数式判断，不直接操作 UART 或继电器：
+
+~~~c
+typedef struct {
+    bool fan_should_run;
+    bool alarm_should_raise;
+} RuleDecision;
+
+RuleDecision Rules_Evaluate(const GatewayEvent *e)
+{
+    RuleDecision d = {0};
+    if (e->type == EVT_TEMPERATURE && e->payload[0] > 30)
+        d.fan_should_run = true;  /* 教学示例：真实值需按格式解析 */
+    return d;
+}
+~~~
+
+执行层接到 `RuleDecision` 后仍需使用安全状态机、权限与超时。这样可以单独用录制的 GatewayEvent 测试规则，而不接任何真实设备。
+
+### 长稳验收
+
+- 同时注入有效帧、CRC 错帧、离线和突发数据；
+- 每个适配器都仍能报告 `last_seen`、错误数、溢出数；
+- 命令都有 correlation ID 和终态；
+- 网络断开时本地规则仍有明确行为；
+- 重启后设备注册、配置和默认安全状态可重复。
+
+练习：录制 20 条 GatewayEvent，在 PC/固件测试函数中回放；同一份事件序列应得到同一组 RuleDecision 和统计。
+
+## 27.11 本章要点
 
 - 多协议网关的核心是统一事件模型；
 - 适配器之间通过 Queue 交接，而不是相互直接调用；
