@@ -102,7 +102,7 @@ Reset_Handler:
 
 对比你熟悉的 PC：
 
-| | PC（跑 Java） | STM32F103ZE（跑裸机） |
+| | PC（跑 Java） | STM32F103ZET6（跑裸机） |
 |---|---|---|
 | **程序在哪** | 硬盘 → OS 加载到 RAM | 直接烧在 Flash（512KB），CPU 直接从 Flash 取指执行 |
 | **数据在哪** | 堆（new 出来的对象）+ 栈 | SRAM（64KB）= 全局/静态变量 + 堆 + 栈 |
@@ -232,7 +232,7 @@ int main(void)
 
 - PC 上有 JVM → OS → 驱动 → 硬件；嵌入式只有你的 C 代码 → 寄存器 → 硬件
 - MCU 上电 → 取中断向量表第一条（栈顶）→ 取第二条（Reset_Handler）→ `SystemInit()` → `main()` → `while(1)` 永远循环
-- STM32F103ZE 的 Flash（512KB）= 你程序的「永久存储」；SRAM（64KB）= 全局变量 + 堆 + 栈
+- STM32F103ZET6 的 Flash（512KB）= 你程序的「永久存储」；SRAM（64KB）= 全局变量 + 堆 + 栈
 - SPL 版 `main.c` 的每一行都是你手动写的配置代码，没有 CubeMX 生成的「黑箱」
 - 使用任何外设前必须先使能对应时钟——这是 STM32 的铁律，忘记就是硬件不响应
 - SPL 的 `GPIO_SetBits/ResetBits` 通过 BSRR 寄存器实现原子操作——写 1 生效，写 0 无效，不用读-改-写
