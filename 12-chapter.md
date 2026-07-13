@@ -1,466 +1,311 @@
-# 第 12 章 · DMA 控制器
+# 第 12 章 · DMA：缓冲区所有权、UART 流与 SDIO 数据通道
 
-> **本章产出**：能把一次重复的数据搬运交给 DMA，说明谁拥有缓冲区、何时数据有效、传输失败后如何恢复；不会把 DMA 当作“自动线程”。
+> **本章产出**：能为一次 DMA 传输说明“谁启动、谁拥有缓冲区、何时完成、失败怎样收尾”；能正确实现 UART 的 DMA TX 与循环 RX 的基础层；知道 SDIO DMA 为什么使用 32 位 FIFO 访问。
 >
-> **前置知识**：第 8 章 UART、第 11 章 SPI/SDIO；熟悉中断与数组生命周期。
+> **前置知识**：第 6 章中断、第 8 章 UART、第 11 章 SPI/SDIO。
 >
-> **硬件准备**：先用 UART DMA 完成最小实验，再接 SD 卡等高速设备；DMA 配置不替代外设和总线的正确接线。
+> **本章边界**：DMA 只是数据搬运机制，不替代 UART 协议解析、SD 卡命令状态机或文件系统。
 
-## 12.1 为什么需要 DMA
+DMA 很容易被误解成“后台线程”。它不是：DMA 只会在某个外设请求到来时，按你预先给出的地址、宽度和计数搬一项数据。它不知道一帧 UART 消息在哪里结束，也不知道一块 SD 数据是否属于正确的卡命令。这些仍是程序的职责。
 
-**没有 DMA**：CPU 逐字节从 UART DR 搬到 buffer，全程占着 CPU。
+## 12.1 先建立传输契约
 
-**有 DMA**：告诉 DMA「把 USART1 DR 搬到 buffer，搬 1024 字节」，CPU 继续做别的事。搬完 DMA 触发中断通知。
+每一条 DMA 代码前，先能写出下面这张表。写不出来，就还不该调用 `DMA_Cmd(..., ENABLE)`。
 
-DMA = **数据搬运工**。CPU 下命令后自己可以干别的。
+| 问题 | 例：USART1 TX DMA |
+|---|---|
+| 外设请求源 | USART1 的 TX DMA 请求 |
+| 固定外设地址 | `&USART1->DR` |
+| 内存地址和宽度 | 待发字节数组，字节宽度 |
+| 方向 | 内存 → 外设 |
+| 计数单位 | 字节数，不是 C 字符串的“元素数”猜测 |
+| 缓冲区所有者 | 发送服务；启动后调用者不能改写/释放该数据 |
+| 完成含义 | DMA 已把最后一字节写入 DR；不一定已从 TX 引脚发完 |
+| 错误收尾 | 关 DMA 通道、清标志、记录原因、唤醒上层 |
 
-> OS 课回顾：程序控制 I/O → 中断驱动 I/O → DMA，三种演进。STM32 全实现了。
+F103 的 DMA 没有数据缓存一致性问题（Cortex-M3 没有 D-Cache），但 C 编译器不知道“DMA 正在改内存”。直接由 DMA 写、CPU 读的缓冲区可声明为 `volatile`；这只保证编译器每次真的读取内存，**不**替你解决帧边界、并发顺序或缓冲区被覆盖的问题。
 
-## 12.2 STM32F103 DMA 架构
+## 12.2 本书使用的固定请求映射
 
-DMA1 7 个通道，硬件固定映射：
+DMA 通道与外设请求在 STM32F103 上是硬件固定映射，不能像现代 SoC 那样随意挑一个空闲 channel。下表只列出本书实际会用到的映射；使用其他外设时仍应查 RM0008 的 DMA request mapping。
 
-| 通道 | 外设 |
-|------|------|
-| CH1 | ADC1 |
-| CH2 | SPI1_RX |
-| CH3 | SPI1_TX |
-| CH4 | USART1_TX |
-| CH5 | USART1_RX |
-| CH6 | USART2_TX |
-| CH7 | USART2_RX |
+| 外设方向 | DMA 控制器 / 通道 | 本书用途 |
+|---|---|---|
+| ADC1 | DMA1 Channel 1 | 第 9 章连续采样 |
+| SPI1 RX | DMA1 Channel 2 | 可选的 SPI 大块读 |
+| SPI1 TX | DMA1 Channel 3 | 可选的 SPI 大块写 |
+| USART1 TX | DMA1 Channel 4 | 控制台批量发送 |
+| USART1 RX | DMA1 Channel 5 | 控制台循环接收 |
+| USART2 RX | DMA1 Channel 6 | 可选 RS485 接收 |
+| USART2 TX | DMA1 Channel 7 | 可选 RS485 发送 |
+| SDIO | DMA2 Channel 4 | SD 卡数据 FIFO |
 
-**关键限制**：每个通道同一时间只能服务于一个外设。USART1_TX 和 SPI2_RX 共用 CH4，不能同时用。
+同一个通道的多个候选请求不能同时工作。此限制应在设计阶段显式写入资源表，而不是等到“串口偶尔不收数据”才发现 SPI 与 UART 抢了 channel。
 
----
+### 12.2.1 正常、循环与内存到内存模式
 
-### 12.2.5 DMA 的握手机制与总线仲裁
+| 模式 | 计数到 0 后 | 适合 | 不适合 |
+|---|---|---|---|
+| Normal | 停止并置完成标志 | 一帧 TX、一个 SD 块 | 无边界的串口字节流 |
+| Circular | 自动从初始地址/计数重新开始 | ADC、UART RX 环形缓冲区 | 不做消费进度管理的协议帧 |
+| Memory-to-memory | 不等待外设请求 | 明确的内存复制任务 | 以为它能自动处理外设 |
 
-"配置好 DMA 后数据自动搬"这听起来像魔法。但它实际上有一套**请求→应答→周期窃取**的硬件握手流程，每搬一字节走三步。
+DMA 的优先级只影响多个 DMA 请求争用总线时的仲裁；它不改变外设协议，不会让错误的波特率、错误的 SD 地址或错误的 CS 自动正确。
 
-#### ① 一次 DMA 传输的三步握手
+## 12.3 UART TX DMA：DMA 完成不等于串口线已空
 
-```
-外设（如 USART1）                   DMA 控制器                   CPU
-      │                               │                        │
-      │ ① 请求                          │                        │
-      │─── DMA 请求信号 ──────────────→│                        │
-      │   (USART_DR 有数据要发)        │                        │
-      │                               │                        │
-      │                               │ ② 仲裁                  │
-      │                               │   判断优先级，等总线     │
-      │                               │                        │
-      │                               │ ③ 周期窃取              │
-      │                               │─── 借总线 ────────────→│ CPU 暂停一个周期
-      │                               │←── 读/写数据 ──────────│
-      │                               │                        │
-      │ ④ 完成                         │                        │
-      │←── 回应信号 ─────────────────│                        │
-      │   (收到传输完成确认)           │                        │
-      │                               │ ⑤ 递减 CNDTR           │
-      │                               │   CNDTR = CNDTR - 1     │
-      │                               │   如果 >0 → 回到 ①      │
-      │                               │   如果 =0 → 置传输完成标志│
-```
+最常见的错误是第一次发送前就等待 `DMA1_FLAG_TC4`。该标志在你还没有启动任何传输时当然不会成为“上一笔已完成”的可靠条件，于是程序会永久等住。
 
-**每一步的物理含义**：
-
-| 步 | 信号通路 | 发生了什么 |
-|----|---------|-----------|
-| **① 请求** | USART→DMA 的硬件连线 | USART 的 TXE 信号直接触发 DMA 请求（不需要 CPU 干预） |
-| **② 仲裁** | DMA 内部判断 | 如果有多个 DMA 通道同时请求，优先级高的先执行 |
-| **③ 周期窃取** | DMA 通过系统总线读写内存 | **CPU 暂停一个总线周期**，DMA 搬一字节，然后 CPU 继续——这就是"周期窃取"名字的由来 |
-| **④ 回应** | DMA→USART 的硬件连线 | DMA 告诉外设"数据已经搬好了" |
-| **⑤ 递减** | DMA 内部计数器 | CNDTR（传输计数器）自减 1 |
-
-#### ② 周期窃取——DMA 搬一字节时 CPU 在干嘛
-
-```
-No DMA（程序控制 I/O）：
-CPU:  读 USART_DR → 写内存 → 读 USART_DR → 写内存 → ……（CPU 全程占用）
-
-有 DMA（周期窃取）：
-CPU:  执行指令     ├──┤ 执行指令     ├──┤ 执行指令 ……
-                  暂停 1 周期         暂停 1 周期
-DMA:           搬 1 字节         搬 1 字节
-```
-
-DMA 每搬一字节只**偷 1 个总线周期**（~14ns @72MHz），CPU 只是稍微慢了一点，基本感觉不到。只有在 DMA 大量传输（比如 ADC 连续采 1000 个点）时，CPU 的有效执行时间才会明显减少。
-
-#### ③ CNDTR——传输计数器
-
-`DMA_Init` 里设的 `DMA_BufferSize` 最终写入 `DMA_Channelx->CNDTR`：
+正确模式是显式维护软件状态：只有发送服务启动过的任务才是 busy；DMA TC 中断表示内存到 DR 的搬运完成；若下游需要释放 RS485 的 DE，则还必须等待 USART 的 `TC`（最后一个停止位离开 TX 引脚）。
 
 ```c
-dma.DMA_BufferSize = 256;  // → CNDTR = 256
-```
-
-DMA 每搬一字节，CNDTR 自减 1：
-
-```
-初始： CNDTR = 256
-搬完第 1 字节： CNDTR = 255
-搬完第 2 字节： CNDTR = 254
-……
-搬完第 256 字节： CNDTR = 0 → 触发传输完成中断（TCIF）
-```
-
-**CNDTR 的值在运行时可以读取**，用来知道 DMA 还剩多少没搬：
-
-```c
-uint16_t remaining = DMA_GetCurrDataCounter(DMA1_Channel4);
-// 已经搬了的 = 总大小 - remaining
-```
-
-这在 UART RX 循环模式时特别有用——想知道"当前收到了多少字节"：
-
-```c
-uint16_t received = RX_BUF_SIZE - DMA_GetCurrDataCounter(DMA1_Channel5);
-```
-
-#### ④ 循环模式（Circular Mode）的底层实现
-
-`DMA_Mode_Circular` 和 `DMA_Mode_Normal` 唯一的区别是：**CNDTR 减到 0 时自动重载为初始值**。
-
-```
-Normal 模式：  CNDTR: 256 → 255 → … → 0 → 停（TCIF 置 1）
-Circular 模式：CNDTR: 256 → 255 → … → 0 → 256 → 255 → …（自动循环）
-```
-
-循环模式下，如果 CPU 没有及时把已有的数据读走，新的数据会覆盖旧数据——这就是 UART RX 循环 DMA 丢包的根源。
-
-#### ⑤ 内存到内存模式（M2M）
-
-DMA 可以内存→内存搬数据（不用经过外设）：
-
-```c
-dma.DMA_M2M = DMA_M2M_Enable;  // 内存到内存模式
-dma.DMA_DIR = DMA_DIR_PeripheralDST;
-// 源地址：src_buf，目标地址：dst_buf
-```
-
-但有两个实际限制：
-- DMA1 只有 CH1 和 CH2 支持 M2M
-- M2M 时 DMA **持续占着总线**直到搬完（不是周期窃取，是连续窃取），CPU 在此期间无法访问内存
-
-所以 M2M 通常只用于在启动时快速初始化大块数据（比如把 `const` 数组从 Flash 搬到 SRAM），运行时很少用。
-
----
-
-## 12.3 SPL DMA 配置
-
-```c
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "stm32f10x_dma.h"
+#include "stm32f10x_rcc.h"
+#include "stm32f10x_usart.h"
 
-// DMA1 CH4: USART1 TX（内存 → 外设）
-void USART1_DMA_TX_Init(void) {
-    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+static volatile bool usart1_tx_dma_busy;
+static volatile bool usart1_tx_dma_error;
 
+void USART1_DmaTxInit(void)
+{
     DMA_InitTypeDef dma;
+
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+    DMA_DeInit(DMA1_Channel4);
     DMA_StructInit(&dma);
     dma.DMA_PeripheralBaseAddr = (uint32_t)&USART1->DR;
-    dma.DMA_MemoryBaseAddr     = (uint32_t)tx_buffer;
-    dma.DMA_DIR                = DMA_DIR_PeripheralDST;   // 内存→外设
-    dma.DMA_BufferSize         = sizeof(tx_buffer);
-    dma.DMA_PeripheralInc      = DMA_PeripheralInc_Disable; // DR 地址不变
-    dma.DMA_MemoryInc          = DMA_MemoryInc_Enable;      // buffer 地址递增
+    dma.DMA_MemoryBaseAddr     = 0U;  /* 每次发送时填写 */
+    dma.DMA_DIR                = DMA_DIR_PeripheralDST;
+    dma.DMA_BufferSize         = 1U;  /* 每次发送时填写 */
+    dma.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
+    dma.DMA_MemoryInc          = DMA_MemoryInc_Enable;
     dma.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
     dma.DMA_MemoryDataSize     = DMA_MemoryDataSize_Byte;
-    dma.DMA_Mode               = DMA_Mode_Normal;           // 搬完就停
-    dma.DMA_Priority           = DMA_Priority_High;
+    dma.DMA_Mode               = DMA_Mode_Normal;
+    dma.DMA_Priority           = DMA_Priority_Medium;
     dma.DMA_M2M                = DMA_M2M_Disable;
     DMA_Init(DMA1_Channel4, &dma);
 
-    USART_DMACmd(USART1, USART_DMAReq_Tx, ENABLE);  // USART → DMA 触发
-    DMA_Cmd(DMA1_Channel4, ENABLE);
-}
-```
-
-**关键参数**：
-- `DMA_Mode_Normal`：搬一次就停
-- `DMA_Mode_Circular`：搬完从头再来（ADC 连续采样用）
-- `DMA_PeripheralInc_Disable`：外设地址不动（DR 寄存器固定）
-- `DMA_MemoryInc_Enable`：内存地址每次+1（填 buffer）
-
----
-
-## 12.4 动手①：UART DMA 收发——printf 不占 CPU
-
-第 8 章的 `printf` 重定向用的是 `fputc` → `USART_SendData` + 轮询 TXE，每个字符 CPU 都在等。用 DMA 发一批数据，CPU 只需启动一次 DMA。
-
-### UART1 TX DMA
-
-```c
-// 发送缓冲区
-uint8_t dma_tx_buf[256];
-
-void USART1_DMA_Transmit(const uint8_t *data, uint16_t len) {
-    // 等上一次传输完成
-    while (DMA_GetFlagStatus(DMA1_FLAG_TC4) == RESET);
-
-    // 关闭后修改参数
-    DMA_Cmd(DMA1_Channel4, DISABLE);
-
-    DMA1_Channel4->CMAR = (uint32_t)data;     // 内存地址指向要发的数据
-    DMA1_Channel4->CNDTR = len;               // 要发的字节数
-
-    DMA_Cmd(DMA1_Channel4, ENABLE);
-}
-
-int main(void) {
-    USART1_Init();
-    USART1_DMA_TX_Init();      // 配 CH4（在 12.3 节）
+    DMA_ITConfig(DMA1_Channel4, DMA_IT_TC | DMA_IT_TE, ENABLE);
     USART_DMACmd(USART1, USART_DMAReq_Tx, ENABLE);
+    /* 此处还要按第 6 章配置 DMA1_Channel4_IRQn。 */
+}
 
-    const char *msg = "Hello DMA! 这串数据是 DMA 自动搬的，CPU 没逐字节参与。\r\n";
+/* 只能从同一个发送服务上下文调用；多个生产者应先排队。 */
+bool USART1_DmaTxStart(const uint8_t *data, uint16_t length)
+{
+    if (data == NULL || length == 0U || usart1_tx_dma_busy) {
+        return false;
+    }
 
-    while (1) {
-        USART1_DMA_Transmit((uint8_t *)msg, strlen(msg));
-        // CPU 在 DMA 搬数据时可以干别的
-        printf("DMA 正在后台发数据，CPU 在这里执行其他代码\r\n");
-        Delay_ms(2000);
+    usart1_tx_dma_busy = true;       /* 在使能通道之前先占有缓冲区 */
+    DMA_Cmd(DMA1_Channel4, DISABLE);
+    DMA_ClearFlag(DMA1_FLAG_GL4);
+    DMA1_Channel4->CMAR  = (uint32_t)data;
+    DMA1_Channel4->CNDTR = length;
+    DMA_Cmd(DMA1_Channel4, ENABLE);
+    return true;
+}
+
+void DMA1_Channel4_IRQHandler(void)
+{
+    if (DMA_GetITStatus(DMA1_IT_TE4) != RESET) {
+        DMA_Cmd(DMA1_Channel4, DISABLE);
+        DMA_ClearITPendingBit(DMA1_IT_TE4);
+        usart1_tx_dma_error = true;
+        usart1_tx_dma_busy = false;
+        return;
+    }
+    if (DMA_GetITStatus(DMA1_IT_TC4) != RESET) {
+        DMA_Cmd(DMA1_Channel4, DISABLE);
+        DMA_ClearITPendingBit(DMA1_IT_TC4);
+        usart1_tx_dma_busy = false;
     }
 }
 ```
 
-### UART1 RX DMA（接收不定长数据）
-
-接收更实用——DMA 在后台自动收字节到 buffer，CPU 不用逐字节响应中断：
+上面的接口刻意不接受临时栈数组：调用成功后，`data` 必须一直有效到 DMA TC 中断到来。安全来源包括静态字符串、静态发送槽、或发送队列自己拥有的缓冲区；下面这种写法是错误的：
 
 ```c
-#define RX_BUF_SIZE  256
-uint8_t dma_rx_buf[RX_BUF_SIZE];
-volatile uint16_t rx_count = 0;
+void SendBad(void)
+{
+    uint8_t local[] = "hello\r\n";
+    (void)USART1_DmaTxStart(local, sizeof(local));
+} /* 返回后 local 已无效，DMA 仍可能在读它 */
+```
 
-void USART1_DMA_RX_Init(void) {
-    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+同一 USART 的 `printf` 轮询重定向与 DMA TX 也不能混着用。二者都会向 `USART1->DR` 写数据，输出可能交错。要么全部经由一个串行化的 TX 服务，要么把调试日志放到另一 UART。
 
+### 12.3.1 什么时候要等待 USART `TC`
+
+对普通控制台，只要 DMA TC 后继续给同一 UART 排下一段数据即可，硬件会在 TXE 条件满足时续传。对半双工 RS485 则不同：DMA TC 后最后一字节可能仍在移位寄存器中。必须这样收尾：
+
+```text
+DMA TC -> 最后一个字节已写入 USART DR
+等待 USART_FLAG_TC -> 最后一个停止位已从 TX 引脚发出
+DE 拉低 -> 回到接收模式
+```
+
+第 12B 章会把这个序列连同超时、收发方向与 Modbus 帧边界一起实现。
+
+## 12.4 UART RX Circular DMA：它是字节流，不是消息队列
+
+循环 DMA 很适合让 CPU 不必每个字符进一次中断，但它只维护“写指针”。它不知道 `\r\n`、长度字段、CRC 或 Modbus 的静默间隔；这些属于解析器。
+
+设缓冲区容量为 256（2 的幂便于取模），当前 DMA 写入位置为：
+
+```c
+#define UART_RX_CAP  256U
+#define UART_RX_MASK (UART_RX_CAP - 1U)
+
+static volatile uint8_t uart1_rx_dma[UART_RX_CAP];
+static volatile uint32_t uart1_rx_wraps;
+static volatile bool uart1_rx_event;
+static uint32_t uart1_rx_consumed;
+
+static uint16_t USART1_RxWriteIndex(void)
+{
+    return (uint16_t)((UART_RX_CAP -
+            DMA_GetCurrDataCounter(DMA1_Channel5)) & UART_RX_MASK);
+}
+```
+
+初始化时使用 `DMA_DIR_PeripheralSRC`、`DMA_Mode_Circular`、`DMA_PeripheralInc_Disable`、`DMA_MemoryInc_Enable`、两侧字节宽度，然后使能 `USART_DMAReq_Rx`。同时打开 DMA HT/TC 中断：半满时尽快服务，完整回卷时记录圈数。
+
+```c
+void DMA1_Channel5_IRQHandler(void)
+{
+    if (DMA_GetITStatus(DMA1_IT_HT5) != RESET) {
+        DMA_ClearITPendingBit(DMA1_IT_HT5);
+        uart1_rx_event = true;
+    }
+    if (DMA_GetITStatus(DMA1_IT_TC5) != RESET) {
+        ++uart1_rx_wraps;
+        DMA_ClearITPendingBit(DMA1_IT_TC5);
+        uart1_rx_event = true;
+    }
+}
+```
+
+此外可打开 USART 的 IDLE 中断，把“线路空闲”当作一次尽快唤醒解析器的提示。清 IDLE 的 F1 规定动作是读 SR 后读 DR；ISR 不解析协议、不打印：
+
+```c
+void USART1_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART1, USART_IT_IDLE) != RESET) {
+        volatile uint32_t discard;
+        discard = USART1->SR;
+        discard = USART1->DR;
+        (void)discard;
+        uart1_rx_event = true;
+    }
+}
+```
+
+主循环里的消费器按“生产的总字节数”推进读指针。这里的 `wraps` 与 `CNDTR` 快照在临近回卷时有竞争窗口，因此实际工程还应使用 HT/TC/IDLE 事件、足够大的缓冲区，并保证主循环在一个缓冲区周期内得到运行机会。下面的代码展示的是**丢失检测与边界**，不是以一个瞬时 `CNDTR` 值伪造可靠帧：
+
+```c
+void USART1_RxService(void)
+{
+    uint32_t wraps;
+    uint16_t write_index;
+    uint32_t produced;
+
+    if (!uart1_rx_event) {
+        return;
+    }
+    uart1_rx_event = false;
+
+    wraps       = uart1_rx_wraps;
+    write_index = USART1_RxWriteIndex();
+    produced    = wraps * UART_RX_CAP + write_index;
+
+    if (produced - uart1_rx_consumed > UART_RX_CAP) {
+        /* 生产者追过消费者至少一整圈：旧字节已不可恢复。 */
+        uart1_rx_consumed = produced - UART_RX_CAP;
+        Protocol_ReportRxOverrun();
+    }
+
+    while (uart1_rx_consumed != produced) {
+        const uint16_t index = (uint16_t)(uart1_rx_consumed & UART_RX_MASK);
+        Protocol_FeedByte(uart1_rx_dma[index]);
+        ++uart1_rx_consumed;
+    }
+}
+```
+
+`Protocol_FeedByte()` 是第 8 章的状态机入口。它根据协议自身的长度、结束符或 CRC 决定何时交付一帧。对 Modbus RTU 来说，IDLE 只是线索，真正的帧边界仍要由第 12B 章的字符时间规则判断。
+
+## 12.5 SDIO DMA：FIFO 是 32 位数据通道
+
+SDIO 的数据路径不是“把 `uint8_t[512]` 原样交给任意 DMA 宽度”。F103 的 SDIO FIFO 是 32 位宽；ST 的 F1 勘误表也明确指出，SDIO 的 DMA 字节/半字访问不受支持。使用 DMA 读一个 512 字节块时，应以 128 个 word 配置 DMA2 Channel4，并让缓冲区 4 字节对齐。
+
+```c
+#include "stm32f10x_sdio.h"
+
+#define SD_BLOCK_BYTES 512U
+#define SD_BLOCK_WORDS (SD_BLOCK_BYTES / sizeof(uint32_t))
+
+static uint32_t sd_read_block[SD_BLOCK_WORDS]
+    __attribute__((aligned(4)));
+
+void Sdio_DmaPrepareOneBlockRead(uint32_t *words)
+{
     DMA_InitTypeDef dma;
-    DMA_StructInit(&dma);
-    dma.DMA_PeripheralBaseAddr = (uint32_t)&USART1->DR;
-    dma.DMA_MemoryBaseAddr     = (uint32_t)dma_rx_buf;
-    dma.DMA_DIR                = DMA_DIR_PeripheralSRC;    // 外设→内存
-    dma.DMA_BufferSize         = RX_BUF_SIZE;
-    dma.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
-    dma.DMA_MemoryInc          = DMA_MemoryInc_Enable;
-    dma.DMA_Mode               = DMA_Mode_Circular;        // 循环，写满自动从头写
-    DMA_Init(DMA1_Channel5, &dma);        // CH5 = USART1 RX
 
-    USART_DMACmd(USART1, USART_DMAReq_Rx, ENABLE);
-    DMA_Cmd(DMA1_Channel5, ENABLE);
-}
-
-// 读当前 DMA 收到了多少字节
-uint16_t USART1_RX_Available(void) {
-    return RX_BUF_SIZE - DMA_GetCurrDataCounter(DMA1_Channel5);
-}
-
-int main(void) {
-    USART1_Init();
-    USART1_DMA_RX_Init();
-
-    printf("DMA RX 已开启，串口收数据自动存入 buffer（循环模式）\r\n");
-
-    while (1) {
-        uint16_t n = USART1_RX_Available();
-        if (n > 0 && n != rx_count) {
-            printf("DMA 收到 %d 字节: ", n);
-            for (uint16_t i = rx_count; i < n; i++)
-                USART_SendData(USART1, dma_rx_buf[i]);
-            rx_count = n;
-        }
-        // CPU 可以做别的事，DMA 在后台收数据
-    }
-}
-```
-
-### UART DMA 效果对比
-
-| 方式 | 发 1KB 数据 | 收 1KB 数据 |
-|------|-----------|-----------|
-| 轮询 | CPU 忙等 ~10ms | CPU 忙等 ~10ms |
-| 中断 | CPU 进 ~1000 次 ISR | CPU 进 ~1000 次 ISR |
-| **DMA** | **CPU 启动一次即走** | **CPU 启动一次即走** |
-
----
-
-## 12.5 动手②：SDIO + DMA 读 SD 卡扇区
-
-第 11 章用 SDIO 初始化了 SD 卡，但读数据需要轮询 FIFO——每个字 CPU 都要等。加上 DMA 后，SDIO 读一整个扇区自动搬运到内存，CPU 只等一次完成中断。
-
-### SDIO DMA 配置
-
-STM32F103ZET6（本书目标板）有 **DMA2**，SDIO 固定接 **DMA2 通道 4**：
-
-```c
-// 512 字节的扇区 buffer
-uint8_t sdio_buffer[512];
-
-void SDIO_DMA_Init(void) {
     RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA2, ENABLE);
-
-    DMA_InitTypeDef dma;
+    DMA_Cmd(DMA2_Channel4, DISABLE);
+    DMA_DeInit(DMA2_Channel4);
     DMA_StructInit(&dma);
-    dma.DMA_PeripheralBaseAddr = (uint32_t)&SDIO->FIFO;   // SDIO FIFO 地址
-    dma.DMA_MemoryBaseAddr     = (uint32_t)sdio_buffer;    // 内存 buffer
-    dma.DMA_DIR                = DMA_DIR_PeripheralSRC;    // 外设→内存（读卡）
-    dma.DMA_BufferSize         = 128;                       // 512 字节 / 4 = 128 个字
+    dma.DMA_PeripheralBaseAddr = (uint32_t)&SDIO->FIFO;
+    dma.DMA_MemoryBaseAddr     = (uint32_t)words;
+    dma.DMA_DIR                = DMA_DIR_PeripheralSRC;
+    dma.DMA_BufferSize         = SD_BLOCK_WORDS;
     dma.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
     dma.DMA_MemoryInc          = DMA_MemoryInc_Enable;
-    dma.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Word;  // FIFO 32 位
+    dma.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Word;
     dma.DMA_MemoryDataSize     = DMA_MemoryDataSize_Word;
     dma.DMA_Mode               = DMA_Mode_Normal;
-    dma.DMA_Priority           = DMA_Priority_VeryHigh;
+    dma.DMA_Priority           = DMA_Priority_High;
+    dma.DMA_M2M                = DMA_M2M_Disable;
     DMA_Init(DMA2_Channel4, &dma);
-
-    SDIO_DMACmd(ENABLE);          // SDIO 使能 DMA
+    DMA_ClearFlag(DMA2_FLAG_GL4);
 }
 ```
 
-### 读一个扇区
+这只是“准备一块 DMA 内存”的小接口。一个完整的 `Sd_ReadBlock()` 还必须：
 
-```c
-uint8_t SD_ReadBlock_DMA(uint32_t sector) {
-    uint32_t resp[4];
+1. 根据 SDSC/SDHC 类型计算正确命令参数；
+2. 在状态机允许的时机配置 SDIO 数据长度、方向和超时；
+3. 启动 DMA 与相应数据命令；
+4. 同时检查 SDIO 的 `DATAEND`、数据 CRC、数据超时、FIFO 溢出/欠载和 DMA TC；
+5. 无论成功或失败都关闭 DMA、清理标志、让缓冲区所有权回到调用者。
 
-    // 1. CMD16: 设块大小 512
-    SDIO_SendCmd(16, 512, SDIO_Response_Short, NULL);
+不要把“DMA TC”单独当作读块成功：它只说明 128 个 word 已搬入 RAM。卡命令、SDIO 数据 CRC 与状态机错误仍可能失败。关于这个 32 位访问限制，见 [STM32F101xC/D/E 与 STM32F103xC/D/E 勘误表](https://www.st.com/resource/en/errata_sheet/es0340-stm32f101xcde-stm32f103xcde-device-errata-stmicroelectronics.pdf)。
 
-    // 2. CMD17: 读单块
-    SDIO_SendCmd(17, sector * 512, SDIO_Response_Short, resp);
-    if (resp[0] & 0xFF) return 1;   // 检查错误位
+## 12.6 诊断、验收与练习
 
-    // 3. 配置 DMA 开始搬运
-    DMA_Cmd(DMA2_Channel4, DISABLE);
-    DMA2_Channel4->CMAR  = (uint32_t)sdio_buffer;
-    DMA2_Channel4->CNDTR = 128;       // 512 字节 → 128 次 32 位传输
-    DMA_Cmd(DMA2_Channel4, ENABLE);
-
-    // 4. 启动 SDIO 数据通道
-    SDIO_DataInitTypeDef data;
-    SDIO_DataStructInit(&data);
-    data.SDIO_DataTimeOut   = 0xFFFFFF;
-    data.SDIO_DataLength    = 512;
-    data.SDIO_DataBlockSize = SDIO_DataBlockSize_512b;
-    data.SDIO_TransferDir   = SDIO_TransferDir_ToSDIO;       // 卡→主机
-    data.SDIO_TransferMode  = SDIO_TransferMode_Block;
-    data.SDIO_DPSM          = SDIO_DPSM_Enable;
-    SDIO_DataConfig(&data);
-
-    // 5. 等 DMA 传输完成
-    while (DMA_GetFlagStatus(DMA2_FLAG_TC4) == RESET);
-    DMA_ClearFlag(DMA2_FLAG_TC4);
-
-    return 0;
-}
-
-int main(void) {
-    USART1_Init();
-    SD_Init();               // 第 11 章的 SDIO 初始化
-    SDIO_DMA_Init();
-
-    if (SD_ReadBlock_DMA(0) == 0) {    // 读第 0 扇区（MBR）
-        printf("第 0 扇区前 16 字节:\r\n");
-        for (int i = 0; i < 16; i++)
-            printf("%02X ", sdio_buffer[i]);
-        printf("\r\n");
-    }
-    while (1);
-}
-```
-
-输出：
-```
-第 0 扇区前 16 字节:
-EB 3C 90 4D 53 44 4F 53 35 2E 30 00 02 08 3E 00
-```
-
-这是 FAT 文件系统的 MBR 引导扇区。
-
-### 数据流对比
-
-```
-无 DMA：CPU 发 CMD17 → 循环读 FIFO (128 次) → 拿到数据
-                           CPU 被绑死在这里
-
-有 DMA：CPU 发 CMD17 → 启动 DMA → 等一次完成中断 → 拿数据
-                           DMA 干活，CPU 做别的
-```
-
-CPU 从「逐字等待」变成「只等一次完成通知」，效率提升一个数量级。配合后续第 13 章的 FatFs 文件系统，读 SD 卡上的文件只需要 `f_open` + `f_read`，底层全部由 SDIO + DMA 自动完成。
-
----
-
-## 12.6 SPL vs HAL DMA 对照
-
-| 操作 | SPL | HAL |
-|------|-----|-----|
-| 初始化 | `DMA_Init()` + 手配通道/外设请求 | `HAL_DMA_Init()` + `HAL_PPP_Transmit_DMA()` |
-| UART TX | 开 `USART_DMAReq_Tx` + 配 DMA 通道 | `HAL_UART_Transmit_DMA()` 一步 |
-| UART RX | 循环模式 + 查 CNDTR 剩余计数值 | `HAL_UART_Receive_DMA()` + 回调 |
-| SDIO | 手动配 DMA2 通道 4 | `HAL_SD_ReadBlocks_DMA()` 一步 |
-| ADC 连续 | ADC 开 DMA 请求 + DMA 循环模式 | `HAL_ADC_Start_DMA()` + 回调 |
-
-HAL 把「外设请求 + DMA 通道」封装成一步函数，内部自动配中断和回调。SPL 的优势在于你同时看到外设侧的 `USART_DMACmd()` 和 DMA 侧的通道配置——理解了 DMA 的完整工作流。
-
-## 12.7 DMA 缓冲区、所有权与错误恢复
-
-DMA 最大的价值是让外设和内存直接搬数据，但它也引入一个新问题：**同一块内存此刻归谁使用？**
-
-推荐用一个简单规则管理缓冲区：
-
-~~~text
-CPU 填充缓冲区 → 启动 DMA → 缓冲区只读 → DMA 完成中断 → CPU 再次拥有
-~~~
-
-不要在 DMA 尚未完成时复用、释放或改写发送缓冲区。对于 UART 循环接收：
-
-- 用写入位置、读取位置或事件记录真实数据长度；
-- 在 IDLE/传输完成事件中通知解析任务；
-- 缓冲区满时计数并丢弃策略要明确；
-- DMA 错误、超时和外设复位都要有恢复路径。
-
-STM32F103 没有数据 Cache，一致性问题较少；但养成清晰的缓冲区所有权习惯，未来迁移到带 Cache 的 MCU 时仍然适用。
-
-## 12.8 实验验收与常见坑
-
-- [ ] DMA 完成中断确实触发，而不是只看到配置代码；
-- [ ] 发送前后打印缓冲区地址和长度，确认没有提前复用；
-- [ ] 连续发送或接收数千帧后，统计是否有溢出；
-- [ ] 故意制造超时，确认驱动能返回而不是永久等待；
-- [ ] SDIO/DMA 失败时，先检查通道映射、长度和缓冲区对齐。
-
-## 12.9 DMA 验收与练习
-
-DMA 的通过标准是“数据、边界和错误都能说明白”，不是只看到中断进了一次。
-
-| 检查项 | 验收方式 |
+| 现象 | 首先检查 |
 |---|---|
-| 源/目的地址 | 在传输前后打印缓冲区前 8 字节，确认方向没有反 |
-| 长度 | 故意传输非整块长度，确认不会越界 |
-| 完成边界 | 分别处理半传输与完成中断，记录计数 |
-| 缓冲区所有权 | 明确 CPU 何时可读、何时可改、何时必须等待 |
-| 失败恢复 | 模拟超时/外设断开，停止通道、清状态、重新初始化 |
+| 第一次 TX DMA 永远不发 | 是否错误地先等 TC4；USART TX DMA 请求是否使能 |
+| DMA TC 了但 RS485 少最后一字节 | 把 DMA TC 误当 USART TC，DE 释放太早 |
+| DMA TX 内容偶发乱码 | 源数组在栈上、发送期间被改写，或 `printf` 与 DMA 同时写 DR |
+| RX 缓冲区看似随机丢帧 | 消费者落后一整圈，或把 Circular DMA 当作“每次一帧” |
+| SDIO DMA 的 512 字节错位 | 使用了 Byte/HalfWord，或块缓冲区未按 word 管理 |
 
-练习：
-1. 使用双缓冲或“生产者/消费者索引”重写一个 UART 接收示例；
-2. 故意让消费者变慢，记录队列或缓冲区溢出；
-3. 写下每个 DMA 缓冲区的大小、生命周期和所有者。
+最小验收不需要先做完整文件系统：
 
-## 12.10 本章要点
+1. UART TX DMA 发送固定的静态字符串，记录 DMA TC 和 USART TC 的时间顺序。
+2. 向 UART 连续发送超过一个 RX 缓冲区的数据，验证溢出计数会增长，而不是静默假装完整。
+3. 用逻辑分析仪验证 RS485 DE（第 12B 章）直到最后一个停止位后才释放。
+4. 对 SDIO 读块，比较已知扇区的 512 字节内容与 PC 上的十六进制转储；同时分别打印 DMA 与 SDIO 状态。
 
-- DMA = Direct Memory Access，**自动搬运数据**，CPU 只需启动和收完成通知
-- UART TX DMA：发大量数据不占 CPU；UART RX DMA 循环模式：自动收数据到环形 buffer
-- SDIO + DMA：读 SD 卡扇区不再逐字等待，DMA 搬完一整块再通知 CPU
-- **循环模式**（`Circular`）用于不间断数据流（ADC、UART RX）
-- **普通模式**（`Normal`）用于一次性传输（SPI Flash 读、SD 卡读块）
-- 第 9 章的 ADC 多通道 DMA 是 DMA 在 ADC 上的应用——DMA 是连接各章外设的「黏合剂」
+### 练习
 
-
----
-
-> **上一章**：[第 11 章 · SPI 总线](./11-chapter.md)
->
-> **下一章**：[第 12.5 章 · RS485 与 Modbus RTU](./12b-chapter.md)
->
-> DMA 解放了 CPU。但在工业现场，你还需要一种能传几百米的通信方式。
+1. 实现一个有两个静态槽位的 UART TX 队列，明确满队列时丢弃、返回忙还是覆盖旧日志。
+2. 为 RX 循环缓冲区增加 HT/TC 事件计数，并设计一个能够复现“消费者慢一圈”的压力测试。
+3. 为 SDIO DMA 设计 `enum SdTransferResult`，区分命令超时、数据 CRC、DMA 异常和地址参数错误。
+4. 画出“应用 → 块设备 → SDIO 状态机 → DMA → FIFO”的所有权转移图，并标出每一次失败的清理点。

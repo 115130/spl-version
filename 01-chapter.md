@@ -6,10 +6,6 @@
 >
 > **本章验收**：不看资料，解释“为什么 MCU 没有 OS 也能运行 C 程序”，并在自己的工程里找到启动文件、`SystemInit()` 与 `main()`。
 
-> **本章产出**：理解 MCU 怎么运行程序、嵌入式与 PC 的本质区别、逐行搞懂用 SPL 写的 `main.c`
->
-> **用到项目的哪里**：这是认知地基——后面每学一个新外设，你都知道它在整个系统中处于什么位置
-
 ---
 
 ## 1.1 你熟悉的 PC 世界
@@ -43,19 +39,19 @@
 
 ### 上电瞬间发生了什么
 
-当你给 STM32 供上 3.3V 电：
+当你给 STM32 供上 3.3V 电，并按启动配置从用户 Flash 启动时：
 
 ```
 上电 → 内部复位电路等电压稳定
-     → CPU 从地址 0x0000_0000 取第一条指令
-     → 但 STM32 把 Flash 映射到了 0x0800_0000
+     → 启动存储器在 0x0000_0000 处形成一个别名映射
+     → 用户 Flash 的物理起始地址仍是 0x0800_0000
      → 0x0000_0000 存的是 栈顶指针 MSP 的初始值
      → 0x0000_0004 存的是 Reset_Handler 的地址（这就是第一个要执行的函数）
      → Reset_Handler 里：初始化数据段、初始化时钟、调 main()
      → 你的 main() 开始执行
 ```
 
-用代码说话。打开 `lib/startup_stm32f10x_hd.s`（启动汇编文件）：
+用代码说话。打开本书的 [`code/startup_stm32f10x_hd.s`](./code/startup_stm32f10x_hd.s)（启动汇编文件）：
 
 ```asm
 .section .isr_vector,"a",%progbits
@@ -72,37 +68,32 @@
 
 ```asm
 Reset_Handler:
-    ldr   r0, =_estack
-    mov   sp, r0          @ 设置栈指针
-
     @ 把 .data 段从 Flash 复制到 RAM（初始化全局变量）
-    ldr   r3, =_sidata
+    ldr   r0, =_sidata
     ldr   r1, =_sdata
     ldr   r2, =_edata
 1:  cmp   r1, r2
-    bge   2f
-    ldr   r0, [r3]
-    str   r0, [r1]
-    add   r3, #4
-    add   r1, #4
+    bcs   2f
+    ldr   r3, [r0], #4
+    str   r3, [r1], #4
     b     1b
 
     @ 清零 .bss 段（未初始化的全局变量）
 2:  ldr   r1, =_sbss
     ldr   r2, =_ebss
-    mov   r0, #0
+    movs  r3, #0
 3:  cmp   r1, r2
-    bge   4f
-    str   r0, [r1]
-    add   r1, #4
+    bcs   4f
+    str   r3, [r1], #4
     b     3b
 
-4:  bl    SystemInit      @ 初始化时钟（默认 HSI 8MHz）
-    bl    main             @ 跳到你的 main() 函数
-    b     .                @ main() 返回后的死循环（理论上不会执行到）
+4:  bl    SystemInit          @ 按 system_stm32f10x.c 的配置初始化时钟
+    bl    __libc_init_array    @ 运行期初始化钩子（若链接到）
+    bl    main                 @ 跳到你的 main() 函数
+    b     .                    @ main() 返回后的死循环（理论上不会执行到）
 ```
 
-这就是 SPL 启动的全过程——**没有任何隐藏代码**，每一步都摆在 .s 文件里。HAL 用户看到的是 CubeMX 生成的 `SystemClock_Config()`，SPL 用户看到的是这段汇编 + `system_stm32f10x.c` 里的 `SystemInit()`。哪个更透明，不言自明。
+注意两点：CPU 在进入 `Reset_Handler` 前已经把向量表第一项装入 MSP，所以启动汇编不必再次设置栈指针；`.data`、`.bss` 的边界符号由链接脚本和启动文件共同约定，二者必须成对修改。本书第 0 章的实际模板已经把这份约定放进 `examples/00-blink-zet6/`，不要混用网上另一份启动文件和链接脚本。
 
 ### Flash 和 RAM 的分工
 
@@ -157,7 +148,7 @@ Reset_Handler:
 
 ## 1.5 动手：逐行读 SPL 版 `main.c`
 
-回到 `~/code/stm32/init/main.c`，这是你正在用的工程。逐段理解：
+回到实际模板的 [`examples/00-blink-zet6/main.c`](./examples/00-blink-zet6/main.c)。下面另用 **PB5 上外接的测试 LED** 演示 SPL 的 GPIO 调用；它不是本书默认板载 LED，也不能替代 `board.h` 的板级配置。
 
 ### 头文件
 
@@ -178,9 +169,9 @@ void delay(void) {
 }
 ```
 
-- `volatile` 告诉编译器「这个变量可能在任何时刻变化，不许优化掉」
+- `volatile` 告诉编译器“每次读写这个对象都必须保留为可观察访问”
 - 不带 `volatile`，编译器看到 `for(i=0;i<500000;i++);` 空循环可能会直接删掉，因为它觉得「这循环啥也没干」
-- 这个延时非常粗略——不精确，但胜在简单。第 5 章会用 SysTick 定时器替代它
+- 这个延时非常粗略——不精确，也会占满 CPU。`volatile` 不能让它变成定时器，不能让递增操作原子，也不能替代中断同步；第 5 章会用 SysTick 定时器替代它
 
 ### main() 三部曲
 
@@ -194,23 +185,23 @@ int main(void)
 **任何外设使用前必须先开时钟**——这是 STM32 的铁律。不开时钟，属于那个外设的所有寄存器都不可访问，写入无效，读取为 0。STM32F103 的时钟设计像一栋大楼每层有独立电闸——GPIOB 挂在 APB2 总线上，对应 RCC 寄存器的第 3 位。`RCC_APB2PeriphClockCmd` 就是帮你去置那个位的。
 
 ```c
-    // ② 配置 PB5 为推挽输出
+    // ② 配置 PB5 为推挽输出（外接测试 LED，不是板载 LED 的固定引脚）
     GPIO_InitTypeDef gpio;
     GPIO_StructInit(&gpio);               // 填默认值：输入浮空、2MHz、所有引脚
-    gpio.GPIO_Pin   = GPIO_Pin_5;         // 选 Pin 5
+    gpio.GPIO_Pin   = GPIO_Pin_5;         // 选外接测试引脚 PB5
     gpio.GPIO_Mode  = GPIO_Mode_Out_PP;   // 推挽输出（Push-Pull）
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;   // 最大输出速度
+    gpio.GPIO_Speed = GPIO_Speed_2MHz;    // LED 等低速信号不需要 50MHz 边沿
     GPIO_Init(GPIOB, &gpio);
 ```
 
-`GPIO_InitTypeDef` 是 SPL 的 GPIO 配置结构体——和 HAL 里的完全一样（因为 ST 官方定义了同一个结构体给两个库用）。`GPIO_StructInit` 把所有字段填成安全默认值，你再覆盖需要的字段，这样不会因为忘记设某个字段而把栈上的随机垃圾灌进寄存器。
+`GPIO_InitTypeDef` 是 SPL 的 GPIO 配置结构体。`GPIO_StructInit` 把字段填成该库定义的默认值，你再覆盖需要的字段，这样不会因为遗漏字段而把栈上的随机值写入寄存器。实际板载 LED 的端口、有效电平不应硬编码在这里，而应放进 `board.h`（见第 0 章模板）。
 
 ```c
     // ③ 主循环——嵌入式程序永不退出
     while (1) {
-        GPIO_ResetBits(GPIOB, GPIO_Pin_5);   // 输出 0 → LED 亮
+        GPIO_ResetBits(GPIOB, GPIO_Pin_5);   // 输出 0（外接 LED 若低有效则亮）
         delay();
-        GPIO_SetBits(GPIOB, GPIO_Pin_5);     // 输出 1 → LED 灭
+        GPIO_SetBits(GPIOB, GPIO_Pin_5);     // 输出 1（外接 LED 若低有效则灭）
         delay();
     }
 }
@@ -245,6 +236,21 @@ int main(void)
 | while(1) 是低级写法 | 裸机程序本来就需要持续运行；关键是循环内是否有阻塞和状态管理 |
 
 练习：画出你第 0 章 blink 工程的文件关系图，并用一句话说明每个文件在上电后的作用。
+
+### 用 GDB 验证启动路径
+
+把“我以为程序跑到了 `main`”变成可检查的事实。烧录后启动 OpenOCD，再在另一个终端执行：
+
+```gdb
+arm-none-eabi-gdb build/blink.elf
+(gdb) target remote :3333
+(gdb) monitor reset halt
+(gdb) break Reset_Handler
+(gdb) break main
+(gdb) continue
+```
+
+先命中 `Reset_Handler`、再命中 `main`，才说明向量表、链接脚本和基本启动链路一致。若第一个断点都不命中，先回第 0 章检查 HD 启动文件、`FLASH` 起始地址和 OpenOCD 连接；不要先怀疑 GPIO。
 
 ## 1.7 本章要点
 

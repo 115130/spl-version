@@ -1,385 +1,331 @@
-# 第 13 章 · 存储器与文件系统
+# 第 13 章 · 存储语义：原始 NOR 日志与 FatFs 的正确边界
 
-> **本章产出**：能从 SPI Flash 的页写、扇区擦除和掉电边界出发，设计一个可检查的本地日志；理解“写成功返回”不等于永远不会丢数据。
+> **本章产出**：能安全地读、擦、页写一个外部 SPI NOR；能设计掉电后可扫描恢复的追加日志；知道 FatFs 应接到 SD 块设备或经过验证的翻译层，而不是直接套在裸 NOR 上。
 >
-> **前置知识**：第 11 章 SPI、第 12 章 DMA（可选）；第 8 章 UART 用于打印文件系统错误码。
+> **前置知识**：第 11 章 SPI/SDIO、第 12 章 DMA（SD 卡大块传输时使用）。
 >
-> **硬件准备**：3.3V W25Q 系列或兼容 SPI Flash；确认 CS、WP、HOLD 和供电，先在空白或可擦除的测试芯片上实验。
+> **本章边界**：本章不假定板上一定有某一颗 W25Q，也不提供未经实现的“Flash 上 FatFs”捷径。先建立可验证的存储语义，再选择文件系统。
 
-> **本章覆盖**：W25Q64 SPI Flash 驱动、FatFs 文件系统移植、SPI Flash 上读写文件
->
-> **用到项目的哪里**：存储配置参数、日志记录、字库/图片资源
+## 13.1 先按介质的物理规则设计
 
-## 13.1 为什么需要外部存储器
+STM32F103ZET6 的内部 Flash 为 512 KiB，SRAM 为 64 KiB；高密度 F103 的内部 Flash 擦除页为 **2 KiB**。外部 SPI NOR 的容量、页大小、扇区大小、指令集和擦写次数则取决于实物芯片，必须由 JEDEC ID 与数据手册确认。
 
-你的 ZET6 有 512KB 内部 Flash，但：
+| 介质 | 擦除 / 写入事实 | 合适用途 | 不应假设 |
+|---|---|---|---|
+| STM32 内部 Flash | 按页擦除；编程/擦除会影响从 Flash 取指 | 程序、少量关键配置 | 可以像 RAM 一样频繁改一个字节 |
+| SPI NOR Flash | 先擦后写，写只能把位从 1 变 0；通常页编程、扇区擦除 | 资源、追加日志、受控分区 | 擦一扇区后仍能保留其中其他文件 |
+| SD 卡 | 对上层呈现 512 字节块；卡内部有自己的控制器 | FatFs、可交换文件、批量日志 | 断电时写入必然原子完成 |
 
-| 需求 | 需要多大 | 内部 Flash 够吗 |
-|------|---------|----------------|
-| 存几张图片（128×64 OLED） | 128×64×8bit/张 ≈ 8KB | ✅ |
-| 汉字字库（16×16 点阵，常用 6763 字）| 6763×32 ≈ 216KB | ❌ 太大 |
-| 记录传感器日志（每小时 1KB，存一年） | 1KB×24×365 ≈ 8.7MB | ❌ |
-| 固件升级包（OTA） | 几十到几百 KB | ❌ |
+第 11 章的 SPI 是事务层，不保证这些介质语义；第 13 章的设计必须在事务层之上显式处理范围、擦除、忙状态、校验与掉电。
 
-**你的板子上**：**W25Q64**（8MB SPI NOR Flash）就是干这个的。它挂在 SPI1（PA5/PA6/PA7），CS 用 PB12。
+### 13.1.1 首次连通只验证“这颗芯片能说话”
 
-## 13.2 W25Q64 SPI Flash 驱动
-
-### 接线
-
-第 11 章已经配置了 SPI1，引脚直接复用：
-
-| SPI1 信号 | STM32 | W25Q64 |
-|-----------|-------|--------|
-| SCK | PA5 | CLK |
-| MISO | PA6 | DO |
-| MOSI | PA7 | DI |
-| CS | PB12 | CS# |
-
-### 基本操作
-
-W25Q64 的命令很简单——发命令码 + 参数，然后收/发数据：
+对兼容 JEDEC 的 NOR，`0x9F` 常可读出厂商、类型和容量编码。它是很好的 SPI 验收命令，但不能单凭某个常见值就把容量写死为 8 MiB。保存识别结果后，用一个几何结构驱动范围检查：
 
 ```c
-#define FLASH_CS_LOW()   GPIO_ResetBits(GPIOB, GPIO_Pin_12)
-#define FLASH_CS_HIGH()  GPIO_SetBits(GPIOB, GPIO_Pin_12)
+typedef struct {
+    uint32_t capacity_bytes;
+    uint32_t erase_unit_bytes;
+    uint16_t page_bytes;
+} NorGeometry;
+
+/* 仅在识别值与对应数据手册均确认后填写。 */
+static NorGeometry g_nor;
 ```
 
-#### 读 JEDEC ID（验证通信）
+对于使用 3 字节地址命令的器件，地址空间本身最多覆盖 16 MiB。容量更大的芯片可能需要 4 字节地址模式或其他厂商命令；不要把本章的 3 字节示例扩展到未知容量。
+
+## 13.2 原始 NOR 的安全基础层
+
+### 13.2.1 擦除必须有明确的授权范围
+
+擦除是破坏性操作。第一次实验只允许碰一个在配置中明确命名的测试分区，绝不接受“任意地址都可以擦”：
 
 ```c
-uint32_t Flash_ReadID(void) {
-    FLASH_CS_LOW();
-    SPI_Transfer(0x9F);                          // JEDEC ID 命令
-    uint32_t id  = SPI_Transfer(0xFF) << 16;
-    id          |= SPI_Transfer(0xFF) << 8;
-    id          |= SPI_Transfer(0xFF);
-    FLASH_CS_HIGH();
-    return id;   // W25Q64 = 0xEF4017
-}
+#define NOR_TEST_BASE  0x00100000UL  /* 由你的分区表决定，不是通用常量 */
+#define NOR_TEST_SIZE  0x00010000UL
 
-int main(void) {
-    SPI1_Init();           // 第 11 章
-    USART1_Init();
-    uint32_t id = Flash_ReadID();
-    printf("Flash ID = 0x%06lX\r\n", id);
-    while (1);
+static bool Nor_IsInTestPartition(uint32_t address, uint32_t length)
+{
+    return length <= NOR_TEST_SIZE &&
+           address >= NOR_TEST_BASE &&
+           address - NOR_TEST_BASE <= NOR_TEST_SIZE - length;
 }
 ```
 
-输出：
-```
-Flash ID = 0xEF4017
-```
+这里的减法顺序很重要：先确认 `address >= base`，再计算 `address - base`，避免无符号下溢把越界地址误判为安全。真实项目应把分区表集中在一个文件中，并为启动镜像、资源、日志、工厂数据分别指定不可重叠范围。
 
-`0xEF` = 华邦（Winbond）厂商 ID，`0x4017` = W25Q64 型号。看到这个值说明 SPI 通信通了。
+### 13.2.2 页写的前置条件
 
-#### 读数据（任意地址，任意长度）
+绝大多数常见 SPI NOR 的 Page Program 不能跨页：如果页为 256 字节，地址低 8 位为 250 时最多只可写 6 个字节。跨页的行为常是地址在同一页内回绕，导致“前面几字节看似正确，页首被悄悄覆盖”。因此把边界检查放进最低层接口。
+
+以下代码把底层 SPI 事务抽象为 `Nor_Begin()`、`Nor_End()` 和 `Nor_TxRx()`；它们应使用第 11 章的 CS、`BSY` 与超时规则。故意不在这里再复制一个没有超时的 `SPI_Transfer()`。
 
 ```c
-void Flash_ReadData(uint32_t addr, uint8_t *buf, uint32_t len) {
-    FLASH_CS_LOW();
-    SPI_Transfer(0x03);                          // Read Data
-    SPI_Transfer((addr >> 16) & 0xFF);            // 地址 3 字节
-    SPI_Transfer((addr >> 8)  & 0xFF);
-    SPI_Transfer( addr        & 0xFF);
-    for (uint32_t i = 0; i < len; i++)
-        buf[i] = SPI_Transfer(0xFF);              // 读数据
-    FLASH_CS_HIGH();
-}
-```
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "timebase.h"
 
-#### 擦除扇区（写之前必须先擦除）
+typedef enum {
+    NOR_OK = 0,
+    NOR_ARGUMENT,
+    NOR_RANGE,
+    NOR_ALIGNMENT,
+    NOR_BUS_ERROR,
+    NOR_WEL_NOT_SET,
+    NOR_TIMEOUT
+} NorResult;
 
-```c
-void Flash_WriteEnable(void) {
-    FLASH_CS_LOW();
-    SPI_Transfer(0x06);                          // Write Enable
-    FLASH_CS_HIGH();
-}
+bool Nor_Begin(void);                 /* CS 拉低，取得 SPI 总线所有权 */
+bool Nor_End(void);                   /* 等 BSY=0，再释放 CS */
+bool Nor_TxRx(uint8_t tx, uint8_t *rx);
 
-void Flash_WaitBusy(void) {
-    FLASH_CS_LOW();
-    SPI_Transfer(0x05);                          // Read Status Register
-    while (SPI_Transfer(0xFF) & 0x01);            // BUSY 位
-    FLASH_CS_HIGH();
+static bool Nor_RangeValid(uint32_t address, uint32_t length)
+{
+    return length <= g_nor.capacity_bytes &&
+           address <= g_nor.capacity_bytes - length;
 }
 
-void Flash_EraseSector(uint32_t addr) {
-    Flash_WriteEnable();
-    FLASH_CS_LOW();
-    SPI_Transfer(0x20);                          // Sector Erase (4KB)
-    SPI_Transfer((addr >> 16) & 0xFF);
-    SPI_Transfer((addr >> 8)  & 0xFF);
-    SPI_Transfer( addr        & 0xFF);
-    FLASH_CS_HIGH();
-    Flash_WaitBusy();                            // ~150ms
-}
-```
+static NorResult Nor_ReadStatus(uint8_t *status)
+{
+    uint8_t ignored;
 
-#### 写一页（256 字节）
-
-```c
-void Flash_WritePage(uint32_t addr, const uint8_t *data, uint16_t len) {
-    Flash_WriteEnable();
-    FLASH_CS_LOW();
-    SPI_Transfer(0x02);                          // Page Program
-    SPI_Transfer((addr >> 16) & 0xFF);
-    SPI_Transfer((addr >> 8)  & 0xFF);
-    SPI_Transfer( addr        & 0xFF);
-    for (uint16_t i = 0; i < len; i++)
-        SPI_Transfer(data[i]);
-    FLASH_CS_HIGH();
-    Flash_WaitBusy();                            // ~3ms
-}
-```
-
-### 验证：写一组数据再读回来
-
-```c
-int main(void) {
-    SPI1_Init();
-    USART1_Init();
-
-    uint8_t write_buf[] = "Hello W25Q64! 这是 SPI Flash 写入的数据。";
-    uint8_t read_buf[64] = {0};
-
-    uint32_t test_addr = 0x00010000;             // 避开前 64KB（可能放启动代码）
-
-    Flash_EraseSector(test_addr);                // 擦除 4KB
-    Flash_WritePage(test_addr, write_buf, sizeof(write_buf));
-    Flash_ReadData(test_addr, read_buf, sizeof(read_buf));
-
-    printf("读回: %s\r\n", read_buf);
-    while (1);
-}
-```
-
-输出：
-```
-读回: Hello W25Q64! 这是 SPI Flash 写入的数据。
-```
-
-### 内部 Flash vs SPI NOR Flash 对比
-
-| | STM32 内部 Flash | W25Q64（SPI NOR Flash）|
-|--|-----------------|------------------------|
-| 容量 | 512KB | **8MB** |
-| 接口 | 内部总线（AHB） | SPI 总线 |
-| 擦除单位 | 1KB 页 | **4KB 扇区** |
-| 擦除寿命 | 1 万次 | **10 万次** |
-| 写入时 CPU | 暂停（Flash 总线被锁）| **不暂停**（SPI 后台传输）|
-| 用途 | 程序代码、关键参数 | 字库、日志、OTA 固件包 |
-
-> **SPI Flash 比内部 Flash 更适合存大量数据**——容量大、不阻塞 CPU、寿命更长。唯一的代价是速度（SPI 9MHz vs 内部 AHB 72MHz），但对大多数数据存储场景足够。
-
----
-
-## 13.3 动手：在 SPI Flash 上跑 FatFs 文件系统
-
-上面我们直接往 SPI Flash 写地址+数据，但项目里你不会这么用——你需要的是 **文件**：
-
-```c
-f_open(&file, "log.txt", FA_WRITE | FA_CREATE_ALWAYS);
-f_printf(&file, "温度: %.1f°C\r\n", temp);
-f_close(&file);
-```
-
-FatFs 就是一个帮你把「扇区读写」变成「文件操作」的中间层。
-
-### FatFs 是什么
-
-FatFs 是一个**纯 C 的 FAT 文件系统库**，跟 SPL/HAL 无关。它不知道你的存储介质是 SPI Flash 还是 SD 卡——它只需要 6 个底层函数。
-
-### 移植：对接 6 个 diskio 函数
-
-FatFs 的 `ff.c` 调用 `diskio.c` 中的 6 个函数。对于 W25Q64：
-
-```c
-// diskio.c —— 完整实现
-
-DSTATUS disk_initialize(BYTE pdrv) {
-    if (pdrv != 0) return STA_NODISK;
-    SPI1_Init();                // 确保 SPI 已初始化
-    return 0;                   // 成功
-}
-
-DSTATUS disk_status(BYTE pdrv) {
-    if (pdrv != 0) return STA_NODISK;
-    return 0;                   // 永远 Ready
-}
-
-DRESULT disk_read(BYTE pdrv, BYTE *buffer, LBA_t sector, UINT count) {
-    // FatFs 把 W25Q64 当成 512 字节/扇区的磁盘（每 512 字节 = 1 个模拟扇区）
-    for (UINT i = 0; i < count; i++)
-        Flash_ReadData((sector + i) * 512, buffer + i * 512, 512);
-    return RES_OK;
-}
-
-DRESULT disk_write(BYTE pdrv, const BYTE *buffer, LBA_t sector, UINT count) {
-    for (UINT i = 0; i < count; i++) {
-        uint32_t addr = (sector + i) * 512;
-        // 检查是否是扇区起始地址（4KB 对齐），是则擦除
-        if ((addr & 0xFFF) == 0)
-            Flash_EraseSector(addr);
-        Flash_WritePage(addr, buffer + i * 512, 256);            // 前 256 字节
-        Flash_WritePage(addr + 256, buffer + i * 512 + 256, 256); // 后 256 字节
+    if (status == NULL || !Nor_Begin() ||
+        !Nor_TxRx(0x05U, &ignored) ||
+        !Nor_TxRx(0xFFU, status) || !Nor_End()) {
+        return NOR_BUS_ERROR;
     }
-    return RES_OK;
+    return NOR_OK;
 }
 
-DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
-    switch (cmd) {
-    case GET_SECTOR_COUNT:
-        *(LBA_t *)buff = 16384;         // 8MB / 512 = 16384 个扇区
-        return RES_OK;
-    case GET_SECTOR_SIZE:
-        *(WORD *)buff = 512;
-        return RES_OK;
-    case GET_BLOCK_SIZE:
-        *(DWORD *)buff = 8;             // 4KB/512 = 8 个扇区/擦除块
-        return RES_OK;
-    default:
-        return RES_PARERR;
+static NorResult Nor_WaitReady(uint32_t timeout_ms)
+{
+    const uint32_t start = Timebase_NowMs();
+    uint8_t status;
+
+    for (;;) {
+        if (Nor_ReadStatus(&status) != NOR_OK) {
+            return NOR_BUS_ERROR;
+        }
+        if ((status & 0x01U) == 0U) {  /* WIP = 0 */
+            return NOR_OK;
+        }
+        if ((uint32_t)(Timebase_NowMs() - start) >= timeout_ms) {
+            return NOR_TIMEOUT;
+        }
     }
 }
 
-DWORD get_fattime(void) {
-    // 返回固定时间戳（如果不连 RTC）
-    return (2025 - 1980) << 25 | 1 << 21 | 1 << 16;  // 2025-01-01
+static NorResult Nor_WriteEnable(void)
+{
+    uint8_t ignored;
+    uint8_t status;
+
+    if (!Nor_Begin() || !Nor_TxRx(0x06U, &ignored) || !Nor_End()) {
+        return NOR_BUS_ERROR;
+    }
+    if (Nor_ReadStatus(&status) != NOR_OK) {
+        return NOR_BUS_ERROR;
+    }
+    return (status & 0x02U) != 0U ? NOR_OK : NOR_WEL_NOT_SET;
 }
 ```
 
-### 使用 FatFs：创建文件并写入
+`WIP`（write in progress）和 `WEL`（write enable latch）的位定义、指令码与超时上限必须按你的芯片数据手册确认。上面的写使能检查是故障早发现，不是对所有兼容品的保证。
+
+### 13.2.3 只写一页的接口
 
 ```c
-FATFS   fs;        // 文件系统对象
-FIL     file;      // 文件对象
-UINT    bw;        // 写入字节数
+NorResult Nor_ProgramOnePage(uint32_t address, const uint8_t *data,
+                             uint16_t length, uint32_t timeout_ms)
+{
+    uint16_t i;
+    uint8_t ignored;
 
-int main(void) {
-    USART1_Init();
-
-    // 1. 挂载文件系统（逻辑驱动器 "0:"）
-    FRESULT res = f_mount(&fs, "0:", 1);
-    if (res == FR_NO_FILESYSTEM) {
-        // 首次使用，需要格式化
-        printf("未检测到文件系统，正在格式化...\r\n");
-        f_mkfs("0:", 0, 0, 512);        // 格式化为 FAT16
-        f_mount(&fs, "0:", 1);          // 重新挂载
+    if (data == NULL || length == 0U || length > g_nor.page_bytes) {
+        return NOR_ARGUMENT;
+    }
+    if (!Nor_RangeValid(address, length)) {
+        return NOR_RANGE;
+    }
+    if ((uint32_t)(address % g_nor.page_bytes) + length > g_nor.page_bytes) {
+        return NOR_ALIGNMENT;
+    }
+    {
+        const NorResult wel = Nor_WriteEnable();
+        if (wel != NOR_OK) {
+            return wel;
+        }
+    }
+    if (!Nor_Begin()) {
+        return NOR_BUS_ERROR;
     }
 
-    // 2. 创建文件并写入
-    res = f_open(&file, "0:hello.txt", FA_WRITE | FA_CREATE_ALWAYS);
-    if (res == FR_OK) {
-        f_printf(&file, "Hello from STM32F103 + W25Q64!\r\n");
-        f_printf(&file, "温度: %.1f°C\r\n", 25.5f);
-        f_close(&file);
-        printf("文件写入成功\r\n");
+    if (!Nor_TxRx(0x02U, &ignored) ||       /* Page Program：需按芯片确认 */
+        !Nor_TxRx((uint8_t)(address >> 16), &ignored) ||
+        !Nor_TxRx((uint8_t)(address >> 8), &ignored) ||
+        !Nor_TxRx((uint8_t)address, &ignored)) {
+        (void)Nor_End();
+        return NOR_BUS_ERROR;
     }
-
-    // 3. 读回确认
-    char buf[128];
-    res = f_open(&file, "0:hello.txt", FA_READ);
-    if (res == FR_OK) {
-        f_gets(buf, sizeof(buf), &file);
-        printf("文件内容: %s", buf);
-        f_close(&file);
+    for (i = 0U; i < length; ++i) {
+        if (!Nor_TxRx(data[i], &ignored)) {
+            (void)Nor_End();
+            return NOR_BUS_ERROR;
+        }
     }
-
-    while (1);
+    if (!Nor_End()) {
+        return NOR_BUS_ERROR;
+    }
+    return Nor_WaitReady(timeout_ms);
 }
 ```
 
-第一次运行输出：
+写任意长度数据的上层函数必须按“当前页剩余空间”分段调用 `Nor_ProgramOnePage()`；擦除函数同理应拒绝未按 `erase_unit_bytes` 对齐的地址。写后立刻读回并逐字节比较，才是第一次实验的验收。SPI/DMA 可以减少 CPU 参与传输的时间，但**编程和擦除期间的 WIP 仍需要轮询或做成异步状态机**，不能据此宣称“Flash 写入不阻塞”。
+
+## 13.3 追加日志：把掉电当作正常事件
+
+原始 NOR 最适合先做追加式日志：从空白区域顺序向后写，写满一个擦除单元后切到下一个。它避免了“把旧数据改回 1”这一难题，并让恢复过程可以只扫描记录。
+
+### 13.3.1 一条记录应有哪些逻辑字段
+
+不要直接把 C 结构体裸写进 Flash：编译器填充、字节序和未来字段变动都会破坏兼容性。定义固定的字节序列化格式，例如：
+
+```text
+magic | format_version | header_length | payload_length | sequence
+      | payload_crc32 | ...可扩展字段... | payload | commit_word
 ```
-未检测到文件系统，正在格式化...
-文件写入成功
-文件内容: Hello from STM32F103 + W25Q64!
+
+其中：
+
+- `magic` 防止把擦除态或随机数据当记录；
+- `format_version` 和 `header_length` 允许以后扩展；
+- `payload_length` 必须先做分区范围检查，不能相信损坏值；
+- `sequence` 用于找最新记录、发现缺失；
+- `payload_crc32` 覆盖 payload；
+- `commit_word` 独立放在最后，擦除态为全 `1`，完成态只把某些位编程为 `0`。
+
+一次安全的写入顺序是：预先擦好当前擦除单元 → 写未提交的头 → 分页写 payload → 读回/校验必要部分 → 最后只写 `commit_word`。掉电后，扫描器只有同时满足“头合法、长度在界内、commit 完成、CRC 正确”的记录才交给应用。
+
+若在未提交/损坏记录处断电，不能盲目信任其中的长度以跳到“下一条”。简单安全策略是把该擦除单元余下区域视为不可用，切换到下一个已擦除单元；之后按你的数据保留策略再回收这一单元。循环使用多个擦除单元并轮转写入位置，才能均匀分摊擦除寿命。
+
+### 13.3.2 启动扫描的责任
+
+启动恢复程序至少应输出：扫描到的最后合法 `sequence`、跳过的损坏/未提交记录数、当前可写位置、每个擦除单元的状态。这样你才能通过断电实验回答“最多丢哪一条记录”，而不是只说“理论上有 CRC”。
+
+对内部 Flash 做同类日志时，页大小应按 ZET6 的 2 KiB 处理；更重要的是遵守 F1 编程/擦除流程，并评估中断与代码取指受 Flash 操作影响的时段。小配置若需要频繁更新，也应使用页轮换和序号，不要反复擦同一页。
+
+## 13.4 FatFs 的正确底座：512 字节块设备
+
+FatFs 是 FAT 文件系统实现。它期望的底层介质语义是：给出逻辑扇区号和数量，可靠地读/写完整扇区，并在 `CTRL_SYNC` 时完成底层同步。最自然的介质是已经完成初始化的 SD 卡块驱动。
+
+```text
+应用（日志 / 配置文件）
+        ↓
+FatFs: f_open / f_write / f_sync / f_close
+        ↓
+diskio.c: disk_read / disk_write / disk_ioctl
+        ↓
+SD 块设备：读写 512 字节逻辑扇区，处理 SDSC/SDHC 地址差异
+        ↓
+SDIO 状态机 + DMA（第 11、12 章）
 ```
 
-**关电再开**，文件还在——这就是非易失存储 + 文件系统的意义。
+裸 SPI NOR 不能直接假装成 SD 卡。FAT 会在任意扇区反复更新目录、FAT 表和文件内容，而 NOR 需要先擦除整个较大单元、且擦除会毁掉邻近扇区。仅仅“地址每 4 KiB 时擦一次，再页写两个 256 字节”会在 FAT 更新时破坏已有文件。若确实要在 NOR 上使用 FatFs，必须先实现并验证磨损均衡、擦除块回收、逻辑到物理映射与掉电恢复的 FTL/托管 Flash 层；这是一项独立工程，不是 `diskio.c` 的几行代码。
 
-### FatFs 文件操作速查
+### 13.4.1 `diskio.c` 的语义契约
 
-| 函数 | 作用 | 类似 C 标准库 |
-|------|------|-------------|
-| `f_open` | 打开/创建文件 | `fopen` |
-| `f_close` | 关闭文件 | `fclose` |
-| `f_read` | 读数据 | `fread` |
-| `f_write` | 写数据 | `fwrite` |
-| `f_printf` | 格式化写 | `fprintf` |
-| `f_gets` | 读一行 | `fgets` |
-| `f_lseek` | 移动读写指针 | `fseek` |
-| `f_mkdir` | 创建目录 | `mkdir` |
-| `f_unlink` | 删除文件 | `remove` |
-| `f_rename` | 重命名 | `rename` |
+以下是接 SD 卡时应该满足的语义，而不是可直接复制的完整驱动。具体的 `LBA_t`、`UINT` 与是否需要 `disk_write` 取决于你所用 FatFs 版本和 `ffconf.h` 配置。
 
-### SPI Flash + FatFs 能干什么
+```c
+DRESULT disk_read(BYTE pdrv, BYTE *buffer, LBA_t sector, UINT count)
+{
+    if (pdrv != 0U || buffer == NULL || count == 0U || !Sd_IsReady()) {
+        return RES_NOTRDY;
+    }
+    return Sd_ReadBlocks((uint32_t)sector, buffer, count)
+         ? RES_OK : RES_ERROR;
+}
 
-- **数据日志**：每隔 10 秒写一条传感器数据到 `log.csv`，攒满一个月用电脑读
-- **字库存储**：把汉字字库存到 Flash，上电后加载到内存
-- **配置文件**：WiFi 密码、PID 参数以 INI 格式存储，电脑上也能编辑
-- **OTA 固件包**：下载固件→存到 Flash→重启→从 Flash 加载执行
+DRESULT disk_write(BYTE pdrv, const BYTE *buffer, LBA_t sector, UINT count)
+{
+    if (pdrv != 0U || buffer == NULL || count == 0U || !Sd_IsReady()) {
+        return RES_NOTRDY;
+    }
+    return Sd_WriteBlocks((uint32_t)sector, buffer, count)
+         ? RES_OK : RES_ERROR;
+}
 
----
+DRESULT disk_ioctl(BYTE pdrv, BYTE command, void *buffer)
+{
+    if (pdrv != 0U || !Sd_IsReady()) {
+        return RES_NOTRDY;
+    }
+    switch (command) {
+    case CTRL_SYNC:        return Sd_Synchronize() ? RES_OK : RES_ERROR;
+    case GET_SECTOR_SIZE:  *(WORD *)buffer = 512U; return RES_OK;
+    case GET_SECTOR_COUNT: return Sd_GetSectorCount((LBA_t *)buffer)
+                              ? RES_OK : RES_ERROR;
+    case GET_BLOCK_SIZE:   return Sd_GetEraseBlockSectors((DWORD *)buffer)
+                              ? RES_OK : RES_ERROR;
+    default:               return RES_PARERR;
+    }
+}
+```
 
-## 13.4 掉电、寿命与日志策略
+块驱动应对上层隐藏 SDSC 的字节地址与 SDHC/SDXC 的块地址差异；FatFs 只看到从 0 开始的 512 字节 LBA。任一次 `Sd_ReadBlocks` 或 `Sd_WriteBlocks` 要么完成请求的所有扇区，要么返回失败，不能在已写一半时仍返回 `RES_OK`。
 
-文件系统的难点不只是“写进去”，而是“写到一半断电时还能知道发生了什么”。
+### 13.4.2 应用层写文件也有失败边界
 
-建议把日志策略写清楚：
+一次日志写入至少检查每个 `FRESULT` 和写入字节数，并在希望落盘的位置调用 `f_sync()`：
 
-| 问题 | 建议 |
+```c
+FRESULT WriteOneRecord(FIL *file, const void *record, UINT length)
+{
+    UINT written = 0U;
+    FRESULT result = f_write(file, record, length, &written);
+
+    if (result != FR_OK || written != length) {
+        return (result == FR_OK) ? FR_DISK_ERR : result;
+    }
+    return f_sync(file);
+}
+```
+
+`f_sync()` 和 `f_close()` 也可能失败，必须被日志服务记录。它们能请求 FatFs/块驱动提交数据，但不能让突然断电的所有硬件内部状态变成绝对原子；重要日志仍应有序号、长度和应用级 CRC。首次格式化是破坏性维护操作：只在明确的维护模式、确认设备为空且按当前 FatFs 版本 `ff.h` 的 `f_mkfs` 签名调用，不要把某一版本的四参数示例硬塞进所有工程。
+
+## 13.5 验收与故障定位
+
+### 原始 NOR 的四阶段验收
+
+1. **识别**：低速 SPI 下连续读 ID，断开 CS/MISO 时能得到可诊断错误。
+2. **擦写**：只擦预定义测试分区；页内写、跨页拒绝、读回逐字节比较。
+3. **边界**：尝试越过容量、页尾和擦除单元边界，所有操作必须拒绝且不修改邻近数据。
+4. **掉电**：在头、payload、commit 三个阶段分别复位；启动扫描只接受完整 CRC 记录。
+
+### FatFs/SD 的验收
+
+| 测试 | 通过条件 |
 |---|---|
-| 数据多久落盘 | 按记录数量或时间间隔调用同步，而不是每字节同步 |
-| 突然掉电 | 启动时检查文件完整性、最后一条记录和序号 |
-| Flash 擦除寿命 | 避免反复写同一个小区域，采用循环日志或分区 |
-| 日志格式 | 选择可恢复、可检查的 CSV/JSONL/二进制帧 |
-| 存储失败 | 上报错误，保留 RAM 中最近样本，不要卡死采样任务 |
-
-对温度记录仪来说，seq、时间戳和 CRC 往往比“把每一行写得漂亮”更重要；它们能帮助你判断缺失、重复和损坏。
-
-## 13.5 实验验收与常见坑
-
-- [ ] 连续写入多条记录并重启，确认能识别最后状态；
-- [ ] 模拟 SD 卡或 SPI Flash 不存在，任务能超时返回；
-- [ ] 记录写入失败次数、剩余空间和最近 seq；
-- [ ] 不在 ISR 中操作文件系统；
-- [ ] 在说明中写出“掉电时可能丢失多少最近数据”。
-
-## 13.6 存储实验验收与练习
-
-用“写入—读回—断电—恢复”四步证明日志策略，而不是只做一次成功演示。
-
-1. 擦除一个明确的测试区域；
-2. 写入带版本、长度和 CRC 的记录；
-3. 立即读回并逐字节比较；
-4. 在不同记录阶段模拟复位，再启动扫描恢复；
-5. 统计擦除次数和写入失败次数。
+| 挂载已格式化 SD 卡 | `f_mount` 成功，容量与块驱动一致 |
+| 写入后读回 | 比较全部字节，不只打印字符串开头 |
+| 拔卡/初始化失败 | `diskio` 返回错误，主循环仍可运行 |
+| `f_sync` 后复位 | 文件系统能挂载，应用记录能识别最近完整条目 |
+| 未格式化卡 | 仅在明确维护流程下格式化；普通运行报 `FR_NO_FILESYSTEM` |
 
 | 现象 | 优先检查 |
 |---|---|
-| 写后读回全 FF | 写使能、页边界、CS、擦除状态 |
-| 记录偶尔损坏 | 掉电窗口、CRC、页/扇区边界、未等待 busy 清除 |
-| 文件系统挂载失败 | 块设备回调、扇区大小、格式化状态、SPI 事务 |
-| 寿命越来越差 | 反复擦同一扇区、没有轮换或批量写策略 |
+| NOR 写入后页首被改 | 一次 Page Program 跨了页边界 |
+| NOR 擦完后其他数据丢失 | 擦除单元/分区边界设计错误 |
+| NOR 一直忙 | WIP 轮询无超时、CS 时序错误或供电异常 |
+| FatFs 写一次后旧文件坏 | 试图把裸 NOR 伪装为可随机覆写磁盘 |
+| 文件存在但最后记录缺失 | 未检查 `f_sync`/`f_close`，或掉电策略未定义 |
 
-练习：设计一条 32 字节日志记录，其中包含 magic、版本、序号、长度、payload 和 CRC；写出启动时如何跳过最后一条半写入记录。
+### 练习
 
-## 13.7 本章要点
-
-- W25Q64 = 8MB SPI NOR Flash，用 SPI1（PA5/PA6/PA7/PB12）操作
-- SPI Flash 铁律：**写之前必须先擦除**，擦除以 4KB 扇区为单位
-- W25Q64 的基本命令：`0x9F` 读 ID、`0x03` 读数据、`0x02` 页写、`0x20` 扇区擦除、`0x06` 写使能
-- FatFs 是一个**库无关的文件系统**——只需要实现 6 个 `diskio.c` 函数就能在任何存储介质上跑 FAT
-- SPI Flash + FatFs = 嵌入式设备的「硬盘」：存日志、字库、配置文件
-- 存储层次：内部 Flash（代码）→ W25Q64（大量数据）→ SD 卡（可插拔、更大容量）
-
----
-
-> **上一章**：[第 12.5 章 · RS485 与 Modbus RTU](./12b-chapter.md)
->
-> **下一章**：[第 14 章 · 为什么需要 RTOS（SPL版）](./14-chapter.md)
->
-> 裸机部分告一段落。接下来进入多任务世界——让你的 MCU 同时做多件事。
+1. 定义一个以小端或大端明确编码的日志头，并为它写 encode/decode 单元测试向量。
+2. 让写入器在每一页后故意复位，验证扫描器永不接受未提交记录。
+3. 为 NOR 分区表加一个“只读资源区”和“可擦日志区”，并在 API 层拒绝跨区操作。
+4. 为 SD `diskio.c` 记录最后一个命令错误、最后一个数据错误和失败 LBA；用它解释一次拔卡失败。
+5. 比较“原始追加日志”和“FatFs 文件日志”在掉电恢复、电脑可读性、实现成本上的取舍。

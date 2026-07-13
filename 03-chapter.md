@@ -6,10 +6,6 @@
 >
 > **硬件准备**：STM32F103ZET6、ST-Link；外接 LED 时必须串联限流电阻，按键输入必须有确定的上拉或下拉。
 
-> **本章产出**：用 SPL 函数 + 纯寄存器两种方式控制 GPIO、驱动流水灯、驱动按键输入并理解消抖
->
-> **用到项目的哪里**：GPIO 是嵌入式开发的起点——LED、按键、继电器、蜂鸣器、片选信号，所有项目的第一步都要配 GPIO
-
 ---
 
 ## 3.1 GPIO 硬件结构
@@ -90,7 +86,7 @@ PMOS（P 沟道 MOS 管）和 NMOS（N 沟道 MOS 管）各有一个：
       │
 GPIO ─┼───→ 引脚（连到外部的上拉电阻）
       │
-      │ NMOS  ← ODR=1 时导通
+      │ NMOS  ← ODR=0 时导通
       └──┐
          │
         GND
@@ -98,10 +94,10 @@ GPIO ─┼───→ 引脚（连到外部的上拉电阻）
 
 关键区别：**PMOS 被禁用**，只剩 NMOS：
 
-- ODR 写 **1** → NMOS 导通 → 引脚通过 NMOS **直接连到 GND（0V）**
-- ODR 写 **0** → NMOS 断开 → 引脚浮空（高阻态），被外部上拉电阻拉到 **VDD（比如 3.3V）**
+- ODR 写 **0** → NMOS 导通 → 引脚通过 NMOS **直接连到 GND（0V）**
+- ODR 写 **1** → NMOS 断开 → 引脚高阻，被外部上拉电阻拉到 **VDD（通常是 3.3V）**
 
-**等等，这里的 ODR 逻辑和直觉相反**？是的，同一位的 1 和 0 在开漏下物理行为不一样。但 SPL 封装好了——`GPIO_SetBits` 仍然把引脚置高（断开 NMOS），`GPIO_ResetBits` 拉低（导通 NMOS）。
+因此 `GPIO_SetBits` 在开漏模式表示“释放总线”，`GPIO_ResetBits` 表示“拉低总线”。逻辑值和引脚的电气行为一致：写 1 不是 MCU 主动供电，而是停止下拉。
 
 **开漏最关键的物理特性**：引脚对外呈现出**两种阻抗状态**——要么是 0Ω 到 GND（低电平），要么是**高阻抗（Hi-Z）**。而外部上拉电阻在 Hi-Z 时把电平「拉」上去。
 
@@ -110,7 +106,7 @@ GPIO ─┼───→ 引脚（连到外部的上拉电阻）
 **什么时候用开漏**：
 
 1. **I2C 总线**：多个设备共享 SCL/SDA，任何设备都能把线拉低，但不能拉高——靠上拉电阻。如果其中一个设备输出 1 而另一个输出 0，推挽输出会导致短路（一个往 VDD 推，一个往 GND 拉）；开漏输出最多就是 1 和 0 打架变成**线与**（谁拉低谁赢）。
-2. **电平转换**：外设是 5V 但 STM32 是 3.3V。把上拉电阻接到 5V，开漏输出 Hi-Z 时引脚被拉到 5V——实现 3.3V → 5V 输出。
+2. **电平转换**：只有数据手册明确该引脚耐受目标电压、而且总线中所有参与者都安全时，才可讨论把上拉接到更高电压。初学实验一律把上拉接 3.3V；不要把“开漏”理解为自动安全的 5V 方案。
 3. **多个芯片共用一个中断线**：任何芯片都能把中断线拉低，不会打架。
 
 ### 3.2.3 复用推挽 vs 复用开漏
@@ -221,7 +217,7 @@ NMOS（拉 GND）        ✔        ✔        断开   断开   断开
 | 你想做的事 | 用什么模式 | 为什么 |
 |-----------|-----------|--------|
 | 点亮 LED（一端接 VDD，一端接 GPIO） | 推挽输出 | LED 需要电流，推挽能提供足够驱动 |
-| 驱动 5V 继电器（STM32 是 3.3V） | 开漏输出 + 5V 上拉 | 电平转换，5V 上拉输出 5V |
+| 驱动继电器/电机 | GPIO + 三极管/MOSFET 驱动级 | GPIO 不直接承受线圈电流；线圈要有续流二极管 |
 | I2C 通信 | 开漏输出（或复用开漏） | I2C 协议要求线与逻辑 |
 | 串口 TX | 复用推挽输出 | 外设自动控制，输出 3.3V 逻辑电平 |
 | 测量 NTC 电压 | 模拟输入 | ADC 需要纯模拟路径 |
@@ -251,14 +247,14 @@ MODE[1:0]（低 2 位）：
    00 = 输入
    01 = 输出，最大 10MHz
    10 = 输出，最大 2MHz
-   11 = 输出，最大 50MHz ← LED/普通外设用这个
+   11 = 输出，最大 50MHz（这是输出翻转能力/边沿速度，不是程序运行速度）
 
 CNF[1:0]（高 2 位）：
    输入模式下：00=模拟, 01=浮空, 10=上拉/下拉, 11=保留
    输出模式下：00=推挽, 01=开漏, 10=复用推挽, 11=复用开漏
 ```
 
-**例子**：把 PB5 配成 50MHz 推挽输出。PB5 在 CRL 里占 bits[23:20]，CNF=00（推挽），MODE=11（50MHz）→ 写入 `0x0030_0000`。
+普通 LED 或片选通常选 2MHz 已足够；更高的输出速度意味着更陡的边沿和更强的噪声，不是“越高越好”。若用 PB5 作外接 LED，2MHz 推挽的配置字是 `0x0020_0000`；它只是外接实验，不代表你的板载 LED。
 
 ### BSRR 为什么比 ODR 好
 
@@ -322,12 +318,12 @@ void spl_led_init(void) {
 | 初始化 | `GPIO_Init(GPIOx, &cfg)` | 写 CRL/CRH |
 | 输出高 | `GPIO_SetBits(GPIOx, Pin)` | 写 BSRR 低 16 位 |
 | 输出低 | `GPIO_ResetBits(GPIOx, Pin)` | 写 BSRR 高 16 位 |
-| 翻转（手动实现） | `GPIOx->ODR ^= Pin` | 异或 ODR |
+| 翻转（单一上下文） | `GPIOx->ODR ^= Pin` | 读-改-写 ODR，不能与 ISR/其他写者并发 |
 | 读输入 | `GPIO_ReadInputDataBit(GPIOx, Pin)` | 读 IDR |
 | 写整个端口 | `GPIO_Write(GPIOx, val)` | 写 ODR |
 
 ```c
-// 翻转引脚（SPL 没有原生 Toggle，自己加一行宏）
+// 仅限这一个上下文是该引脚唯一写者时使用；这不是原子操作。
 #define GPIO_ToggleBits(GPIOx, Pin)  ((GPIOx)->ODR ^= (Pin))
 
 GPIO_ToggleBits(GPIOB, GPIO_Pin_5);   // PB5 翻转
@@ -339,7 +335,7 @@ GPIO_ToggleBits(GPIOB, GPIO_Pin_5);   // PB5 翻转
 
 ### 接线
 
-将板载的多个 LED（或外接 LED 到 PB0-PB3）依次点亮：
+将**外接**的多个 LED（每个都串限流电阻）接到 PB0–PB3 后依次点亮：
 
 | 引脚 | 颜色（依板子）|
 |------|-------------|
@@ -348,7 +344,7 @@ GPIO_ToggleBits(GPIOB, GPIO_Pin_5);   // PB5 翻转
 | PB2 | 蓝 |
 | PB3 | 黄（或其他）|
 
-普中玄武板上通常有 3-4 个可编程 LED，查原理图确认引脚。
+这是一组临时外接映射，不是“板载流水灯”的声明。PB0/PB1 与本书默认的 DS18B20/DHT11 实验、PB0 与 TIM3_CH3 PWM 实验互斥；做本实验前断开那些模块，并在资源表中记录冲突。
 
 ### 代码
 
@@ -363,11 +359,12 @@ void LED_All_Init(void) {
     GPIO_StructInit(&gpio);
     gpio.GPIO_Pin   = LED_PINS;
     gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    gpio.GPIO_Speed = GPIO_Speed_2MHz;
     GPIO_Init(LED_PORT, &gpio);
 
-    // 初始全灭（推挽输出默认高电平还是低电平要看电路设计）
-    LED_PORT->ODR |= LED_PINS;
+    // 这里假定每个 LED 阳极经电阻接 3.3V、阴极接 GPIO：高电平灭。
+    // 直接写 BSRR，避免同端口其他位被读-改-写覆盖。
+    GPIO_SetBits(LED_PORT, LED_PINS);
 }
 ```
 
@@ -387,7 +384,7 @@ while (1) {
 
 LED 像水一样「流」过——这就是嵌入式初体验中最有成就感的 10 行代码。
 
-> **如果只有一个 LED 或引脚不同**：用 `GPIO_ToggleBits` 配合 `Delay_ms` 做呼吸节奏也行。流水灯的思想是「一组引脚依次输出」——你学会了 `ODR` 批量操作。
+> **如果只有一个 LED 或引脚不同**：改 `board.h` 后用第 0 章的 `BoardLed_Write()` 验证。流水灯的思想是一组引脚依次输出；若 ISR 或 DMA 也可能写同一端口，不要用 `ODR ^= ...` 作为通用翻转方案。
 
 ---
 
@@ -447,35 +444,39 @@ while (1) {
 
 ### 3.9.3 软件消抖
 
-思路：**检测到电平变化 -> 跳过抖动期（等 20-50ms）-> 再读一次确认**。
+思路：**检测到原始电平变化 → 记录时间 → 只有持续稳定 20–50ms 才提交新状态**。下面的示例假定第 0 章的 1ms 时基已经提供 `Timebase_NowMs()`；第 5 章会实现它。不要引用 HAL 的 `uwTick`，本书的 SPL 工程中没有这个全局变量。
 
 ```c
-uint8_t Key_Debounce(void) {
-    static uint32_t last_tick = 0;
-    static uint8_t  last_state = 1;     // 上拉初始 = 1
+typedef struct {
+    uint8_t raw;          // 最近一次立即采样的电平
+    uint8_t stable;       // 已确认的稳定电平
+    uint32_t changed_at;  // raw 最近改变的时间
+} KeyDebouncer;
 
-    uint8_t cur = GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0);
+static KeyDebouncer key = { .raw = 1, .stable = 1, .changed_at = 0 };
 
-    // 状态变化：记录时间，暂不确认
-    if (cur != last_state) {
-        last_tick  = uwTick;            // SysTick 计数值，见第 5 章
-        last_state = cur;
-        return 0;
+/* 返回 1 只表示一次“稳定的按下沿”（上拉按键：1 -> 0）。 */
+uint8_t Key_PollPressed(void)
+{
+    const uint8_t sample = GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0);
+    const uint32_t now = Timebase_NowMs();
+
+    if (sample != key.raw) {
+        key.raw = sample;
+        key.changed_at = now;
     }
 
-    // 状态稳定超过 30ms -> 确认是有效按压（非抖动）
-    if ((uwTick - last_tick) > 30) {
-        if (cur == 0 && last_state == 0) {
-            last_state = 2;             // 标记已处理
-            return 1;                   // 确认为一次有效按下
-        }
-        if (cur == 1) last_state = 1;   // 释放后复位
+    if (key.raw != key.stable &&
+        (uint32_t)(now - key.changed_at) >= 30U) {
+        const uint8_t old = key.stable;
+        key.stable = key.raw;
+        return (old == 1U && key.stable == 0U);
     }
-    return 0;
+    return 0U;
 }
 ```
 
-核心：不阻塞（`Delay_ms(30)` 会让 CPU 原地等 30ms——太浪费了），而是用 `uwTick` 计时。这就是第 6 章要讲的中断思路的雏形。
+核心：不阻塞（`Delay_ms(30)` 会让 CPU 原地等 30ms），而是用单调递增的毫秒计数计时。计数回绕通过无符号减法处理；主循环只要周期性调用 `Key_PollPressed()` 即可。这是第 6 章中“中断只产生时基/事件，主循环做业务”的雏形。
 
 ### 3.9.4 完整实验：按键切换 LED 模式
 
@@ -483,28 +484,30 @@ uint8_t Key_Debounce(void) {
 typedef enum { MODE_OFF, MODE_ON, MODE_BLINK } led_mode_t;
 
 int main(void) {
-    LED_Init();         // GPIOB PB5
+    BoardLed_Init();    // 实际引脚与有效电平来自 board.h
     Key_Init();         // GPIOA PA0
 
     led_mode_t mode = MODE_OFF;
     uint32_t last_blink = 0;
 
     while (1) {
-        if (Key_Debounce()) {
+        if (Key_PollPressed()) {
             mode = (mode + 1) % 3;
         }
 
         switch (mode) {
         case MODE_OFF:
-            GPIO_SetBits(GPIOB, GPIO_Pin_5);     // 灭
+            BoardLed_Write(0);
             break;
         case MODE_ON:
-            GPIO_ResetBits(GPIOB, GPIO_Pin_5);   // 亮
+            BoardLed_Write(1);
             break;
         case MODE_BLINK:
-            if (uwTick - last_blink > 500) {
-                GPIO_ToggleBits(GPIOB, GPIO_Pin_5);
-                last_blink = uwTick;
+            if ((uint32_t)(Timebase_NowMs() - last_blink) >= 500U) {
+                static uint8_t led_on;
+                led_on ^= 1U;
+                BoardLed_Write(led_on);
+                last_blink = Timebase_NowMs();
             }
             break;
         }
@@ -565,25 +568,30 @@ void GPIO_Init(GPIO_TypeDef *GPIOx, GPIO_InitTypeDef *cfg) {
 
 最小实验不要同时接多个模块：先让 LED 稳定闪烁，再读按键，最后才做流水灯与消抖。
 
+每次开始前写下“引脚、有效电平、上拉来源、共享资源、观察方法”五项。GPIO 代码本身通常很短；最常见错误来自把别的实验的物理接线和本次代码混在一起。
+
 | 现象 | 优先检查 |
 |---|---|
 | LED 逻辑反了 | 开发板 LED 是否低电平点亮；输出模式和实际引脚 |
 | 按键随机触发 | 输入是否浮空；上拉/下拉与按键接法是否一致 |
 | GPIO 无变化 | RCC 时钟、端口/引脚号、是否被复用或调试接口占用 |
 | 外接 LED 不亮 | 极性、限流电阻、GPIO 电压和 GND |
+| 总线一直低或模块不回应 | 是否误用推挽驱动共享线；上拉是否存在、是否接到安全电压 |
+| 偶发错位/闪烁 | 是否用 `ODR ^= ...` 与中断/其他模块并发写同一端口 |
 
 练习：
 1. 用逻辑取反实现按键控制 LED，并说明为什么不能只靠一次读取避免抖动；
 2. 把一个输出从推挽改为开漏，解释为什么必须外接或启用上拉；
 3. 用 GDB 或寄存器窗口观察 ODR/IDR/BSRR 中至少一个值的变化。
+4. 用万用表测输出高/低，确认这是**实际引脚**的变化；不要只根据 LED 是否可见下结论。
 
 ## 3.12 本章要点
 
-- GPIO 推挽驱动 LED/按键，开漏用于 I2C；上拉给悬空引脚默认高电平
+- GPIO 推挽输出可驱动 LED 等数字负载，输入配上拉/下拉后才能可靠读取按键；开漏用于 I2C 等“只拉低、靠上拉释放”的总线
 - CRL/CRH 配制模式，IDR 读输入，ODR/BSRR 写输出；BSRR 原子写优于 ODR
 - SPL 的 `GPIO_Init` 本质是帮你填 CRL/CRH 寄存器——打开源文件就能看到，没有黑箱
 - SPL 和纯寄存器方式**可以在同一工程混用**
-- 按键消抖 = 检测变化 → 延迟 20-50ms → 确认稳定；用 `uwTick` 计时，不阻塞 CPU
+- 按键消抖 = 记录原始变化 → 等待 20–50ms 稳定 → 提交一次边沿事件；用本书的毫秒时基计时，不阻塞 CPU
 - 使用任何 GPIO 前必须 `RCC_APB2PeriphClockCmd()` 使能对应时钟——忘了就全部不响应
 
 ---

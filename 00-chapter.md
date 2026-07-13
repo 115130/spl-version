@@ -1,32 +1,43 @@
-# 第 0 章 · 开发环境搭建（ZET6 SPL版）
+# 第 0 章 · 开发环境搭建（ZET6 SPL 版）
 
-> **本章产出**：Linux 下完整的 STM32 开发环境就绪——GCC + SPL + Makefile + OpenOCD + 第一个 SPL 工程（LED 闪烁）
+> **本章产出**：一个可构建、可烧录、可调试的 STM32F103ZET6 SPL 最小工程，而不是只在教程里“看起来能运行”的代码。
 >
-> **硬件前置**：本书统一使用 STM32F103ZET6。若你还不熟悉供电、GND、ST-Link 和 UART 接线，请先完成 [第 0.5 章](./00.5-hardware-basics.md)。
+> **硬件前置**：先完成 [第 0.5 章](./00.5-hardware-basics.md)。你至少应能确认 SWDIO、SWCLK、GND、板卡供电方式，以及 LED 的实际引脚与有效电平。
 >
-> **预计时间**：一个下午
+> **通过标准**：生成 ELF/BIN/HEX/MAP；OpenOCD `verify` 成功；GDB 能先停在 `Reset_Handler` 再停在 `main`；LED 以约 500 ms 开、500 ms 关的节奏变化。
 
 ---
 
-## 0.1 为什么选这套工具链
+## 0.1 这一章解决什么问题
 
-嵌入式初学者常被 IDE 裹挟——Keil、IAR、CubeIDE 各搞一套，换个平台就不会了。
+你熟悉的 Web 项目通常由运行时、操作系统和 IDE 接住大量细节；裸机工程必须明确回答下面六个问题：
 
-**Linux + GCC + Makefile + OpenOCD + SPL** 这套方案的好处：
+| 问题 | 本章中的答案 |
+|---|---|
+| 由谁把 C 编译成 ARM 指令？ | `arm-none-eabi-gcc` |
+| 哪些 SPL 源文件参与构建？ | Makefile 中明确列出的 RCC、GPIO、CMSIS 文件 |
+| 复位后从哪里开始？ | HD 启动文件的完整中断向量表与 `Reset_Handler` |
+| 程序和变量分别放在哪里？ | 链接脚本：Flash 512KB、SRAM 64KB |
+| 如何烧录与调试？ | OpenOCD + ST-Link/DAP-Link + GDB |
+| LED 实际在哪个引脚？ | `board.h`；由你的原理图/测量确认 |
 
-| | 商业 IDE（Keil/IAR） | 本书方案 |
-|---|---|---|
-| 价格 | 收费（或破解） | **免费** |
-| 平台 | Windows 为主 | **Linux 原生** |
-| 你看到的 | GUI 按钮背后的魔法 | **每一行编译选项你都知道什么意思** |
-| 换芯片 | 可能要换 IDE | 改 Makefile 几行就行 |
-| 找工作 | 部分公司用 | **所有公司都用 GCC 做 CI/CD** |
+本书不支持把 C8T6/MD 工程改几个宏后“凑合运行”。ZET6 的工程身份必须始终一致：
 
-> 你学完这套工具链，就不只是「会用 STM32」了——你懂了 ARM 嵌入式开发的全流程。
+| 项目 | 固定值 |
+|---|---|
+| MCU | STM32F103ZET6（LQFP144） |
+| SPL 宏 | `STM32F10X_HD` |
+| 启动文件 | `startup_stm32f10x_hd.s` |
+| Flash / SRAM | 512KB / 64KB |
+| 调试接口 | SWD：PA13、PA14、GND |
 
-## 0.2 安装工具链
+板载 LED、按键、USB 串口、板载 Flash 的接线不是上述“芯片身份”的一部分。请先填写 [板卡资源约定](./board-zet6-profile.md)；它是全书唯一的板卡事实入口。
 
-### Step 1：安装 ARM GCC 交叉编译器
+## 0.2 安装命令行工具
+
+### ARM GCC 交叉编译器
+
+你的 PC 是 x86-64/ARM64，而目标是 Cortex-M3；因此必须使用“为 ARM 生成代码”的交叉编译器。
 
 ```bash
 # Ubuntu/Debian
@@ -38,16 +49,14 @@ sudo pacman -S arm-none-eabi-gcc arm-none-eabi-binutils
 # Fedora
 sudo dnf install arm-none-eabi-gcc arm-none-eabi-binutils
 
-# NixOS（通过 flake，推荐）
-# 在项目的 flake.nix 中声明 buildInputs，然后 direnv allow 自动加载
-# 详见本目录下的 flake.nix 和 .envrc 示例
-
-# 验证安装
 arm-none-eabi-gcc --version
-# arm-none-eabi-gcc (15:13.3.rel1-2) 13.3.1 20240614
+arm-none-eabi-objcopy --version
+arm-none-eabi-gdb --version
 ```
 
-### Step 2：安装 OpenOCD（调试和烧录）
+### OpenOCD
+
+OpenOCD 让命令行、GDB 与 ST-Link/DAP-Link 通过 SWD 通信。
 
 ```bash
 # Ubuntu/Debian
@@ -59,533 +68,217 @@ sudo pacman -S openocd
 # Fedora
 sudo dnf install openocd
 
-# NixOS：同上，flake.nix 的 buildInputs 已包含 openocd
-
-# 验证
 openocd --version
-# Open On-Chip Debugger 0.12.0
 ```
 
-### Step 3：解决 USB 权限问题
+Linux 上若普通用户无法访问调试器，需要为**自己的调试器型号**配置 udev 规则。先用 `lsusb` 看 VID:PID，再按发行版与调试器官方文档添加规则；不要把来源不明的 `0666` 规则当成通用解法。规则生效后，重新插拔调试器并确认 OpenOCD 能连接。
 
-Linux 默认不允许普通用户访问 USB 调试器。需要一条 udev 规则把设备文件设为 0666 权限：
+## 0.3 获取并识别 SPL
 
-```bash
-# 创建文件 /etc/udev/rules.d/99-stlink.rules
-sudo tee /etc/udev/rules.d/99-stlink.rules << 'EOF'
-# ST-Link V2 (0483:3748 旧版 / 0483:374b 新版)
-ATTRS{idVendor}=="0483", ATTRS{idProduct}=="3748", MODE="0666"
-ATTRS{idVendor}=="0483", ATTRS{idProduct}=="374b", MODE="0666"
+本章按 ST 的 `STM32F10x_StdPeriph_Lib_V3.5.0` 目录结构编写。下载/解压后，不要把 CMSIS、驱动源码、头文件随机散拷到多个工程；先保持原始库树，并通过 `SPL_ROOT` 指向它。
 
-# CMSIS-DAP / DAP-Link
-ATTRS{idVendor}=="0d28", ATTRS{idProduct}=="0204", MODE="0666"
-EOF
-
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-
-# 拔插调试器使规则生效
-```
-
-> **NixOS 用户**：不能直接写 `/etc/udev/rules.d/`。将上述规则放到 `/etc/nixos/hardware.nix` 的 `services.udev.extraRules` 中，然后 `sudo nixos-rebuild switch`。详见附录 D。
-
-## 0.3 准备 SPL 标准外设库
-
-### 下载 SPL
-
-ST 官网现在不太好找 SPL 的下载链接。下面是两种获取方式：
-
-**方式一**：ST 官网下载 `STM32F10x_StdPeriph_Lib_V3.5.0.zip`（需要注册 ST 账号）
-
-**方式二**：GitHub 上有人维护了镜像：
-```bash
-git clone https://github.com/abhishekkCTRL/STM32F10x_StdPeriph_Driver.git
-```
-
-### 了解 SPL 的目录结构
-
-```
+```text
 STM32F10x_StdPeriph_Lib_V3.5.0/
-├── CMSIS/
-│   ├── CM3/
-│   │   ├── CoreSupport/       ← core_cm3.c/h (ARM 内核支持)
-│   │   └── DeviceSupport/ST/STM32F10x/
-│   │       ├── startup/       ← 启动文件（汇编）
-│   │       │   ├── startup_stm32f10x_hd.s  ← ZET6 使用的启动文件（High Density）
-│   │       │   └── ...
-│   │       ├── stm32f10x.h   ← 寄存器地址定义
-│   │       └── system_stm32f10x.c  ← 系统时钟初始化
-│   └── ...
-└── STM32F10x_StdPeriph_Driver/
-    ├── inc/                   ← 头文件：stm32f10x_gpio.h, stm32f10x_usart.h ...
-    └── src/                   ← 源文件：stm32f10x_gpio.c, stm32f10x_usart.c ...
+└── Libraries/
+    ├── CMSIS/
+    │   ├── CM3/CoreSupport/core_cm3.c
+    │   └── CM3/DeviceSupport/ST/STM32F10x/
+    │       ├── system_stm32f10x.c
+    │       └── stm32f10x.h
+    └── STM32F10x_StdPeriph_Driver/
+        ├── inc/      ← GPIO、RCC 等头文件
+        └── src/      ← GPIO、RCC 等实现
 ```
 
-**你需要的核心文件**（在一个最小 SPL 工程中）：
+最小 blink 只需要 CMSIS、`system_stm32f10x.c`、RCC 与 GPIO。之后每增加一个外设，才把对应 SPL 的 `.c` 文件和头文件加入 Makefile/`stm32f10x_conf.h`。**头文件被 include 不等于实现已经参与链接**；最终是否链接，由 Makefile 的源文件列表决定。
 
-| 文件 | 作用 |
-|------|------|
-| `startup_stm32f10x_hd.s` | 启动代码（中断向量表 + Reset_Handler） |
-| `system_stm32f10x.c` | 系统时钟初始化 `SystemInit()` |
-| `core_cm3.c` | ARM Cortex-M3 内核访问函数 |
-| `stm32f10x_rcc.c` | 时钟控制 |
-| `stm32f10x_gpio.c` | GPIO 控制 |
-| `stm32f10x_conf.h` | 你写的——决定哪些外设驱动被编译 |
-| `main.c` | 你的代码 |
-| `Makefile` | 构建脚本 |
+## 0.4 使用可构建的起步工程
 
-## 0.4 你的第一个 SPL 工程
+仓库中的 [`examples/00-blink-zet6`](./examples/00-blink-zet6) 是本书第一个工程的唯一源码版本。不要手抄下面以外的旧 Makefile、旧链接脚本或不完整向量表。
 
-### 目录结构
+```bash
+cd examples/00-blink-zet6
 
-```
-~/stm32/01-blink-spl/
-├── Makefile
-├── main.c
-├── stm32f10x_conf.h
-├── stm32f10x_it.c          ← 中断服务函数（可留空）
-├── lib/                    ← 从 SPL 包拷贝过来的文件
-│   ├── startup_stm32f10x_hd.s
-│   ├── system_stm32f10x.c
-│   ├── core_cm3.c
-│   ├── stm32f10x_rcc.c
-│   └── stm32f10x_gpio.c
-├── inc/                    ← 头文件
-│   ├── stm32f10x.h          ← 主头文件（会 include 下面几个）
-│   ├── system_stm32f10x.h   ← SystemCoreClock 声明（必须！）
-│   ├── stm32f10x_rcc.h
-│   ├── stm32f10x_gpio.h
-│   └── core_cm3.h
-└── build/                  ← 编译产物（自动生成）
+# 先只验证 SPL 路径。失败时不要继续编译。
+make check-spl SPL_ROOT=$HOME/opt/STM32F10x_StdPeriph_Lib_V3.5.0
+
+# 编译，并生成 ELF/BIN/HEX/MAP。
+make SPL_ROOT=$HOME/opt/STM32F10x_StdPeriph_Lib_V3.5.0
 ```
 
-### Makefile 入门：从零理解 Makefile
+工程结构如下：
 
-如果你没写过 Makefile，先花几分钟搞懂它的基本语法。Makefile 只有三种东西：
+```text
+00-blink-zet6/
+├── Makefile               ← 工具链、SPL 路径、参与编译的源码
+├── link.ld                ← ZET6 的 Flash/SRAM 与段布局
+├── main.c                 ← SysTick 1 ms 时基 + LED 状态机
+├── board.h                ← 唯一允许写板载 LED 物理引脚的地方
+├── stm32f10x_conf.h       ← 本例启用的 SPL 头文件
+└── build/                 ← 自动生成，禁止手工编辑
+```
 
-#### 1. 变量
+启动文件位于仓库根目录 [`code/startup_stm32f10x_hd.s`](./code/startup_stm32f10x_hd.s)，由 Makefile 以相对路径编译。它包含高容量 F1 的完整向量表：除了常见 GPIO/USART 中断，还包括 ADC3、FSMC、SDIO、TIM5–7、SPI3、UART4/5、DMA2 等条目。不能用 C8T6/Medium Density 启动文件替代它。
+
+### 读懂 Makefile 的关键部分
 
 ```makefile
-CC = arm-none-eabi-gcc     # 定义变量 CC
-CFLAGS = -mcpu=cortex-m3   # 定义编译选项
+SPL_ROOT ?= ../../STM32F10x_StdPeriph_Lib_V3.5.0
 
-# 使用时用 $(变量名)：
-$(CC) $(CFLAGS) -c main.c
-# 展开后变成：arm-none-eabi-gcc -mcpu=cortex-m3 -c main.c
+CFLAGS += -DSTM32F10X_HD -DUSE_STDPERIPH_DRIVER
+CFLAGS += -I. -I$(DEVICE) -I$(CMSIS)/CoreSupport -I$(SPL)/inc
+CFLAGS += -MMD -MP -ffunction-sections -fdata-sections
+
+OBJS += $(BUILD)/stm32f10x_rcc.o $(BUILD)/stm32f10x_gpio.o
+LDFLAGS += -Wl,--gc-sections,-Map,$(BUILD)/$(TARGET).map,--cref
 ```
 
-`+=` 是追加（不覆盖）：
+| 项 | 作用 | 出错时先看什么 |
+|---|---|---|
+| `SPL_ROOT` | 未修改 SPL 根目录的位置 | 目录下是否同时存在 `Libraries/CMSIS` 和 `Libraries/STM32F10x_StdPeriph_Driver` |
+| `STM32F10X_HD` | 让设备头文件选择高容量 F1 定义 | 不要写成 `MD`，也不要在多个文件重复定义不同密度 |
+| `-MMD -MP` | 生成头文件依赖，改 `.h` 后能重编 | `build/*.d` 是自动产物 |
+| `-ffunction-sections` + `--gc-sections` | 允许链接器删除未引用函数 | 不会替你修复漏加的 SPL `.c` 文件 |
+| `-Map` | 输出符号/段布局地图 | 这是 Flash/RAM 超限和符号冲突的第一手证据 |
 
-```makefile
-CFLAGS = -Wall         # CFLAGS = -Wall
-CFLAGS += -O2          # CFLAGS = -Wall -O2
-```
+`Makefile` 中的命令行必须以 **Tab** 开头，不能用空格。若你复制后看到 `missing separator`，优先检查这一点。
 
-#### 2. 规则（Rule）
+### 链接脚本和启动文件必须配对
 
-```makefile
-目标: 依赖1 依赖2
-	命令1
-	命令2
-```
-
-规则的意思是：**要生成「目标」，需要先有「依赖」；然后用「命令」来生成。**
-
-```makefile
-# 例子：blink.elf 依赖 main.o 和 gpio.o，用 gcc 把它们链接起来
-blink.elf: main.o gpio.o
-	arm-none-eabi-gcc -o blink.elf main.o gpio.o
-```
-
-> ⚠️ 命令行前面**必须是 Tab 键，不能是空格**。这是 Makefile 最常见的坑。
-
-#### 3. 模式规则（Pattern Rule）
-
-`%.o: %.c` 的意思是：「任何 `.o` 文件都可以从同名的 `.c` 文件编译出来」：
-
-```makefile
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
-#                          ↑  ↑
-#                          │  └── $< = 第一个依赖（.c 文件）
-#                          └───── $@ = 目标名（.o 文件）
-```
-
-#### 4. 不写规则的第一个目标 = 默认目标
-
-```makefile
-all: blink.elf     # ← 这是第一个目标，执行 make 时默认执行它
-```
-
----
-
-### 逐行解读本书的 Makefile
-
-现在回到 SPL 工程的 Makefile，逐段拆解：
-
-```makefile
-# ===== 第一段：定义变量 =====
-TARGET = blink              # 最终产物叫 blink.elf / blink.bin
-
-CC      = arm-none-eabi-gcc # C 编译器
-AS      = arm-none-eabi-as  # 汇编器
-LD      = arm-none-eabi-gcc # 链接器（和编译器同一个程序）
-OBJCOPY = arm-none-eabi-objcopy  # 格式转换工具
-SIZE    = arm-none-eabi-size     # 显示代码大小
-```
-
-```makefile
-# ===== 第二段：编译选项（传给 gcc 的参数）=====
-MCU     = cortex-m3         # CPU 架构
-FLOAT   = -msoft-float      # Cortex-M3 没有硬件浮点，用软件模拟
-
-CFLAGS  = -mcpu=$(MCU) -mthumb $(FLOAT)
-#          生成 cortex-m3 指令  用 Thumb 模式  软浮点
-
-CFLAGS += -O0 -g3 -Wall -fmessage-length=0
-#         优化0  调试信息3  所有警告  不截断错误信息
-#         ↑ O0 不做优化，每行 C 对应明确的汇编，方便调试
-
-CFLAGS += -DSTM32F10X_HD
-#         定义宏 STM32F10X_HD（告诉 stm32f10x.h 你的芯片是大容量）
-
-CFLAGS += -I./inc
-#         头文件搜索路径：-I 后面跟目录，-I./inc 表示也在 ./inc 里找 .h
-
-LDFLAGS = -T link.ld -mcpu=$(MCU) -mthumb $(FLOAT)
-#          链接脚本   CPU 参数（和编译时保持一致）
-
-LDFLAGS += -Wl,--gc-sections
-#           告诉链接器：删掉没被引用的函数（省 Flash）
-
-LDFLAGS += -specs=nosys.specs -specs=nano.specs
-#           用 nano 版 C 标准库（体积小）  不依赖操作系统
-```
-
-```makefile
-# ===== 第三段：源文件列表 =====
-C_SRCS  = main.c stm32f10x_it.c                     # 你的代码
-C_SRCS += lib/system_stm32f10x.c lib/core_cm3.c     # CMSIS 内核
-C_SRCS += lib/stm32f10x_rcc.c lib/stm32f10x_gpio.c  # SPL 外设驱动
-
-ASM_SRCS = lib/startup_stm32f10x_hd.s  # 启动汇编（大容量芯片用 _hd）
-
-# 把 .c 和 .s 分别替换成 .o
-OBJS = $(C_SRCS:.c=.o) $(ASM_SRCS:.s=.o)
-#      └──────────────┘ └──────────────┘
-#        main.c → main.o     startup.s → startup.o
-```
-
-```makefile
-# ===== 第四段：规则 =====
-
-# 默认目标：make 或 make all 就执行这个
-all: $(TARGET).elf $(TARGET).bin $(TARGET).hex
-	$(SIZE) $(TARGET).elf       # 编译完后显示 Flash/RAM 占用
-
-# 链接：把所有 .o 合成一个 .elf
-$(TARGET).elf: $(OBJS)
-	$(LD) $(LDFLAGS) -o $@ $^
-#                        ↑  ↑
-#                        │  └── $^ = 所有依赖（所有 .o 文件）
-#                        └───── $@ = 目标（blink.elf）
-
-# 编译 .c → .o（模式规则，自动匹配）
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-# 汇编 .s → .o（模式规则，自动匹配）
-%.o: %.s
-	$(AS) -mcpu=$(MCU) -mthumb -o $@ $<
-
-# .elf → .bin（用于烧录，纯二进制）
-$(TARGET).bin: $(TARGET).elf
-	$(OBJCOPY) -O binary $< $@
-
-# .elf → .hex（Intel Hex 格式，有些烧录工具用）
-$(TARGET).hex: $(TARGET).elf
-	$(OBJCOPY) -O ihex $< $@
-```
-
-```makefile
-# ===== 第五段：辅助目标 =====
-
-# 烧录——make flash
-flash: $(TARGET).elf
-	openocd -f interface/stlink.cfg \
-	        -f target/stm32f1x.cfg \
-	        -c "program $< verify reset exit"
-#           └── 写 Flash → 校验 → 复位 → 退出 OpenOCD
-
-# 清理——make clean
-clean:
-	rm -f $(TARGET).elf $(TARGET).bin $(TARGET).hex $(OBJS)
-```
-
-### Makefile 的依赖链
-
-当你执行 `make` 时，Make 会自动追踪依赖关系：
-
-```
-make (默认目标 all)
-  │
-  ├──→ 需要 blink.elf
-  │      ├──→ 需要 main.o ──→ main.c 存在 → 执行编译命令
-  │      ├──→ 需要 stm32f10x_rcc.o ──→ stm32f10x_rcc.c 存在 → 编译
-  │      └──→ ... 所有 .o 都就绪 → 执行链接命令
-  │
-  ├──→ 需要 blink.bin ──→ blink.elf 就绪 → 执行 objcopy
-  └──→ 需要 blink.hex ──→ blink.elf 就绪 → 执行 objcopy
-```
-
-**智能重编译**：如果你只改了 `main.c`，下次 `make` 只重新编译 `main.c → main.o` 然后重新链接，其他 `.o` 不动。Make 靠比较文件修改时间来判断哪些需要重编。
-
----
-
-### Makefile
-
-```makefile
-# 项目名称
-TARGET = blink
-
-# 工具链
-CC      = arm-none-eabi-gcc
-AS      = arm-none-eabi-as
-LD      = arm-none-eabi-gcc
-OBJCOPY = arm-none-eabi-objcopy
-SIZE    = arm-none-eabi-size
-
-# MCU 配置
-MCU     = cortex-m3
-FPU     =
-FLOAT   = -msoft-float
-BOARD   = STM32F103ZET6        # 本书唯一目标板
-
-# 编译选项
-CFLAGS  = -mcpu=$(MCU) -mthumb $(FLOAT)
-CFLAGS += -O0 -g3 -Wall -fmessage-length=0
-CFLAGS += -DSTM32F10X_HD        # ZET6 属于 High Density（512KB Flash）
-CFLAGS += -I./inc
-
-LDFLAGS = -T link.ld -mcpu=$(MCU) -mthumb $(FLOAT)
-LDFLAGS += -Wl,--gc-sections -specs=nosys.specs -specs=nano.specs
-
-# 源文件
-C_SRCS  = main.c stm32f10x_it.c
-C_SRCS += lib/system_stm32f10x.c lib/core_cm3.c
-C_SRCS += lib/stm32f10x_rcc.c lib/stm32f10x_gpio.c
-
-ASM_SRCS = lib/startup_stm32f10x_hd.s
-
-OBJS = $(C_SRCS:.c=.o) $(ASM_SRCS:.s=.o)
-
-all: $(TARGET).elf $(TARGET).bin $(TARGET).hex
-	$(SIZE) $(TARGET).elf
-
-$(TARGET).elf: $(OBJS)
-	$(LD) $(LDFLAGS) -o $@ $^
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-%.o: %.s
-	$(AS) -mcpu=$(MCU) -mthumb -o $@ $<
-
-$(TARGET).bin: $(TARGET).elf
-	$(OBJCOPY) -O binary $< $@
-
-$(TARGET).hex: $(TARGET).elf
-	$(OBJCOPY) -O ihex $< $@
-
-# 烧录（通过 OpenOCD + ST-Link）
-flash: $(TARGET).elf
-	openocd -f interface/stlink.cfg \
-	        -f target/stm32f1x.cfg \
-	        -c "program $< verify reset exit"
-
-# 调试
-debug:
-	openocd -f interface/stlink.cfg -f target/stm32f1x.cfg
-	# 另开终端：arm-none-eabi-gdb $(TARGET).elf
-	# (gdb) target remote :3333
-	# (gdb) load
-	# (gdb) monitor reset halt
-	# (gdb) continue
-
-clean:
-	rm -f $(TARGET).elf $(TARGET).bin $(TARGET).hex $(OBJS)
-```
-
-### 链接脚本 `link.ld`
+链接脚本不是“随便写个内存大小”。它向链接器承诺每个段放在哪里，并导出启动汇编需要的边界符号：
 
 ```ld
-MEMORY
-{
-    FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 512K
-    SRAM  (rwx): ORIGIN = 0x20000000, LENGTH = 20K
-}
+FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 64K
 
-_stack_top = ORIGIN(SRAM) + LENGTH(SRAM);
-
-SECTIONS
-{
-    .isr_vector :
-    {
-        KEEP(*(.isr_vector))
-    } > FLASH
-
-    .text :
-    {
-        *(.text*)
-        *(.rodata*)
-    } > FLASH
-
-    .data :
-    {
-        _data_start = .;
-        *(.data*)
-        _data_end = .;
-    } > SRAM AT > FLASH
-
-    .bss :
-    {
-        _bss_start = .;
-        *(.bss*)
-        _bss_end = .;
-    } > SRAM
-}
+_estack = ORIGIN(RAM) + LENGTH(RAM);
+/* .data 在 RAM 运行、在 Flash 保存初始化值。 */
+_sdata, _edata, _sidata
+/* .bss 只占 RAM，复位时清零。 */
+_sbss, _ebss
 ```
 
-> **本书固定配置：STM32F103ZET6**
->
-> - 启动文件：startup_stm32f10x_hd.s
-> - SPL 宏：-DSTM32F10X_HD
-> - 链接脚本：Flash 512KB、SRAM 64KB
-> - 本书所有引脚、内存容量和工程说明均以此为准。
->
-> 不要混用其他开发板教程中的启动文件、密度宏或链接脚本；它们不是本书的支持路径。
+| 组件 | 契约 |
+|---|---|
+| 向量表第一项 | `_estack`，CPU 复位时装入 MSP |
+| `Reset_Handler` | 从 `_sidata` 复制到 `_sdata.._edata`，清零 `_sbss.._ebss` |
+| `.isr_vector` | 必须 `KEEP`，否则 `--gc-sections` 可能删除入口 |
+| 链接脚本 | 为 ZET6 保留 512KB Flash、64KB SRAM，并在 RAM 溢出时失败 |
 
-### `stm32f10x_conf.h`（精简版）
+如果启动文件使用 `_data_start`、而链接脚本只提供 `_sdata`，或者向量表段名与链接脚本 `KEEP` 的段名不同，构建即使侥幸通过，复位后也可能无法到达 `main`。本书模板已经统一使用 `_sidata/_sdata/_edata/_sbss/_ebss` 和 `.isr_vector`。
+
+### `board.h`：把“板子差异”关进一个文件
+
+模板默认把 PC13、低有效作为**常见示例**，并非所有 ZET6 板都如此。先修改下面三个宏，再运行程序：
 
 ```c
-#ifndef __STM32F10x_CONF_H
-#define __STM32F10x_CONF_H
-
-// 只用 GPIO 和 RCC，其他外设暂时注释掉
-#include "stm32f10x_gpio.h"
-#include "stm32f10x_rcc.h"
-// #include "stm32f10x_usart.h"  ← 后面用到时取消注释
-// #include "stm32f10x_tim.h"
-// ...
-
-#endif
+#define BOARD_LED_PORT       GPIOC
+#define BOARD_LED_PIN        GPIO_Pin_13
+#define BOARD_LED_ACTIVE_LOW 1
 ```
 
-### `main.c`：用 SPL 点亮 LED
+业务代码只调用 `BoardLed_Init()` 与 `BoardLed_Write(on)`。换板时改 `board.h`，不要把同一份 LED 引脚复制到第 3、7、8 章的业务文件里。
+
+### 为什么 blink 不再用空循环延时
+
+`main.c` 配置 SysTick 为 1 ms：
 
 ```c
-#include "stm32f10x.h"
-#include "stm32f10x_gpio.h"
-#include "stm32f10x_rcc.h"
-
-// 简陋的延时（不用 SysTick，纯 CPU 空转）
-void Delay_ms(uint32_t ms) {
-    for (uint32_t i = 0; i < ms * 8000; i++) {
-        __NOP();  // 空指令，防止被优化掉
-    }
-}
-
-int main(void)
-{
-    // 1. 开启 GPIOC 的时钟
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
-
-    // 2. 配置 PC13 为推挽输出
-    GPIO_InitTypeDef gpio;
-    GPIO_StructInit(&gpio);  // 先填默认值
-    gpio.GPIO_Pin   = GPIO_Pin_13;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;  // 推挽输出
-    GPIO_Init(GPIOC, &gpio);
-
-    // 3. 主循环——LED 闪烁
-    while (1) {
-        GPIO_ResetBits(GPIOC, GPIO_Pin_13);  // PC13 输出低（LED 亮）
-        Delay_ms(500);
-        GPIO_SetBits(GPIOC, GPIO_Pin_13);    // PC13 输出高（LED 灭）
-        Delay_ms(500);
-    }
-    // SPL 没有 HAL_Delay——后面用 SysTick 写一个
-}
+SystemCoreClockUpdate();
+SysTick_Config(SystemCoreClock / 1000U);
 ```
 
-### 编译和烧录
+中断中只做 `g_ms++`；主循环用无符号减法判断经过的时间。这样即使计数器回绕，`(uint32_t)(now - start) < delay` 仍在一个周期内成立。`__WFI()` 让 CPU 在等待 SysTick 中断时休眠，而不是用一个对优化等级和时钟频率敏感的空循环占满 CPU。第 5 章会系统讲时钟与这个时基的边界。
+
+## 0.5 构建、烧录与调试
+
+### 构建产物分别是什么
+
+| 文件 | 用途 |
+|---|---|
+| `build/blink.elf` | 带符号和调试信息；烧录/调试首选它 |
+| `build/blink.bin` | 裸二进制，适合某些下载器 |
+| `build/blink.hex` | Intel HEX，适合某些烧录工具 |
+| `build/blink.map` | 段、符号、交叉引用；分析占用和链接问题 |
+
+构建后先检查容量，而不是看到“Build finished”就结束：
 
 ```bash
-cd ~/stm32/01-blink-spl
-
-# 编译
-make
-
-# 烧录
-make flash
-
-# 或者分开烧录：
-openocd -f interface/stlink.cfg -f target/stm32f1x.cfg \
-        -c "program blink.elf verify reset exit"
+arm-none-eabi-size build/blink.elf
+arm-none-eabi-nm -n build/blink.elf | rg '(_estack|_sidata|_sdata|_edata|_sbss|_ebss|Reset_Handler|main)'
 ```
 
-**效果**：板载 LED 以 1 秒周期闪烁。你的第一个 SPL 工程跑起来了。
+`size` 的数值是当前镜像占用，不是芯片总容量；64KB RAM 和 512KB Flash 的上限由 `link.ld` 保证。若链接报 RAM overflow，先看 map 中的 `.bss`、`.data` 和栈预留，而不是擅自把内存长度改大。
 
-## 0.5 和 HAL 版的关键区别
+### 连接和烧录
 
-HAL 版第 0 章做了同样的事——点亮 LED。对比一下：
+断电确认 SWD 线序后，按第 0.5 章的供电方式连接目标板和调试器。然后：
 
-| | HAL 版 | SPL 版 |
+```bash
+make flash SPL_ROOT=$HOME/opt/STM32F10x_StdPeriph_Lib_V3.5.0
+```
+
+该目标执行 `program ... verify reset exit`。日志出现 `verified` 只证明 Flash 写入与读回一致；它不证明 LED 引脚、有效电平或板载电路假设正确。
+
+### 用 GDB 验证“代码确实在跑”
+
+终端 A：
+
+```bash
+make debug
+```
+
+终端 B：
+
+```gdb
+arm-none-eabi-gdb build/blink.elf
+(gdb) target remote :3333
+(gdb) monitor reset halt
+(gdb) break Reset_Handler
+(gdb) break main
+(gdb) continue
+```
+
+先命中 `Reset_Handler`、再命中 `main`，再观察 LED。这样可以把“启动链路错误”和“LED 接线错误”分开排查。
+
+## 0.6 常见失败路径
+
+| 现象 | 证据/原因 | 先做什么 |
 |---|---|---|
-| **IDE** | CubeIDE（GUI + 自动生成） | 纯命令行（VS Code 编辑 + 终端编译） |
-| **工程创建** | CubeMX 点几下 → 生成 20+ 个文件 | 手动拷贝 7 个文件 + 手写 Makefile |
-| **LED 初始化** | `MX_GPIO_Init()`（CubeMX 生成的函数） | `GPIO_Init()`（你亲手写的配置） |
-| **延时** | `HAL_Delay(500)`（SysTick 自动配置好了） | `Delay_ms(500)`（自己用空循环写的,简陋） |
-| **编译** | 点 Build 按钮 | `make` |
-| **烧录** | 点 Run 按钮 | `make flash`（一行命令） |
-| **调试** | 点 Debug 按钮 | 终端里 `gdb` 连接 OpenOCD |
+| `arm-none-eabi-gcc: command not found` | 工具链未装或 PATH 不含它 | 运行 `arm-none-eabi-gcc --version` |
+| `SPL_ROOT must point ...` | 路径不是 SPL 根目录或库版本结构不同 | 运行 `make check-spl SPL_ROOT=...`，检查三个必需 `.c` 文件 |
+| `undefined reference to GPIO_Init` | 头文件存在但 `stm32f10x_gpio.c` 未参与链接 | 检查 Makefile 的 `OBJS`，不要只加 include |
+| OpenOCD 找不到目标 | 供电、GND、SWDIO/SWCLK、权限或调试器配置错误 | 回第 0.5 章，先量供电并确认线序 |
+| `verify` 成功但不能到 `main` | 启动文件、向量表段、链接脚本符号不一致 | 用 GDB 断在 `Reset_Handler`；核对 HD 文件和 `.isr_vector` |
+| 到了 `main` 但 LED 不动 | LED 引脚、低/高有效、板载电路不符 | 修改 `board.h`，或先用万用表测该 GPIO 电平 |
+| LED 亮但节奏错误/串口乱码 | 时钟假设与实际不一致 | 记录 `SystemCoreClock`，第 5/8 章再校准时钟/波特率 |
 
-**SPL 版更「原始」**——但正因为原始，你对每一行代码、每一个编译选项都了如指掌。
+## 0.7 本章验收与练习
 
-## 0.6 如果灯不亮
+完成后保存一次实验记录：
 
-| 现象 | 可能原因 |
-|------|---------|
-| `make` 报 `arm-none-eabi-gcc: command not found` | 工具链没装好。跑 `which arm-none-eabi-gcc` |
-| `make flash` 报 `Error: open failed` | 调试器没插好或没权限。`lsusb` 确认设备被识别，检查 udev 规则是否正确加载 |
-| 编译通过但 LED 不闪 | `SystemInit()` 没被调用（默认启动文件里会调）。检查 `startup` 文件是否正确 |
-| LED 一直亮 | PC13 低电平有效（灯亮）——注意 `GPIO_ResetBits` = 亮, `GPIO_SetBits` = 灭 |
+- [ ] 写下板卡的实际 LED 端口、引脚和有效电平；
+- [ ] `make check-spl`、`make` 和 `make flash` 的输出已保存；
+- [ ] `build/blink.map` 存在，链接脚本写的是 512KB Flash / 64KB RAM；
+- [ ] GDB 断点已分别命中 `Reset_Handler` 与 `main`；
+- [ ] LED 的实际观察结果与 `board.h` 匹配。
 
----
+练习按风险从低到高进行：
 
-## 0.7 最小工程验收与渐进练习
-
-先把“能编译”与“程序真的在 ZET6 上运行”分开确认：
-
-1. `make` 后检查是否生成 `.elf`、`.bin` 和 map 文件；
-2. 用 `arm-none-eabi-size` 记录 Flash/RAM 占用；若 Flash 只有 64KB 上限，说明链接脚本仍是旧配置；
-3. OpenOCD 能识别目标后再烧录；烧录成功不等于 LED 一定可见；
-4. 在 `main()` 第一行设置断点或输出一条 UART 日志，确认程序越过 Reset_Handler；
-5. 最后再检查 PC13 的低电平点亮特性、板载 LED 实际引脚和时钟配置。
-
-练习：复制工程到一个新目录，故意把启动文件改为 `_md` 或把 Flash 改成 64KB，观察构建配置哪里不一致；随后恢复 ZET6 的 HD 配置。这个练习只在副本中做，不要破坏自己的可用工程。
+1. 只改 `board.h` 的有效电平，预测 LED 行为并恢复；
+2. 在 `main.c` 添加一个已初始化全局变量和一个未初始化全局变量，用 `nm`/map 找到它们分别进入 `.data` 与 `.bss`；
+3. 复制整个目录到临时位置，把链接脚本故意改为 20KB RAM，观察 `size`、map 和链接错误的变化，然后恢复。不要在可用工程中做破坏性实验。
 
 ## 0.8 本章要点
 
-- 工具链：`arm-none-eabi-gcc` + OpenOCD + Makefile + SPL
-- SPL 工程 = 启动文件 + CMSIS 内核文件 + 外设驱动（按需拷贝）+ 你的 `main.c`
-- `stm32f10x_conf.h` 决定哪些外设驱动被编译——不需要的外设不编译，省 Flash
-- `Makefile` 是你自己写的，每个 `CFLAGS` 都知道什么意思
-- SPL 的 GPIO API：`GPIO_Init()` 配置，`GPIO_SetBits/ResetBits` 控制电平
+- ZET6 工程身份是 HD 启动文件、`STM32F10X_HD`、512KB Flash、64KB SRAM 的组合；四者缺一不可。
+- Makefile 的源码列表决定真正参与链接的 SPL 驱动；头文件不会自动带来实现。
+- 启动文件、向量表段名、链接脚本符号和内存长度是一个不可拆分的契约。
+- `board.h` 隔离开发板差异；芯片功能表不能替代原理图。
+- `verify`、GDB 断点、GPIO 电平/LED 观察分别验证不同层次，不能用其中一个代替全部。
 
 ---
 
-> **下一章**：[第 1 章 · 什么是嵌入式系统（SPL版）](./01-chapter.md)
+> **下一章**：[第 1 章 · 什么是嵌入式系统](./01-chapter.md)
 >
-> 第 1 章已经是独立 SPL 版本——嵌入式概念、MCU 启动流程、裸机 vs RTOS vs Linux、嵌入式全栈。请直接阅读 SPL 版 [第 1 章](./01-chapter.md)。
+> 现在工程已经能被验证。下一章解释复位向量、Flash、SRAM、栈和 `main()` 是如何连成一条启动链路的。

@@ -1,761 +1,348 @@
-# 第 4 章 · C 语言嵌入式视角回顾（SPL版）
+# 第 4 章 · C 语言的嵌入式边界（SPL 版）
 
-> **本章产出**：把位运算、`volatile`、`const`、指针和链接脚本与真实 MCU 内存对应起来；能用编译器和调试器验证，而不是把它们当作语法题。
+> **本章产出**：能判断一段 C 代码是在操作普通内存、硬件寄存器还是 ISR 共享状态；能把位操作、`volatile`、`const`、指针、链接脚本和单线时序放到正确边界内。
 >
-> **前置知识**：会读基础 C，完成 GPIO 实验；不要求先会汇编。
+> **前置知识**：完成第 0–3 章，能读基本 C；不要求会汇编。
 >
-> **本章方法**：先掌握会影响外设代码正确性的部分，再第二遍阅读链接脚本、Mini-GPIO 和单总线实现。
-
-> **本章产出**：彻底理解位运算、`volatile`、`const` 在 Flash 中的行为、结构体映射寄存器、链接脚本
->
-> **用到项目的哪里**：本章教的不是「知识点」，是「基本功」——后面每一行嵌入式 C 代码都会用到
+> **通过标准**：解释为什么 `volatile` 既不能让 `counter++` 原子，也不能替代 RTOS 同步；能用 map/nm 验证 `.data`、`.bss` 和 `.rodata`；能画出 DS18B20 与 DHT11 的共同电气层和不同协议层。
 
 ---
 
-## 这一章怎么读
+## 4.1 位操作：先问“谁还会改这一位”
 
-这一章的内容跨度很大。对于“会写一些 C、但第一次接触硬件”的读者，建议分两层：
+外设寄存器通常把多个功能塞进一个 32 位数。最基本的操作仍然是：
 
-| 必须先掌握 | 可以第二遍再深入 |
+```c
+/* 设置一位；清除一位；读取一位。 */
+REG |=  (1UL << 5);
+REG &= ~(1UL << 5);
+uint32_t bit5 = (REG >> 5) & 1UL;
+
+/* 用掩码更新一个位域。 */
+REG = (REG & ~(0x3UL << 4)) | (0x2UL << 4);
+```
+
+最后一行是“读—改—写”。若 ISR、DMA 或另一段代码可能同时改同一寄存器的其他位，它会把对方刚写的值覆盖掉。GPIO 的 BSRR 专门避免了这一问题：
+
+```c
+GPIOB->BSRR = GPIO_Pin_5;              // 只置 PB5
+GPIOB->BSRR = (uint32_t)GPIO_Pin_5 << 16; // 只复位 PB5
+```
+
+**选择规则**：有“专用置位/清位寄存器”就优先用它；只有在确认唯一写者时，才对 ODR/普通控制寄存器做 `|=`、`&=` 或 `^=`。第 3 章的 `GPIO_ToggleBits` 是唯一写者下的教学工具，不是 ISR 与主循环共享端口时的通用方案。
+
+## 4.2 `volatile`：保留访问，不提供同步
+
+### 硬件寄存器必须按宽度和方向访问
+
+GPIOB 的 IDR 是 32 位**只读**寄存器。下面的写法既说明正确的类型，也提醒“不能向 IDR 写配置”：
+
+```c
+const volatile uint32_t * const gpiob_idr =
+    (const volatile uint32_t *)0x40010C08UL;
+
+uint32_t pb0_level = (*gpiob_idr >> 0) & 1UL;
+```
+
+`volatile` 的含义是：每个 C 层面的读/写都是可观察访问，编译器不能把它当成可随意消除或缓存的普通内存。CMSIS 已把外设寄存器成员定义为 `volatile`，所以正常代码应写：
+
+```c
+uint32_t input = GPIOB->IDR;
+GPIOB->BSRR = GPIO_Pin_5;
+```
+
+而不需要手写裸地址宏。裸地址只适合作为理解和核对参考手册的练习。
+
+### `volatile` 不保证什么
+
+它**不**保证以下事情：
+
+| 误解 | 正确边界 |
 |---|---|
-| 位运算、volatile、指针映射寄存器 | 链接脚本细节、Mini-GPIO、1-Wire 时序 |
-| 为什么 GPIO 寄存器地址能被 C 指针访问 | 启动文件与段布局的完整实现 |
-| 为什么 const/全局变量会影响 RAM | 自己实现驱动库 |
+| “`volatile` 防止所有重排” | 它约束 volatile 访问的优化，不等价于通用内存屏障或并发协议 |
+| “`volatile counter++` 是原子的” | `++` 是读、加、写的复合操作；可能丢失更新 |
+| “任务间共享变量加 volatile 就安全” | FreeRTOS 任务间用队列、通知、互斥量或临界区；ISR 使用对应的 ISR 安全 API |
+| “把所有变量都标 volatile 更安全” | 会掩盖设计问题、增加访问成本，且仍不能修复竞态 |
 
-先完成第 3 章的 GPIO 实验，再用本章解释“刚才那几行代码为什么真的控制了电路”。不要因为第一次看不懂链接脚本而停在这里。
-
-## 4.1 位运算
-
-嵌入式最频繁的操作不是加减乘除，是位操作。
-
-### 六种基本位运算
+主循环与 ISR 的最小模式是单向事件：
 
 ```c
-uint8_t a = 0b1010_1100;  // 172
-uint8_t b = 0b1111_0000;  // 240
+static volatile uint8_t button_event;
 
-a & b   // 0b1010_0000  = 160  按位与：两个都是 1 才出 1
-a | b   // 0b1111_1100  = 252  按位或：有一个是 1 就出 1
-a ^ b   // 0b0101_1100  =  92  按位异或：不同出 1
-~a      // 0b0101_0011  =  83  按位取反
-a << 2  // 0b1011_0000  = 176  左移 2 位（相当于 ×4）
-a >> 2  // 0b0010_1011  =  43  右移 2 位（相当于 ÷4）
+void EXTI0_IRQHandler(void)
+{
+    if (EXTI_GetITStatus(EXTI_Line0) != RESET) {
+        EXTI_ClearITPendingBit(EXTI_Line0);
+        button_event = 1U;       // 单次对齐字节赋值
+    }
+}
+
+int main(void)
+{
+    for (;;) {
+        if (button_event != 0U) {
+            uint8_t event;
+            uint32_t primask = __get_PRIMASK();
+            __disable_irq();
+            event = button_event;
+            button_event = 0U;
+            if (primask == 0U) __enable_irq();
+
+            if (event != 0U) {
+                /* 业务处理放在 ISR 外。 */
+            }
+        }
+    }
+}
 ```
 
-### 嵌入式常用位操作模式
+保存并恢复 `PRIMASK` 很重要：无条件 `__enable_irq()` 会错误地打开上层原本关闭的中断。更复杂的队列、计数、结构体交接在第 6、14 章使用明确的临界区/RTOS 原语实现。
+
+## 4.3 `const`、段与实际内存占用
+
+`const` 表示“不可通过这个名字修改”，它是 C 的类型限定符；**C 语言本身不承诺放在 Flash**。对本书的 GNU ARM 链接脚本而言，文件作用域的只读对象通常进入 `.rodata`，该段与 `.text` 放在 Flash：
 
 ```c
-/* 1. 置位 */
-REG |= (1 << 5);      // 把第 5 位置 1，其他位不变
-
-/* 2. 清零 */
-REG &= ~(1 << 5);     // 把第 5 位清 0，其他位不变
-
-/* 3. 翻转 */
-REG ^= (1 << 5);      // 翻转第 5 位
-
-/* 4. 检测 */
-if (REG & (1 << 5)) { /* 第 5 位是 1 */ }
-
-/* 5. 修改多位 */
-REG &= ~(0x3 << 4);   // 先清除 bits[5:4]
-REG |=  (0x2 << 4);   // 再写入 bits[5:4] = 10₂
-
-/* 6. 提取位域 */
-uint8_t val = (REG >> 4) & 0x3;  // 提取 bits[5:4] 并右移对齐
+static const uint16_t sine_table[4] = {0, 1024, 2048, 3072};
+static uint16_t samples[128];
+static uint32_t boot_count = 3;
 ```
 
-> **Java 对比**：Java 里你很少用位运算。嵌入式里位运算就是日常——你要直接操作硬件寄存器，没得选。
+| 对象 | 通常所在段 | RAM 影响 |
+|---|---|---|
+| `sine_table` | `.rodata`（Flash） | 不占运行期数组 RAM |
+| `samples` | `.bss`（RAM，复位清零） | 占 256B RAM |
+| `boot_count` | `.data`（RAM，初值存 Flash） | 占 4B RAM，启动时要复制 |
 
-## 4.2 `volatile` ——编译器你别自作聪明
+不要凭印象判断。构建后检查：
 
-### 问题：这段代码有什么 bug？
+```bash
+arm-none-eabi-size build/blink.elf
+arm-none-eabi-nm -S --size-sort build/blink.elf | tail -n 20
+rg 'sine_table|samples|boot_count' build/blink.map
+```
+
+字符串字面量、`const` 指针和可变指针仍要分清：`const char *p` 是“不能经由 `p` 改字符”，不是“`p` 不可改”；`char * const p` 才是指针本身不可改。
+
+## 4.4 指针映射寄存器：类型也是硬件协议的一部分
+
+以下定义把地址、访问宽度和易变性写在同一个地方：
 
 ```c
-uint8_t *p = (uint8_t *)0x40010C08;  // GPIOB_IDR 的地址
-
-*p = 1;     // 配置些什么
-*p = 2;     // 再配置些什么
-
-uint8_t val = *p;   // 读引脚状态——但编译器可能会跳过这次读！
+#define GPIOB_BASE 0x40010C00UL
+#define GPIOB_ODR  (*(volatile uint32_t *)(GPIOB_BASE + 0x0CUL))
+#define GPIOB_BSRR (*(volatile uint32_t *)(GPIOB_BASE + 0x10UL))
 ```
 
-优化级别 `-O2` 时，编译器发现 `*p` 刚被写过 2，就「优化」掉实际的硬件读操作，直接用缓存的值。但 `*p` 不是普通内存——它是硬件寄存器，值可能被外部电路改变。
-
-### 解决：`volatile`
-
-```c
-volatile uint8_t *p = (volatile uint8_t *)0x40010C08;
-
-*p = 1;   // 编译器：必须生成写指令
-*p = 2;   // 编译器：必须生成写指令（不会优化掉上一个）
-
-uint8_t val = *p;  // 编译器：必须真的去读硬件
-```
-
-`volatile` 告诉编译器：
-- **每次读都从内存（硬件）重读，不用寄存器缓存**
-- **每次写都真的写进去，不省略、不重排**
-- **这个变量的值可能在编译器不知道的情况下改变**（硬件改的、中断改的）
-
-### 你的 SPL 工程里随处可见 volatile
-
-打开 `inc/stm32f10x.h`：
+但不要为了“直接”而绕开 CMSIS：错误的地址、宽度、保留位或读写方向都可能造成难以定位的故障。外设结构体把偏移也编码进类型：
 
 ```c
 typedef struct {
-    volatile uint32_t CRL;     // ← 每个成员都是 volatile
-    volatile uint32_t CRH;
-    volatile uint32_t IDR;
-    volatile uint32_t ODR;
-    volatile uint32_t BSRR;
-    volatile uint32_t BRR;
-    volatile uint32_t LCKR;
+    volatile uint32_t CRL;   /* +0x00 */
+    volatile uint32_t CRH;   /* +0x04 */
+    volatile uint32_t IDR;   /* +0x08，读 */
+    volatile uint32_t ODR;   /* +0x0C，读写 */
+    volatile uint32_t BSRR;  /* +0x10，写 */
+    volatile uint32_t BRR;   /* +0x14，写 */
+    volatile uint32_t LCKR;  /* +0x18 */
 } GPIO_TypeDef;
 ```
 
-这就是为什么你写 `GPIOB->BSRR = (1 << 5)` 编译器一定生成写指令——因为 BSRR 是 `volatile` 的。SPL 替你加好了所有的 `volatile`。
+同类型的 `uint32_t` 成员以 4 字节间隔，正好对应 RM0008 的 GPIO 偏移。真实工程使用 ST 提供的 `GPIO_TypeDef`，并在阅读参考手册时核对寄存器的“reset value / access / reserved bits”。
 
-### 什么时候必须加 volatile
+## 4.5 链接脚本和启动代码：一份双向契约
 
-| 场景 | 示例 |
-|------|------|
-| 硬件寄存器 | `#define GPIOB_ODR (*(volatile uint32_t *)0x40010C0C)` |
-| 中断与主循环共享的变量 | `volatile uint8_t uart_data_ready;` // ISR 设 1，主循环检测 |
-| FreeRTOS 任务间共享变量 | `volatile uint32_t sensor_value;` |
-| 内存映射 I/O | 所有外设寄存器 |
-
-### 什么时候不需要
-
-普通局部变量、函数参数、只在单一上下文访问的变量——不需要。
-
-## 4.3 `const` 与 Flash 存储
-
-```c
-const char    *msg1 = "Hello";   // 指向的内容是 const，指针可变
-char *const    msg2 = buffer;    // 指针是 const，内容可变
-const char *const msg3 = "Hi";   // 两者都是 const
-```
-
-在 STM32 中，`const` 全局变量被放在 `.rodata` 段（只读数据），**这个段在 Flash 中**，不占 SRAM！
-
-```c
-// 放在 Flash → 不占 RAM（你只有 64KB，不能浪费）
-const uint16_t sine_table[256] = {
-    2048, 2098, 2148, 2198, ...
-};
-
-// 放在 SRAM → 占 512 字节 RAM
-uint16_t buffer[256];
-```
-
-**经验法则**：查找表、字模、常量字符串——加 `const`。SRAM 是稀缺资源。
-
-## 4.4 指针与内存映射 —— 嵌入式 C 的核心魔法
-
-> **把硬件寄存器的地址，当成指向特定类型变量的指针来用。**
-
-```c
-// GPIOB_ODR 是地址 0x40010C0C 上的 32 位寄存器
-#define GPIOB_ODR (*(volatile uint32_t *)0x40010C0C)
-
-// 拆开：
-//   (volatile uint32_t *)0x40010C0C  → 把 0x40010C0C 解释为 volatile uint32_t 指针
-//   *(volatile uint32_t *)0x40010C0C → 解引用：读或写那个地址
-
-// 使用：
-GPIOB_ODR = 0xFFFF;          // 写——GPIOB 所有引脚置高
-uint32_t val = GPIOB_ODR;    // 读——获取当前引脚状态
-```
-
-**这在 Java 里不可想象**——Java 没有指针，也没有「某个地址上有硬件寄存器」这个概念。这是嵌入式最底层的思维模型。
-
-## 4.5 `struct` 映射寄存器组
-
-单个 `#define` 操作一个寄存器。要操作一整套（如 GPIO 的 CRL/CRH/IDR/ODR/BSRR/BRR/LCKR），用结构体：
-
-```c
-typedef struct {
-    volatile uint32_t CRL;    // 偏移 0x00
-    volatile uint32_t CRH;    // 偏移 0x04
-    volatile uint32_t IDR;    // 偏移 0x08
-    volatile uint32_t ODR;    // 偏移 0x0C
-    volatile uint32_t BSRR;   // 偏移 0x10
-    volatile uint32_t BRR;    // 偏移 0x14
-    volatile uint32_t LCKR;   // 偏移 0x18
-} GPIO_TypeDef;
-
-#define GPIOB  ((GPIO_TypeDef *)0x40010C00)
-
-// 现在可以这样用：
-GPIOB->ODR  = 0xFFFF;    // 清晰、直观
-GPIOB->BSRR = (1 << 5);  // 设置 PB5
-```
-
-**关键约束**：结构体成员的顺序必须和硬件寄存器的地址偏移严格一致。ARM 嵌入式 ABI 中同类型成员连续排列，编译器不会插入填充。
-
-这就是你 `inc/stm32f10x.h` 里的内容——打开看看，你会看到 GPIO_TypeDef、USART_TypeDef、SPI_TypeDef……每一个外设都有对应的结构体。SPL 就建立在这些结构体之上。
-
-## 4.6 链接脚本
-
-你的工程里 `link.ld` 就是链接脚本。它定义内存布局和各段放哪里：
+第 0 章模板的 `link.ld` 与 `startup_stm32f10x_hd.s` 使用同一组符号：
 
 ```ld
-MEMORY
-{
-    FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 512K
-    RAM   (rw) : ORIGIN = 0x20000000, LENGTH = 64K
-}
+FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 64K
 
-SECTIONS
-{
-    /* 中断向量表——必须在 Flash 最开头 */
-    .isr_vector : {
-        KEEP(*(.isr_vector))
-    } > FLASH
-
-    /* 代码 + 只读数据 */
-    .text : {
-        *(.text*)            /* 函数 */
-        *(.rodata*)          /* const 全局数据——不走 RAM */
-    } > FLASH
-
-    /* 已初始化的全局变量——初值在 Flash，启动时由 Reset_Handler 复制到 RAM */
-    .data : {
-        _sdata = .;
-        *(.data*)
-        _edata = .;
-    } > RAM AT > FLASH
-    _sidata = LOADADDR(.data);
-
-    /* 零初始化全局变量——启动时由 Reset_Handler 清零 */
-    .bss : {
-        _sbss = .;
-        *(.bss*)
-        _ebss = .;
-    } > RAM
-}
+_estack = ORIGIN(RAM) + LENGTH(RAM);
+/* .data 在 RAM 运行，初始镜像在 Flash。 */
+_sidata = LOADADDR(.data);
+/* 启动文件复制/清零的边界。 */
+_sdata; _edata; _sbss; _ebss;
 ```
 
-| 段 | 存什么 | 在哪 | 启动时 |
-|----|--------|------|--------|
-| `.text` | 你的代码 | Flash | 直接执行 |
-| `.rodata` | `const` 数据、字符串常量 | Flash | 直接读 |
-| `.data` | `int x = 5;` 这种有初值的全局变量 | 初值存 Flash，运行时复制到 RAM | `Reset_Handler` 逐字节复制 |
-| `.bss` | `int y;` 这种无初值的全局变量 | RAM | `Reset_Handler` 清零 |
-| 栈 | 局部变量、函数调用帧 | RAM（`.bss` 之后，向低地址长） | 动态分配 |
-| 堆 | `malloc` 分配的内存 | RAM（另一头向高地址长） | 动态分配 |
+启动过程不是“编译器自动完成”：CPU 从向量表第一项取得 `_estack`，从第二项取得 `Reset_Handler`；处理器随后执行 `.data` 复制、`.bss` 清零、`SystemInit()` 和 `main()`。因此下面四项必须一起验证：
 
-```
-RAM 布局（64KB ZET6）：
-低地址 ┌──────────┐
-       │  .data   │  已初始化全局变量
-       ├──────────┤
-       │  .bss    │  零初始化的全局变量
-       ├──────────┤
-       │   堆 →   │  malloc 的
-       │  ← 栈    │  局部变量
-高地址 └──────────┘
-```
+| 检查 | 正确状态 |
+|---|---|
+| 设备密度 | `STM32F10X_HD` 与 HD 启动向量表 |
+| 向量表段 | `.isr_vector` 被链接脚本 `KEEP` 到 Flash 开头 |
+| 内存 | 512KB Flash、64KB RAM |
+| 边界符号 | 启动汇编与链接脚本都使用 `_sidata/_sdata/_edata/_sbss/_ebss` |
 
-**栈溢出是嵌入式最常见的 bug**——堆和栈碰上了就 Hard Fault。写代码时始终在想「这个变量在 Flash 还是 RAM」。
+栈从 RAM 高地址向下增长，`.data/.bss` 从低地址向上增长；堆是否启用、预留多少，取决于链接脚本和 C 库。不要把“有 64KB SRAM”误解成每个全局数组都安全：还要给 ISR 嵌套、函数局部变量和可能的堆预留空间。
 
-## 4.7 动手：实现你自己的 Mini-GPIO 库
+## 4.6 Mini-GPIO：只为理解，不替代 SPL
 
-用刚学的知识，封一个不依赖 SPL 的微型 GPIO 库：
+下面的例子展示必要边界：先开 RCC 时钟，再配置一个引脚；置位/复位用 BSRR；不提供可并发的 `Toggle`。
 
 ```c
-/* mygpio.h */
 typedef struct {
     volatile uint32_t CRL, CRH, IDR, ODR, BSRR, BRR, LCKR;
 } MyGPIO;
 
-#define MY_GPIOB  ((MyGPIO *)0x40010C00)
-#define MY_GPIOE  ((MyGPIO *)0x40011800)
+#define MY_GPIOB ((MyGPIO *)0x40010C00UL)
 
-void MyGPIO_Init(MyGPIO *gpio, uint8_t pin, uint8_t mode);
-void MyGPIO_Set(MyGPIO *gpio, uint8_t pin);
-void MyGPIO_Reset(MyGPIO *gpio, uint8_t pin);
-void MyGPIO_Toggle(MyGPIO *gpio, uint8_t pin);
-uint8_t MyGPIO_Read(MyGPIO *gpio, uint8_t pin);
+static void MyGpioB_Pin5_Output2MHz(void)
+{
+    RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+    MY_GPIOB->CRL = (MY_GPIOB->CRL & ~(0xFUL << 20)) |
+                     (0x2UL << 20);   /* MODE=10, CNF=00 */
+}
+
+static void MyGpio_Set(MyGPIO *gpio, uint8_t pin)
+{
+    gpio->BSRR = 1UL << pin;
+}
+
+static void MyGpio_Reset(MyGPIO *gpio, uint8_t pin)
+{
+    gpio->BSRR = 1UL << (pin + 16U);
+}
 ```
+
+这个示例没有处理参数检查、所有 GPIO 模式、时钟复位或复用重映射，所以不应被复制成产品驱动。它的目的只是让你看见 SPL 的 `GPIO_Init()` 最终也在进行相同的寄存器配置。
+
+## 4.7 单线传感器：共用电气层，不共用协议
+
+DS18B20 使用 Dallas/Maxim 1-Wire；DHT11 使用自己的单线时序协议。它们都常见为“数据线 + 上拉电阻”，但**命令、应答、位时序、校验都不同**，不能共用“1-Wire 驱动”或把 DHT11 称作 Dallas 1-Wire。
+
+### 先建立可释放的数据线
+
+为外接实验选择一个普通 GPIO（本书默认 DS18B20 为 PB0、DHT11 为 PB1，但必须先确认资源表）。数据线通过约 4.7kΩ 上拉到 3.3V；MCU 使用开漏输出：
 
 ```c
-/* mygpio.c */
-#include "mygpio.h"
+#define OW_PORT GPIOB
+#define OW_PIN  GPIO_Pin_0
 
-void MyGPIO_Init(MyGPIO *gpio, uint8_t pin, uint8_t mode) {
-    // mode: 0=输入, 3=50MHz推挽输出
-    volatile uint32_t *cr = (pin < 8) ? &gpio->CRL : &gpio->CRH;
-    uint8_t pos = (pin % 8) * 4;
-    *cr &= ~(0xF << pos);
-    *cr |= (mode << pos);
-}
-
-void MyGPIO_Set(MyGPIO *gpio, uint8_t pin) {
-    gpio->BSRR = (1 << pin);           // 低 16 位：置位
-}
-
-void MyGPIO_Reset(MyGPIO *gpio, uint8_t pin) {
-    gpio->BSRR = (1 << (pin + 16));    // 高 16 位：复位
-}
-
-void MyGPIO_Toggle(MyGPIO *gpio, uint8_t pin) {
-    gpio->ODR ^= (1 << pin);
-}
-
-uint8_t MyGPIO_Read(MyGPIO *gpio, uint8_t pin) {
-    return (gpio->IDR >> pin) & 0x1;
-}
-```
-
-使用：
-
-```c
-MyGPIO_Init(MY_GPIOB, 5, 3);   // PB5 50MHz 推挽输出
-MyGPIO_Set(MY_GPIOB, 5);       // PB5 高电平
-MyGPIO_Reset(MY_GPIOB, 5);     // PB5 低电平
-```
-
-**这就是 SPL 的微型复刻**。SPL 比这个多出来的东西：所有外设的结构体定义、完整的模式枚举、错误检查（`assert_param`）、更丰富的配置选项。但核心原理就是指针 + 结构体 + 位操作。
-
----
-
-## 4.8 动手：单总线（1-Wire）与 DS18B20 / DHT11
-
-普中玄武板通过板载接口外接 DHT11 和 DS18B20 两个传感器。DS18B20 本体是裸露的 TO-92 封装元件，直接插在板上的 4 针座子上；DHT11 自带一块小 PCB 板，引出 VCC、GND、DATA 三根线。它们都用**单总线（1-Wire）协议**——这是你能用 GPIO 实现的最简单的通信协议。
-
-### 单总线通信：一根 GPIO 怎么又发又收
-
-I2C 是两根线，SPI 是三根线——1-Wire 只有**一根数据线**。没有时钟线，不上拉时默认高电平。
-
-```
-一根线又当爹又当妈：
-主机（MCU）─────┬────── 从机（DS18B20 或 DHT11）
-                │
-             4.7kΩ 上拉到 3.3V（空闲高电平）
-```
-
-单总线的核心是**时序**——用脉冲的宽度表示 0 和 1：
-
-```
-写 1：┌────┐  ──────────  （拉低 ~6μs 后释放，总线自行变高）
-      │    │
-      └────┘
-
-写 0：┌──────────────┐──  （拉低 ~60μs）
-      │              │
-      └──────────────┘
-
-读    主机拉低 ~3μs → 释放 → 从机决定总线电平
-      ┌──┐  ┌─────┐           ┌──┐  ┌─────┐
-      │  │  │     │    ← 1    │  │  │  ← 0
-      └──┘  └─────┘           └──┘  └──┘
-```
-
-关键在于 **微秒级的精确定时**。你不能用 `Delay_ms(1)`——太粗了。需要 `Delay_us(10)` 或纯 CPU 空转循环（用 NOP 指令数计算时间）。
-
-### 延时微秒函数
-
-```c
-// 72MHz 下一条 NOP 约 14ns，粗略循环 10 次 ≈ 1μs
-// （精确值不关键——只要时序在 DS18B20/DHT11 容差范围内就行）
-void Delay_us(uint32_t us) {
-    while (us--) {
-        for (volatile uint8_t i = 0; i < 10; i++);  // volatile 防止编译器优化掉
-    }
-}
-```
-
-> 这个 `Delay_us` 精度不高——72MHz 下编译器优化级别会影响实际延时。这里先用着，第 5 章学了 SysTick 之后再回来升级成精确延时。
-
-### 电气连接
-
-| 传感器 | 形态 | 接线 | 说明 |
-|--------|------|------|------|
-| DS18B20 | 裸露 TO-92 本体，插板载 4 针座 | VCC → 3.3V, GND → GND, DQ → **PB0** | 单总线脚，板上自带 4.7kΩ 上拉 |
-| DHT11 | 自带小 PCB 板，接座子或杜邦线 | VCC → 3.3V, GND → GND, DATA → **PB1** | 单总线脚，板上自带 4.7kΩ 上拉 |
-
-板载接口已自带 4.7kΩ 上拉电阻——DS18B20 直接插到 4 针座子上即可，DHT11 小板的 VCC/GND/DATA 对应接到座子即可。查原理图确认具体引脚。
-
-### DS18B20 读取温度
-
-DS18B20 是达拉斯半导体的高精度数字温度传感器（±0.5°C）。通信流程：
-
-```
-1. 复位脉冲：主机拉低 480μs → 释放 → 从机拉低 60-240μs 回应存在脉冲
-2. 发 ROM 命令：0xCC（跳过 ROM 搜索，只有一个 DS18B20 时用）
-3. 发功能命令：0x44（启动温度转换）
-4. 等待转换完成（~750ms）
-5. 再次复位 → 发 0xCC → 发 0xBE（读暂存器）
-6. 读 9 字节：温度值在 byte[0]（低 8 位）+ byte[1]（高 8 位）
-```
-
-```c
-// ============================================================
-// 引脚宏——把 GPIO 操作封装成"总线动作"
-//
-// 为什么不用 GPIO_SetBits(GPIOB, GPIO_Pin_0) 到处写？
-//   - 如果以后要换引脚（比如从 PB0 换到 PC3），只需要改上面三行
-//   - DQ_LOW() / DQ_HIGH() / DQ_READ() 读起来像"总线操作"，不是"寄存器操作"
-//     语义更清晰：你在拉低总线、读总线，不是在操作某个 GPIO
-// ============================================================
-#define DQ_PORT     GPIOB
-#define DQ_PIN      GPIO_Pin_0
-#define DQ_LOW()    GPIO_ResetBits(DQ_PORT, DQ_PIN)        // 总线拉低 → 输出 0
-#define DQ_HIGH()   GPIO_SetBits(DQ_PORT, DQ_PIN)           // 总线拉高 → 输出 1
-#define DQ_READ()   GPIO_ReadInputDataBit(DQ_PORT, DQ_PIN)  // 读总线当前电平
-
-// ------------------------------------------------------------
-// 复位 + 检测存在脉冲（Presence Pulse）
-//
-// 1-Wire 总线上每次通信前必须复位——就像打电话前先"喂"一声，
-// 看对方在不在。
-//
-// 时序图：
-//  主机拉低 ── 480μs ──→ 释放 ── 70μs ──→ 从机回应？── 410μs ──→ 结束
-//                          │                   │
-//                          │              ┌────┘
-//                          │         从机拉低 60-240μs（存在脉冲）
-//                          │              │
-//                    上拉电阻拉高 ←─── 主机切换为输入
-//
-// 返回 1 = 检测到 DS18B20（从机拉低了总线）
-// 返回 0 = 超时/未接（总线一直高）
-// ------------------------------------------------------------
-// 复位 + 检测存在
-uint8_t DS18B20_Reset(void) {
-    // ── 第 1 步：配置为推挽输出 ──
-    // 复位时主机必须主动拉低总线，所以需要输出能力
+static void OneWireBus_Init(void)
+{
     GPIO_InitTypeDef gpio;
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
     GPIO_StructInit(&gpio);
-    gpio.GPIO_Pin  = DQ_PIN;
-    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(DQ_PORT, &gpio);
-
-    // ── 第 2 步：拉低 480μs（复位脉冲） ──
-    // DS18B20 规格书要求：复位脉冲必须 ≥480μs，小于 960μs
-    // 太短 → 从机不认；太长 → 可能被当成写 0 时序槽
-    DQ_LOW();
-    Delay_us(480);
-
-    // ── 第 3 步：释放总线 ──
-    // 拉高 = 停止驱动，让上拉电阻把总线拉回高电平
-    DQ_HIGH();
-    Delay_us(70);        // 给从机 70μs 准备时间
-
-    // ── 第 4 步：切为输入，等从机拉低 ──
-    // 关键：只有切为输入，DS18B20 才能控制总线电平
-    // 如果保持输出模式，主机一直在强推高电平，从机根本拉不动
-    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
-    GPIO_Init(DQ_PORT, &gpio);
-    Delay_us(10);
-
-    // ── 第 5 步：读电平判断是否存在 ──
-    // DS18B20 检测到复位脉冲后，会在 60-240μs 内拉低总线
-    // 读到低电平（0）→ 从机存在；读到高电平（1）→ 没设备
-    uint8_t presence = (DQ_READ() == 0) ? 1 : 0;
-    Delay_us(410);  // 等剩余存在脉冲走完，保持时序完整
-
-    // ── 第 6 步：切回输出，为后续读写做准备 ──
-    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
-    GPIO_Init(DQ_PORT, &gpio);
-
-    return presence;
+    gpio.GPIO_Pin = OW_PIN;
+    gpio.GPIO_Mode = GPIO_Mode_Out_OD;
+    gpio.GPIO_Speed = GPIO_Speed_2MHz;
+    GPIO_Init(OW_PORT, &gpio);
+    GPIO_SetBits(OW_PORT, OW_PIN);     /* 释放，不是强推高 */
 }
 
-// ------------------------------------------------------------
-// 写一个位 —— 用脉冲宽度表示 0 还是 1
-//
-// 1-Wire 的写时序槽（Write Slot）：
-//
-//         写 1                         写 0
-//   ┌──┐                       ┌──────────────┐
-//   │  │  ← 拉低 ~2μs          │              │  ← 持续低 60μs
-//   └──┴────── 然后释放 ──→    └──────────────┘
-//   ↑                          ↑
-//   起始信号                    起始信号
-//   （主机拉低，宣告        （主机一直保持低电平，
-//    这是一个时序槽）         直到结束时才释放）
-//
-// 区别在于：写 1 在起始信号后释放总线，让上拉电阻拉高；
-//          写 0 则一直保持低电平，直到时序槽结束。
-// 从机在 15-60μs 之间采样总线电平来判断 0 或 1。
-// ------------------------------------------------------------
-void DS18B20_WriteBit(uint8_t bit) {
-    // 起始信号：所有时序槽都以主机拉低开始
-    DQ_LOW();
-    Delay_us(2);
+static inline void Bus_Low(void)     { GPIO_ResetBits(OW_PORT, OW_PIN); }
+static inline void Bus_Release(void) { GPIO_SetBits(OW_PORT, OW_PIN); }
+static inline uint8_t Bus_Read(void)
+{
+    return GPIO_ReadInputDataBit(OW_PORT, OW_PIN);
+}
+```
 
-    if (bit) {
-        // 写 1：拉低 2μs 后就释放 → 上拉电阻把总线拉高
-        DQ_HIGH();
-        Delay_us(60);
+不能用推挽输出的“高电平”来释放共享数据线：如果从机正在拉低，两个输出会对抗。开漏输出在写 1 时断开下拉晶体管，IDR 仍能读到真实总线电平。
+
+### 微秒延时的前提
+
+这些协议的关键是**实测的微秒时序**。不要用空 `for` 循环或“72MHz 下一条 NOP 约多少 ns”估算：优化级别、函数调用和 Flash 等待周期都会改变它。为时序驱动提供一个经验证的接口：
+
+```c
+void TimerUs_Delay(uint32_t us);     /* 用 1MHz 定时器实现，见第 7 章 */
+uint32_t TimerUs_Now(void);          /* 若需要超时轮询 */
+```
+
+用逻辑分析仪或示波器检查低脉冲、释放后的上升沿和采样点；上拉过大、线太长或模块自带上拉不明都会使“代码正确但读不到设备”。
+
+### DS18B20：Dallas 1-Wire 的最小原语
+
+以下是基于开漏释放和定时器延时的核心时隙，数值仍应以所用器件数据手册为准：
+
+```c
+static uint8_t DS18B20_Reset(void)
+{
+    Bus_Low();
+    TimerUs_Delay(480U);
+    Bus_Release();
+    TimerUs_Delay(70U);
+    uint8_t present = (Bus_Read() == Bit_RESET);
+    TimerUs_Delay(410U);
+    return present;
+}
+
+static void OneWire_WriteBit(uint8_t bit)
+{
+    Bus_Low();
+    if (bit != 0U) {
+        TimerUs_Delay(6U);
+        Bus_Release();
+        TimerUs_Delay(64U);
     } else {
-        // 写 0：继续保持低电平 60μs
-        Delay_us(60);
-        DQ_HIGH();  // 结束，释放总线
+        TimerUs_Delay(60U);
+        Bus_Release();
+        TimerUs_Delay(10U);
     }
 }
 
-// ------------------------------------------------------------
-// 读一个位 —— 主机发起，从机回应
-//
-// 读时序槽（Read Slot）和写时序槽很像，但方向反了：
-//
-//     主机拉低 ─→ 释放 ─→ 从机控制总线
-//     ┌──┐         ┌─────┐               ┌──┐         ┌─────┐
-//     │  │         │     │  ← 从机输出 1  │  │         │     │  ← 从机输出 0
-//     └──┴─────────┘     └──────────       └──┴─────────┘     └────
-//       2μs  释放        从机控制期          2μs  释放        从机控制期
-//                            ↑                                ↑
-//                      主机在第 15μs 采样                 主机采样到低电平
-//
-// 核心思路：主机只负责"发起时序"，然后立即释放总线（切为输入），
-// 让 DS18B20 来决定总线电平。读到的值就是 DS18B20 想说的。
-// ------------------------------------------------------------
-uint8_t DS18B20_ReadBit(void) {
-    uint8_t val = 0;
-
-    // ── 发起时序 ──
-    // 和写时序一样，先拉低几微秒宣告"我要开始一个读时序了"
-    DQ_LOW();
-    Delay_us(2);
-
-    // ── 释放总线 ──
-    // 拉高后马上切输入——从此刻起总线由 DS18B20 控制
-    DQ_HIGH();
-    Delay_us(2);      // 给从机一点时间响应
-
-    // 切为输入，不再驱动总线
-    GPIO_InitTypeDef gpio;
-    GPIO_StructInit(&gpio);
-    gpio.GPIO_Pin  = DQ_PIN;
-    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
-    GPIO_Init(DQ_PORT, &gpio);
-    Delay_us(1);
-
-    // ── 采样 ──
-    // 现在读到的电平就是 DS18B20 输出的位：
-    //   从机写 1 → 释放总线，上拉电阻拉高，读到 1
-    //   从机写 0 → 主动拉低，读到 0
-    val = DQ_READ();
-
-    // ── 切回输出，为下一轮操作做准备 ──
-    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
-    GPIO_Init(DQ_PORT, &gpio);
-    Delay_us(55);     // 等剩余时序槽走完
-
-    return val;
-}
-
-// ------------------------------------------------------------
-// 写一个字节 —— 8 位，最低位先发
-//
-// 1-Wire 协议规定：字节传输必须 LSB（Least Significant Bit）先行，
-// 也就是先发 bit 0，再发 bit 1……最后发 bit 7。
-//
-// 这和人们习惯的"从左到右"相反，但很多串行协议都这么干
-// （UART 也是 LSB 先发），原因和移位寄存器的硬件实现有关。
-//
-// 举个例子：发送 0x53（0b0101_0011）：
-//   发送顺序：1 → 1 → 0 → 0 → 1 → 0 → 1 → 0
-//            ↑LSB                          ↑MSB
-// ------------------------------------------------------------
-void DS18B20_WriteByte(uint8_t byte) {
-    // i=0 取 bit 0，i=1 取 bit 1……逐位移出
-    for (uint8_t i = 0; i < 8; i++) {
-        DS18B20_WriteBit(byte & (1 << i));
-        // 注意是 (1 << i) 而不是 (1 << (7-i))——因为 LSB 先行
-    }
-}
-
-// ------------------------------------------------------------
-// 读一个字节 —— 同样 LSB 先行
-//
-// 和写对称：先收到的位是最低位，逐位移到最高位。
-//   byte = bit0 | (bit1<<1) | (bit2<<2) | ... | (bit7<<7)
-// ------------------------------------------------------------
-uint8_t DS18B20_ReadByte(void) {
-    uint8_t byte = 0;
-    for (uint8_t i = 0; i < 8; i++) {
-        if (DS18B20_ReadBit()) {
-            byte |= (1 << i);   // 第 i 位是 1 → 置位
-        }
-        // 读到 0 的话不用动，byte 那一位初始化就是 0
-    }
-    return byte;
-}
-
-// ------------------------------------------------------------
-// 读取温度 —— 从 DS18B20 拿到的原始值转摄氏温度
-//
-// 通信步骤：
-//   1. 复位 → 发 0xCC（跳过 ROM）→ 发 0x44（启动转换）
-//   2. 等待 750ms（DS18B20 完成温度测量）
-//   3. 复位 → 发 0xCC → 发 0xBE（读暂存器）
-//   4. 读低字节 + 高字节，拼成 16 位原始值
-//
-// 原始值格式（11 位有符号 + 4 位小数）：
-//   bit[15:11] = 符号位（温度正负）
-//   bit[10:4]  = 整数部分
-//   bit[3:0]   = 小数部分（精度 1/16 = 0.0625°C）
-//
-// 所以：温度℃ = raw × 0.0625
-// 即：raw ÷ 16
-// ------------------------------------------------------------
-float DS18B20_ReadTemp(void) {
-    // ── 第 1 步：启动温度转换 ──
-    DS18B20_Reset();            // 复位
-    DS18B20_WriteByte(0xCC);    // 跳过 ROM——总线上只有一个 DS18B20
-    DS18B20_WriteByte(0x44);    // 启动转换
-    Delay_ms(750);              // 等 750ms（最大转换时间）
-
-    // ── 第 2 步：读暂存器 ──
-    DS18B20_Reset();            // 再次复位
-    DS18B20_WriteByte(0xCC);    // 跳过 ROM
-    DS18B20_WriteByte(0xBE);    // 读暂存器命令
-
-    // 暂存器 byte[0] = 温度低 8 位，byte[1] = 温度高 8 位
-    int16_t raw = DS18B20_ReadByte() | (DS18B20_ReadByte() << 8);
-
-    // ── 第 3 步：转为摄氏温度 ──
-    return raw * 0.0625f;       // 相当于 raw / 16
+static uint8_t OneWire_ReadBit(void)
+{
+    Bus_Low();
+    TimerUs_Delay(3U);
+    Bus_Release();
+    TimerUs_Delay(10U);
+    uint8_t bit = Bus_Read();
+    TimerUs_Delay(55U);
+    return bit;
 }
 ```
 
-使用：
+完成 `WriteByte`/`ReadByte` 后，单只设备可用 `Skip ROM (0xCC)`、`Convert T (0x44)`、`Read Scratchpad (0xBE)`；但要明确检查每次 reset 的 presence、等待转换完成、读取完整 9 字节并校验 Dallas CRC8。`0xCC` 只适用于总线上确实只有一个 DS18B20 的情况。温度原始值是有符号 1/16°C，优先先输出原始值或整数毫摄氏度，避免第 8 章尚未解释的 `printf` 浮点支持问题。
+
+### DHT11：相同电气层，不同状态机
+
+DHT11 的主机起始信号为低电平至少约 18ms，随后释放并等待传感器应答；传感器发送 40 位，位值由高电平持续时间区分。它不是 reset/presence/ROM 的 1-Wire 流程。
+
+可靠实现要有每一步的超时，不能无限等待：
 
 ```c
-if (DS18B20_Reset()) {
-    float temp = DS18B20_ReadTemp();
-    printf("DS18B20: %.2f°C\r\n", temp);
-} else {
-    printf("DS18B20 未连接\r\n");
-}
-```
-
-### DHT11 读取温湿度
-
-DHT11 比 DS18B20 更简单（精度更低但带湿度）。通信流程：
-
-```
-1. 主机拉低 ≥18ms（启动信号）→ 释放 → 上拉电阻拉高
-2. 从机拉低 80μs → 拉高 80μs（响应信号）
-3. 从机发送 40 位数据（每 1 位 = 50μs 低 + 26-28μs高=0 / 70μs高=1）
-```
-
-数据格式 = 8bit 湿度整数 + 8bit 湿度小数 + 8bit 温度整数 + 8bit 温度小数 + 8bit 校验和
-
-```c
-uint8_t DHT11_Read(uint8_t buf[5]) {
-    // 启动信号：拉低 ≥18ms
-    GPIO_InitTypeDef gpio;
-    GPIO_StructInit(&gpio);
-    gpio.GPIO_Pin   = GPIO_Pin_1;  // DHT11 在 PB1
-    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(GPIOB, &gpio);
-
-    GPIO_ResetBits(GPIOB, GPIO_Pin_1);
-    Delay_ms(20);                      // 拉低 20ms ≥ 18ms
-    GPIO_SetBits(GPIOB, GPIO_Pin_1);  // 释放
-    Delay_us(30);
-
-    // 切输入，等从机响应
-    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
-    GPIO_Init(GPIOB, &gpio);
-
-    // 等 DHT11 拉低（80μs）
-    uint16_t timeout = 0;
-    while (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1))
-        if (++timeout > 500) return 0;  // 超时
-
-    // 等 DHT11 拉高（80μs）
-    while (!GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1))
-        if (++timeout > 500) return 0;
-
-    // 读 40 位
-    for (uint8_t i = 0; i < 40; i++) {
-        while (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1) == 0);  // 等低结束
-        Delay_us(40);  // 等 40μs
-        // 此时如果在高电平区 → 看持续多久
-        // 26-28μs = 0, 70μs = 1
-        if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1))
-            buf[i / 8] = (buf[i / 8] << 1) | 1;
-        else
-            buf[i / 8] = (buf[i / 8] << 1) | 0;
-        while (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1));  // 等高结束
+static uint8_t WaitLevel(uint8_t level, uint32_t timeout_us)
+{
+    uint32_t start = TimerUs_Now();
+    while (Bus_Read() != level) {
+        if ((uint32_t)(TimerUs_Now() - start) >= timeout_us)
+            return 0U;
     }
-
-    // 校验和验证（前 4 字节和 = 第 5 字节）
-    if ((uint8_t)(buf[0] + buf[1] + buf[2] + buf[3]) != buf[4])
-        return 0;  // 校验失败
-
-    return 1;  // 成功
+    return 1U;
 }
 ```
 
-读取：
+读到 5 个字节后验证 `b0 + b1 + b2 + b3 == b4`（低 8 位）。超时或校验失败应返回错误码并保留上一次有效读数；不要把未初始化缓冲区当传感器数据。DHT11 的采样间隔也受器件规格限制，不能在主循环中无间隔读取。
 
-```c
-uint8_t data[5];
-if (DHT11_Read(data)) {
-    printf("湿度: %d.%d%%  温度: %d.%d°C\r\n",
-           data[0], data[1], data[2], data[3]);
-}
-```
+## 4.8 验收、排错与练习
 
-### 1-Wire vs I2C vs SPI 对比
-
-| | 1-Wire | I2C | SPI |
-|--------|--------|-----|-----|
-| 信号线数 | **1**（DQ） | 2（SCL+SDA） | 3-4（SCK+MOSI+MISO+CS）|
-| 速度 | 低速（~16kbps） | 100k-400kHz | 最高 18MHz |
-| 时序要求 | **严格**（μs 级精确，CPU 空转） | 硬件外设自动处理 | 硬件外设自动处理 |
-| 协议复杂度 | 简单（但实现繁琐） | 中等 | 简单 |
-| 多设备支持 | 可级联（ROM 搜索复杂） | 地址区分 | 片选区分 |
-| 嵌入式初学 | **非常适合**（逼你理解时序） | 一般（外设自动处理） | 一般（外设自动处理） |
-
-**1-Wire 最底层的魅力**：你写 `DQ_LOW()` 的那一瞬间，就是在零延迟操作硅片上的晶体管。I2C/SPI 的硬件外设屏蔽了这些细节，但 1-Wire 让你**亲手触碰到物理层的每一次电压变化**。
-
-这就是为什么把 1-Wire 放在 GPIO 之后、其他通信协议之前——它会彻底教会你「时序」这两个字意味着什么。
-
----
-
-## 4.9 用编译结果验证 C 代码，而不是凭感觉
-
-本章概念都可以在自己的工程里观察：
-
-1. 把一个大数组分别声明为普通全局变量和 `const`，比较 `arm-none-eabi-size` 的 RAM/Flash 变化；
-2. 把 ISR 共享标志位暂时去掉 `volatile`，在 `-O2` 编译的副本中观察为何循环可能看不到更新；实验后立即恢复；
-3. 用 `arm-none-eabi-objdump -h blink.elf` 查看 `.text`、`.data`、`.bss` 段；
-4. 对照链接脚本确认 ZET6 的 Flash 是 512KB、SRAM 是 64KB。
-
-| 常见错误 | 正确做法 |
+| 现象 | 先检查 |
 |---|---|
-| 用 volatile 代替同步 | volatile 只约束编译器，不保证原子性或线程安全 |
-| 直接把任意地址强转成指针 | 先确认数据手册地址、访问宽度和外设时钟 |
-| 看见链接脚本就全部跳过 | 至少能核对内存容量、入口和段的去向 |
+| 优化后 ISR 标志偶尔失效 | 变量是否 `volatile`；是否把读清操作做成了竞态；是否保存/恢复 PRIMASK |
+| RAM 突然不够 | `size` 和 map 中 `.bss/.data` 最大符号；是否遗漏 `const`；栈预留是否合理 |
+| DS18B20 始终不存在 | 3.3V/GND、4.7k 上拉、开漏释放、定时器实际微秒宽度、单设备 ROM 假设 |
+| DHT11 卡死 | 每一个等待是否有超时；是否误用了 Dallas 1-Wire 代码；起始低电平是否足够长 |
+| 总线高电平上升很慢 | 上拉阻值、线长、电容、模块上已有的上拉并联关系 |
 
-练习：给自己的 Mini-GPIO 函数写一个“输入参数非法时不写寄存器”的检查，并说明它与硬件寄存器地址的边界。
+练习：
 
-## 4.10 本章要点
+1. 在第 0 章 blink 中分别加入有初值、无初值和 `const` 的 1KB 数组，用 map 验证段归属；
+2. 将 `volatile uint32_t counter` 的 `++` 放入主循环和 ISR，设计一个可观察的丢计数实验，再用临界区修复；
+3. 用逻辑分析仪记录一次 DS18B20 reset/presence，标出 480µs、70µs 和采样点；
+4. 为 DHT11 的所有等待分支写出错误码，确认断线时函数可以在有限时间内返回。
 
-- **位运算**是嵌入式日常：置位 `|=`，清零 `&= ~`，翻转 `^=`
-- **`volatile`** 阻止编译器优化掉硬件读写——所有外设寄存器、中断共享变量都需要
-- SPL 的 GPIO_TypeDef 结构体成员全部是 `volatile`，替你加好了
-- **`const`** 把数据放 Flash，省 SRAM——查找表不加 const 是浪费
-- **结构体 + 指针 = 寄存器映射**——这就是 SPL 和 HAL 共同的底层原理
-- **链接脚本**：`.text/.rodata` 在 Flash，`.data/.bss` 在 RAM，栈和堆共享剩余 RAM
-- 写嵌入式 C 时，始终在想「这个变量在 Flash 还是 SRAM」
+## 4.9 本章要点
+
+- 位操作必须考虑读—改—写是否会覆盖其他上下文；GPIO BSRR 能避免单引脚写的竞态。
+- `volatile` 用于硬件寄存器和最小 ISR 共享状态；它不等于原子、锁、内存屏障或 RTOS 同步。
+- `const` 是否节省 SRAM 要由链接脚本和 map 验证，不能只凭 C 关键字推断。
+- 启动文件和链接脚本是 `_sidata/_sdata/_edata/_sbss/_ebss` 的共同契约。
+- DS18B20 是 Dallas 1-Wire，DHT11 是另一种单线时序协议；二者共享“开漏释放 + 上拉 + 定时器延时”的电气/时间基础，但不共享协议驱动。
 
 ---
-> **上一章**：[第 3 章 · GPIO 与寄存器操作](./03-chapter.md)
-> **下一章**：[第 5 章 · 时钟系统、SysTick 与精确延时（SPL版）](./05-chapter.md)
+
+> **上一章**：[第 3 章 · GPIO 与寄存器编程](./03-chapter.md)
 >
-> 你现在有了精确的位操作能力。接下来给 MCU 配一个准确的心跳——系统时钟和 SysTick 定时器。
-
----
-
+> **下一章**：[第 5 章 · 时钟系统](./05-chapter.md)

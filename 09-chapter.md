@@ -1,507 +1,245 @@
-# 第 9 章 · ADC 模数转换
+# 第 9 章 · ADC、DMA 与 DAC：把码值还原成可验证的模拟量（SPL 版）
 
-> **本章产出**：把 0–3.3V 的模拟电压变成可校验的数字值；能选择单次/连续/DMA 采样，并识别输入超压、噪声和参考电压误差。
+> **本章产出**：读取一个外接电位器的 ADC 码值/电压，理解采样时间与 DMA 缓冲边界，并在 PA4/PA5 上输出经过测量的 DAC 电压。
 >
-> **前置知识**：第 3 章 GPIO、第 5 章时钟；建议已完成第 8 章 UART，便于打印原始读数。
+> **前置知识**：第 5 章时钟、第 7 章定时器、第 8 章串口。
 >
-> **硬件准备**：电位器或安全分压源、万用表；ADC 输入与 MCU 必须共地，任何模拟输入不得超过 3.3V。
-
-> **本章覆盖**：ADC 基本原理、SPL 单通道采集、NTC 测温、DMA 多通道采集、DAC 输出
->
-> **用到项目的哪里**：采集电位器电压、NTC 热敏电阻测温、DAC 输出模拟信号
-
-## 9.1 模拟世界 vs 数字世界
-
-物理世界是连续的（模拟），MCU 是离散的（数字）。ADC 就是桥梁：
-
-| 参数 | STM32F103 ADC | 说明 |
-|------|---------------|------|
-| **分辨率** | 12 位 | 输出 0 ~ 4095（2¹² - 1） |
-| **参考电压** | 通常 3.3V | 输入 ≤ Vref |
-| **采样率** | 最高 1MHz | 每秒 100 万次 |
-| **通道数** | 16 外部 + 2 内部 | 含温度传感器、内部 Vref |
-
-**量化**：12 位 ADC，Vref = 3.3V，每个 LSB = 3.3V / 4096 ≈ 0.806mV。输入 1.65V → ADC 值 ≈ 2048。
-
-逐次逼近型 SAR：和 Vref/2 比 → 大就往 3Vref/4 比，小就往 Vref/4 比...12 次比较出一个 12 位结果。二分法。
-
-### STM32 ADC 结构
-
-- **规则通道组**：最多 16 通道顺序转换，结果只有一个 DR 寄存器——多通道需要 DMA 搬运
-- **注入通道组**：最多 4 通道可插队，每通道有独立数据寄存器
-
-## 9.2 动手：单通道读取电位器
-
-### 接线
-
-电位器（或可调电阻）中间脚接 PA0（ADC1 通道 0），两端接 3.3V 和 GND。
-
-```
-  3.3V ────┐
-           └── 电位器 ──── PA0 (ADC1_IN0)
-                    │
-  GND ──────────────┘
-```
-
-没有电位器？用杜邦线直接碰 3.3V 或 GND 也能看到读数跳变。
-
-### 单通道读取代码
-
-```c
-void ADC1_Init(void) {
-    // 1. 开时钟
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1 | RCC_APB2Periph_GPIOA, ENABLE);
-
-    // 2. PA0 配成模拟输入
-    GPIO_InitTypeDef gpio;
-    gpio.GPIO_Pin  = GPIO_Pin_0;
-    gpio.GPIO_Mode = GPIO_Mode_AIN;         // 模拟输入（GPIO 的缓存不使能，省电）
-    GPIO_Init(GPIOA, &gpio);
-
-    // 3. ADC 配置：独立模式、单次、右对齐
-    ADC_InitTypeDef adc;
-    ADC_StructInit(&adc);
-    adc.ADC_Mode               = ADC_Mode_Independent;
-    adc.ADC_ScanConvMode       = DISABLE;   // 单通道
-    adc.ADC_ContinuousConvMode = DISABLE;   // 单次，触一次转一次
-    adc.ADC_ExternalTrigConv   = ADC_ExternalTrigConv_None;  // 软件触发
-    adc.ADC_DataAlign          = ADC_DataAlign_Right;
-    adc.ADC_NbrOfChannel       = 1;
-    ADC_Init(ADC1, &adc);
-
-    // 4. 配置通道 0：采样时间 55.5 周期（够稳了）
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_0, 1, ADC_SampleTime_55Cycles5);
-
-    // 5. 使能 ADC
-    ADC_Cmd(ADC1, ENABLE);
-
-    // 6. 校准（每次上电做一次，提高精度）
-    ADC_ResetCalibration(ADC1);
-    while (ADC_GetResetCalibrationStatus(ADC1));
-    ADC_StartCalibration(ADC1);
-    while (ADC_GetCalibrationStatus(ADC1));
-}
-
-uint16_t ADC1_Read(void) {
-    ADC_SoftwareStartConvCmd(ADC1, ENABLE);           // 软件触发
-    while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET);  // 等转换完
-    return ADC_GetConversionValue(ADC1);                     // 读结果
-}
-```
-
-主循环：
-
-```c
-int main(void) {
-    ADC1_Init();
-    USART1_Init();    // printf 串口重定向
-    while (1) {
-        uint16_t val = ADC1_Read();
-        float voltage = val * 3.3f / 4096.0f;
-        printf("ADC=%4d, 电压=%.3fV\r\n", val, voltage);
-        Delay_ms(500);
-    }
-}
-```
-
-### 预期输出
-
-```
-ADC= 512, 电压=0.413V
-ADC= 512, 电压=0.413V  ← 旋电位器，值变化
-ADC=2048, 电压=1.650V
-ADC=3072, 电压=2.475V
-ADC=4095, 电压=3.300V  ← 转到 3.3V
-```
-
-转到底→4095（3.3V），转到另一边→0（0V），中间平滑变化。
-
-### 为什么需要校准
-
-ADC 硬件有制造误差。校准过程让 ADC 芯片自动测量两个内部基准电压，算出偏移和增益误差，保存在内部寄存器。**每次上电都要做**。
+> **安全前提**：模拟输入只能在 VSSA–VDDA 范围内；先确认模块电压、共地和引脚冲突。PA0 同时是默认按键、TIM2_CH1 和 ADC1_IN0，实验不能并接。
 
 ---
 
-## 9.3 DMA 多通道连续采集
+## 9.1 两种转换器，两个不同问题
 
-### 场景
+ZET6 具有 3 个 ADC 和 2 个 DAC。ADC 把引脚电压量化为码值；DAC 把数字码近似变成电压。它们都以模拟供电/参考为尺度，不是“天然精确的 3.300V 仪器”。
 
-单通道单次采集是入门。实际项目中 ADC 往往同时采集多个通道（电压、电流、温度、光照）——这就需要**扫描+连续+DMA**。
+| 外设 | 例子 | 关键限制 |
+|---|---|---|
+| ADC | 电位器、分压、传感器 | 输入范围、源阻抗、采样时间、ADCCLK、噪声 |
+| DAC1 | PA4 | 输出缓冲、负载、量程与实际 VDDA |
+| DAC2 | PA5 | 同上；PA5 也常被 SPI1_SCK 占用，不能并用 |
 
-### 配置差异
+12 位 ADC/DAC 的理想关系是：
 
-相比单通道，多通道的改动：
+```text
+code ∈ [0, 4095]
+ADC voltage ≈ code × VDDA / 4095
+DAC voltage ≈ code × VDDA / 4095
+```
 
-| 项目 | 单通道（9.2） | 多通道（9.3） |
-|------|-------------|--------------|
-| `ScanConvMode` | DISABLE | **ENABLE** |
-| `ContinuousConvMode` | DISABLE | **ENABLE** |
-| `NbrOfChannel` | 1 | **N**（如 3） |
-| `RegularChannelConfig` | 配 1 次 | 按顺序配 N 次 |
-| 读结果 | CPU 轮询读 DR | **DMA 自动搬**到 `adc_buf[]` |
-| 数据更新 | 主循环每次调 `ADC1_Read()` | DMA 后台循环更新，CPU 零开销 |
+这是换算模型，不是校准证明。VDDA、偏移、增益误差、噪声、输入/输出缓冲和负载都会带来偏差；用万用表/示波器验证具体板子的实际值。
 
-### 多通道与 DMA 代码
+## 9.2 ADC 时钟和单通道最小闭环
+
+F103 的 ADCCLK 最大 14MHz。若 PCLK2=72MHz，第 5 章的 `/6` 得到 12MHz。必须在 ADC 初始化前或系统时钟配置中明确设置：
 
 ```c
-#define ADC_CHANNELS 3
-uint16_t adc_buf[ADC_CHANNELS];   // DMA 自动写这里
+RCC_ADCCLKConfig(RCC_PCLK2_Div6);   /* 72MHz / 6 = 12MHz */
+```
 
-void ADC1_DMA_Init(void) {
-    // ADC 初始化（扫描+连续）
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1 | RCC_APB2Periph_GPIOA, ENABLE);
-    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+以下示例用外接电位器的滑动端接 PA0（ADC1_IN0），两端接 3.3V/GND。不要假定每块板都带电位器。
 
-    // PA0~PA2 模拟输入
+```c
+#include <stdbool.h>
+#include "stm32f10x_adc.h"
+#include "stm32f10x_gpio.h"
+#include "stm32f10x_rcc.h"
+
+#define ADC_WAIT_LIMIT  1000000U
+
+static bool ADC1_Init_Channel0(void)
+{
     GPIO_InitTypeDef gpio;
+    ADC_InitTypeDef adc;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA |
+                            RCC_APB2Periph_ADC1, ENABLE);
+    RCC_ADCCLKConfig(RCC_PCLK2_Div6);
+
     GPIO_StructInit(&gpio);
+    gpio.GPIO_Pin = GPIO_Pin_0;
     gpio.GPIO_Mode = GPIO_Mode_AIN;
-    gpio.GPIO_Pin  = GPIO_Pin_0 | GPIO_Pin_1 | GPIO_Pin_2;
     GPIO_Init(GPIOA, &gpio);
 
-    // ADC 扫描+连续
-    ADC_InitTypeDef adc;
+    ADC_DeInit(ADC1);
     ADC_StructInit(&adc);
-    adc.ADC_Mode               = ADC_Mode_Independent;
-    adc.ADC_ScanConvMode       = ENABLE;         // 多通道扫描
-    adc.ADC_ContinuousConvMode = ENABLE;          // 自动下一轮
-    adc.ADC_NbrOfChannel       = ADC_CHANNELS;   // 3 通道
+    adc.ADC_Mode = ADC_Mode_Independent;
+    adc.ADC_ScanConvMode = DISABLE;
+    adc.ADC_ContinuousConvMode = DISABLE;
+    adc.ADC_ExternalTrigConv = ADC_ExternalTrigConv_None;
+    adc.ADC_DataAlign = ADC_DataAlign_Right;
+    adc.ADC_NbrOfChannel = 1U;
     ADC_Init(ADC1, &adc);
 
-    // 按顺序配通道：通道0 先采样，通道1 次之...
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_0, 1, ADC_SampleTime_55Cycles5);
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_1, 2, ADC_SampleTime_55Cycles5);
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_2, 3, ADC_SampleTime_55Cycles5);
+    /* 采样时间不是越短越好；高源阻抗传感器应取更长时间。 */
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_0, 1U,
+                             ADC_SampleTime_55Cycles5);
 
-    // DMA1 通道1：外设→内存，循环模式
-    DMA_DeInit(DMA1_Channel1);
+    ADC_Cmd(ADC1, ENABLE);
+    ADC_ResetCalibration(ADC1);
+    for (uint32_t left = ADC_WAIT_LIMIT;
+         ADC_GetResetCalibrationStatus(ADC1) != RESET;) {
+        if (left-- == 0U) return false;
+    }
+    ADC_StartCalibration(ADC1);
+    for (uint32_t left = ADC_WAIT_LIMIT;
+         ADC_GetCalibrationStatus(ADC1) != RESET;) {
+        if (left-- == 0U) return false;
+    }
+    return true;
+}
+
+static bool ADC1_ReadOnce(uint16_t *out)
+{
+    ADC_ClearFlag(ADC1, ADC_FLAG_EOC);
+    ADC_SoftwareStartConvCmd(ADC1, ENABLE);
+    uint32_t left = ADC_WAIT_LIMIT;
+    while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET) {
+        if (left-- == 0U)
+            return false;
+    }
+    *out = ADC_GetConversionValue(ADC1);
+    return true;
+}
+```
+
+使用时先报告原始码值：
+
+```c
+uint16_t raw;
+if (ADC1_ReadOnce(&raw)) {
+    uint32_t millivolt = (uint32_t)raw * 3300U / 4095U; /* 3300 只是待测假设 */
+    /* 输出 raw 和 millivolt；用万用表量 VDDA 后再替换 3300。 */
+}
+```
+
+## 9.3 采样时间、源阻抗和“稳定数值”的陷阱
+
+ADC 采样时内部采样电容需要经外部信号源充电。源阻抗高、线长、传感器输出弱或采样时间过短时，连续码值可能稳定地偏向前一次电压——这比随机噪声更难发现。
+
+| 现象 | 优先动作 |
+|---|---|
+| 电位器转到两端，码值不到 0/4095 | 先测实际输入/VDDA，再检查分压/接线 |
+| 切换两个通道后第一个值异常 | 丢弃第一次，或增加采样时间/降低源阻抗 |
+| NTC/光敏电阻抖动大 | 检查分压拓扑、滤波、采样周期、接地；不要先套软件平均 |
+| 值一直接近固定数 | GPIO 是否仍为数字模式、ADC 通道是否正确、传感器是否共地 |
+
+NTC 不是“给一个公式就能测温”：必须明确 NTC 标称阻值/B 值、串联电阻、供电、测量节点和温度范围，才可由分压电压推回电阻再推回温度。先把原始 ADC、电压和电路图记录清楚，再做拟合/校准。
+
+## 9.4 ADC + DMA：CPU 不搬数据，不等于没有并发问题
+
+ADC1 的规则转换 DMA 请求映射到 DMA1 Channel1。连续扫描时 DMA 可把 DR 自动搬到缓冲区：
+
+```c
+#define ADC_SAMPLE_COUNT  32U
+static volatile uint16_t adc_samples[ADC_SAMPLE_COUNT];
+
+static void ADC1_DMA_Init(void)
+{
     DMA_InitTypeDef dma;
-    DMA_StructInit(&dma);
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+    DMA_DeInit(DMA1_Channel1);
+
     dma.DMA_PeripheralBaseAddr = (uint32_t)&ADC1->DR;
-    dma.DMA_MemoryBaseAddr     = (uint32_t)adc_buf;
-    dma.DMA_DIR                = DMA_DIR_PeripheralSRC;
-    dma.DMA_BufferSize         = ADC_CHANNELS;
-    dma.DMA_Mode               = DMA_Mode_Circular;      // 循环
-    dma.DMA_MemoryInc          = DMA_MemoryInc_Enable;    // 地址递增
-    dma.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
+    dma.DMA_MemoryBaseAddr = (uint32_t)adc_samples;
+    dma.DMA_DIR = DMA_DIR_PeripheralSRC;
+    dma.DMA_BufferSize = ADC_SAMPLE_COUNT;
+    dma.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
+    dma.DMA_MemoryInc = DMA_MemoryInc_Enable;
     dma.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord;
-    dma.DMA_MemoryDataSize     = DMA_MemoryDataSize_HalfWord;
-    dma.DMA_Priority           = DMA_Priority_High;
+    dma.DMA_MemoryDataSize = DMA_MemoryDataSize_HalfWord;
+    dma.DMA_Mode = DMA_Mode_Circular;
+    dma.DMA_Priority = DMA_Priority_High;
+    dma.DMA_M2M = DMA_M2M_Disable;
     DMA_Init(DMA1_Channel1, &dma);
     DMA_Cmd(DMA1_Channel1, ENABLE);
-
-    ADC_DMACmd(ADC1, ENABLE);                            // ADC → DMA 闸门
-
-    // 校准 + 启动
-    ADC_Cmd(ADC1, ENABLE);
-    ADC_ResetCalibration(ADC1);
-    while (ADC_GetResetCalibrationStatus(ADC1));
-    ADC_StartCalibration(ADC1);
-    while (ADC_GetCalibrationStatus(ADC1));
-
-    ADC_SoftwareStartConvCmd(ADC1, ENABLE);              // 开转！DMA 自动循环
+    ADC_DMACmd(ADC1, ENABLE);
 }
 ```
 
-使用：**DMA 在后台自动把 3 个通道的转换结果填入 `adc_buf[0..2]`**，CPU 零开销：
+`volatile` 让 CPU 每次从缓冲区重新读取，而不是沿用寄存器里的旧副本；但它不保证你读 32 个样本时 DMA 不在中间改写。要得到一致帧，可在 DMA 半传输/传输完成 ISR 中标记半块、使用双缓冲/序号，或短暂停止 DMA 后复制。不要宣称“DMA 缓冲不需要 volatile”或“加 volatile 就是线程安全”。
+
+启动多通道扫描前还要把 `ADC_ScanConvMode=ENABLE`、`ADC_NbrOfChannel`、每个 rank 的 `ADC_RegularChannelConfig()`、触发源和连续模式一起配置。单通道配置片段不能直接变成多通道系统。
+
+## 9.5 内部温度传感器：趋势参考，不是环境温度计
+
+内部温度传感器接 ADC 通道 16。启用后需要稳定时间，且器件间偏移/斜率差异很大：
 
 ```c
-int main(void) {
-    ADC1_DMA_Init();
-    USART1_Init();
-    while (1) {
-        printf("CH0=%4d CH1=%4d CH2=%4d\r\n",
-               adc_buf[0], adc_buf[1], adc_buf[2]);
-        Delay_ms(500);
-    }
-}
+ADC_TempSensorVrefintCmd(ENABLE);
+/* 等待数据手册规定的稳定时间，再采样 ADC_Channel_16。 */
 ```
 
-注意：`adc_buf` 不需要 `volatile`——因为 DMA 写入和 CPU 读取是**不同步的**。极端情况下可能在 DMA 写一半时读，读到「半截数据」。正式代码需要双缓冲，但这里先知道有这个问题。
+它测的是芯片附近结温相关信号，不等于空气温度。若没有按目标芯片数据手册做校准，适合看自热和相对变化，不适合在教材中承诺“室温 ±某度”。
 
----
+## 9.6 DAC：ZET6 的 PA4/PA5 是真实模拟输出
 
-## 9.4 动手：读内部温度传感器
-
-STM32F103 内部有一个温度传感器，连接到 ADC1 的通道 16。**不需要任何外部接线**——只要有芯片就能测。
-
-### 内部温度传感器代码
+不要删除 DAC：STM32F103ZET6 有 DAC1(PA4) 和 DAC2(PA5)。下面以 DAC1 输出静态电压为例：
 
 ```c
-void TempSensor_Init(void) {
-    // 开启 ADC1 时钟 + 开启温度传感器
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE);
-    ADC_TempSensorVrefintCmd(ENABLE);     // 使能内部传感器
+#include "stm32f10x_dac.h"
 
-    // ADC 初始化（单通道、单次）
-    ADC_InitTypeDef adc;
-    ADC_StructInit(&adc);
-    adc.ADC_NbrOfChannel = 1;
-    ADC_Init(ADC1, &adc);
+static void DAC1_Init(void)
+{
+    GPIO_InitTypeDef gpio;
+    DAC_InitTypeDef dac;
 
-    // 通道 16 采样时间要长（温度传感器输出阻抗高）
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_16, 1, ADC_SampleTime_239Cycles5);
-
-    ADC_Cmd(ADC1, ENABLE);
-    ADC_ResetCalibration(ADC1);
-    while (ADC_GetResetCalibrationStatus(ADC1));
-    ADC_StartCalibration(ADC1);
-    while (ADC_GetCalibrationStatus(ADC1));
-}
-
-float ReadTemp(void) {
-    ADC_SoftwareStartConvCmd(ADC1, ENABLE);
-    while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET);
-    uint16_t val = ADC_GetConversionValue(ADC1);
-
-    // 温度公式（参考数据手册电气特性表）
-    // V25 = 1.43V（25°C 时输出电压）
-    // Avg_Slope = 4.3mV/°C（每度变化量）
-    float voltage = val * 3.3f / 4096.0f;
-    return ((1.43f - voltage) / 0.0043f) + 25.0f;
-}
-```
-
-主循环：
-
-```c
-printf("芯片温度: %.1f°C\r\n", ReadTemp());
-```
-
-### 注意事项
-
-- **精度 ±1.5°C**——内部传感器用于检测芯片是否过热，不是精密温度计
-- 采样时间长（`239.5 Cycles`），因为传感器输出阻抗高
-- 必须先调 `ADC_TempSensorVrefintCmd(ENABLE)`，否则读通道 16 永远返回 0
-
----
-
-## 9.5 动手：读取 NTC 热敏电阻温度
-
-你的板子上有 **ADC&NTC&PT100 模块**——NTC（负温度系数热敏电阻）的阻值随温度变化，通过 ADC 测量分压电压即可算出温度。
-
-### 原理
-
-```
-      3.3V
-        │
-        ├── 固定电阻 R₀（通常 10kΩ）
-        │
-        └──┬─── PA1 (ADC1_IN1) — 你的 STM_ADC 接口
-           │
-        NTC 热敏电阻（10kΩ @ 25°C）
-           │
-          GND
-```
-
-NTC 阻值与温度的关系（近似公式 —— Steinhart-Hart 方程）：
-
-```
-1/T = 1/T₀ + (1/B) × ln(R/R₀)
-
-其中：
-  T   = 当前温度（开尔文）
-  T₀  = 25°C = 298.15K
-  R₀  = 25°C 时的阻值（10kΩ）
-  B   = NTC 的 B 值（通常 3435K 或 3950K，看模块标称）
-  R   = 当前阻值（由 ADC 分压算出）
-```
-
-### ADC 读数 → 温度
-
-```c
-#define B_VALUE     3950    // 你的 NTC B 值（看模块标签，常见 3435/3950）
-#define R0          10000   // 25°C 时阻值 10kΩ
-#define SERIES_R    10000   // 串联固定电阻 10kΩ
-
-float Read_NTC_Temp(uint8_t adc_channel) {
-    // 1. 读 ADC
-    ADC_RegularChannelConfig(ADC1, adc_channel, 1, ADC_SampleTime_55Cycles5);
-    ADC_SoftwareStartConvCmd(ADC1, ENABLE);
-    while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET);
-    uint16_t adc_val = ADC_GetConversionValue(ADC1);
-
-    // 2. 分压电压 → NTC 阻值
-    float voltage = adc_val * 3.3f / 4096.0f;
-    float r_ntc = SERIES_R * voltage / (3.3f - voltage);   // 串联分压反算
-
-    // 3. 阻值 → 温度（Steinhart-Hart）
-    float steinhart;
-    steinhart = r_ntc / R0;                    // R/R₀
-    steinhart = logf(steinhart);                // ln(R/R₀)
-    steinhart /= B_VALUE;                       // (1/B) × ln(R/R₀)
-    steinhart += 1.0f / 298.15f;                // + 1/T₀
-    steinhart = 1.0f / steinhart;               // 取倒数得 T（开尔文）
-    steinhart -= 273.15f;                       // 转摄氏
-
-    return steinhart;
-}
-```
-
-NTC 模块在你的板子上接 **PA1 (ADC1_IN1)**——这就是 STM_ADC 那个接口。
-
-### 验证
-
-```c
-int main(void) {
-    ADC1_Init();              // 跟 9.2 节同样的 ADC 初始化，只是把通道配为 PA1
-    USART1_Init();
-
-    while (1) {
-        float temp = Read_NTC_Temp(ADC_Channel_1);   // PA1 = 通道 1
-        printf("NTC 温度: %.1f°C\r\n", temp);
-        Delay_ms(1000);
-    }
-}
-```
-
-用手捏住 NTC 探头几秒，温度应该上升 2-5°C。
-
-> **NTC 精度**：取决于 B 值标称精度和分压电阻误差，通常 ±1~2°C。NTC 适合测 -40°C ~ +125°C 范围。PT100 更精确（±0.1°C 级别），但需要专用的恒流源或电桥电路——如果你的模块带 PT100 接口，查模块说明书确认接线和 ADC 通道。
-
-> **P_TOUCH（触摸按键）**：同一个模块上可能还有一个标 P_TOUCH 的接口，它连接一个电容式触摸感应传感器（TTP223 或类似芯片）。触摸感应区时，对应 GPIO 输出高/低电平。用法跟第 3 章的机械按键一样——配成 GPIO 输入读取即可，区别是触摸感应没有机械抖动，不需要消抖。具体接哪个 GPIO 脚，查你的模块说明书。
-
----
-
-## 9.6 动手：DAC 输出模拟电压
-
-ADC 是模拟→数字，**DAC** 是数字→模拟。STM32F103 内置 2 路 12 位 DAC，输出引脚固定：
-
-| DAC 通道 | 引脚 | 说明 |
-|---------|------|------|
-| DAC1 | PA4 | 输出 0~Vref（通常 0~3.3V）|
-| DAC2 | PA5 | 输出 0~Vref |
-
-### DAC 初始化
-
-```c
-void DAC1_Init(void) {
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_DAC, ENABLE);
 
-    // PA4 配成模拟输入（DAC 输出时引脚要配成模拟）
-    GPIO_InitTypeDef gpio;
-    gpio.GPIO_Pin  = GPIO_Pin_4;
+    GPIO_StructInit(&gpio);
+    gpio.GPIO_Pin = GPIO_Pin_4;       /* DAC1_OUT */
     gpio.GPIO_Mode = GPIO_Mode_AIN;
     GPIO_Init(GPIOA, &gpio);
 
-    // DAC 通道 1 使能
-    DAC_InitTypeDef dac;
     DAC_StructInit(&dac);
-    dac.DAC_Trigger = DAC_Trigger_None;       // 软件触发
+    dac.DAC_Trigger = DAC_Trigger_None;
     dac.DAC_WaveGeneration = DAC_WaveGeneration_None;
-    dac.DAC_OutputBuffer = DAC_OutputBuffer_Enable;  // 输出缓冲（可驱动负载）
+    dac.DAC_LFSRUnmask_TriangleAmplitude = DAC_LFSRUnmask_Bit0;
+    dac.DAC_OutputBuffer = DAC_OutputBuffer_Enable;
     DAC_Init(DAC_Channel_1, &dac);
     DAC_Cmd(DAC_Channel_1, ENABLE);
 }
-```
 
-### 输出指定电压
-
-12 位 DAC：输出值 0~4095 对应 0~Vref（3.3V）。每步 = 3.3V / 4096 ≈ 0.8mV。
-
-```c
-// 设 DAC 输出（值 0~4095）
-void DAC1_Set(uint16_t val) {
-    DAC_SetChannel1Data(DAC_Align_12b_R, val);
-}
-
-// 设 DAC 输出电压（0~3.3V）
-void DAC1_SetVoltage(float v) {
-    if (v < 0)        v = 0;
-    if (v > 3.3f)     v = 3.3f;
-    uint16_t val = (uint16_t)(v / 3.3f * 4095.0f + 0.5f);
-    DAC_SetChannel1Data(DAC_Align_12b_R, val);
+static void DAC1_Write12(uint16_t code)
+{
+    if (code > 4095U) code = 4095U;
+    DAC_SetChannel1Data(DAC_Align_12b_R, code);
 }
 ```
 
-### 验证：输出三角波 / 正弦波
+依次写 0、1024、2048、3072、4095，并用高阻万用表测 PA4。实际端点不必恰好是 0/VDDA：输出缓冲、负载、电源和数据手册规格都会影响。若接外部电路，先确认输入阻抗与电流；DAC 不是电源，也不能直接驱动扬声器、继电器或未知低阻负载。
 
-```c
-int main(void) {
-    DAC1_Init();
-    USART1_Init();
+要输出稳定频率的正弦/音频，不能用 `Delay_us()` 在循环中随意写 DAC；应使用定时器触发、DMA、采样率和适当的模拟滤波。第 12 章建立 DMA 边界后再做连续波形。
 
-    printf("DAC 输出三角波（PA4 接示波器或万用表）\r\n");
-
-    while (1) {
-        // 三角波：0→4095→0→4095...
-        for (uint16_t i = 0; i < 4095; i++) {
-            DAC1_Set(i);
-            Delay_us(10);       // 频率约 24Hz（1/(4096×2×10µs)）
-        }
-        for (uint16_t i = 4095; i > 0; i--) {
-            DAC1_Set(i);
-            Delay_us(10);
-        }
-    }
-}
-```
-
-**效果**：用万用表量 PA4 引脚，电压在 0~3.3V 之间匀速摆动。接 LED 串电阻能看到呼吸灯效果。
-
-> **注意**：DAC 输出缓冲器驱动能力有限（约 5mA），不能直接驱动电机或大负载。接个 LED+电阻或示波器观察没问题。
-
----
-
-## 9.7 SPL vs HAL ADC 对照
-
-| 操作 | SPL | HAL |
-|------|-----|-----|
-| 初始化 | `ADC_Init()` + `ADC_Cmd()` | `HAL_ADC_Init()` + `HAL_ADC_Start()` |
-| 校准 | `ADC_ResetCalibration()` + `ADC_StartCalibration()` | `HAL_ADCEx_Calibration_Start()` |
-| 读单通道 | 软件触发 + 轮询 EOC | `HAL_ADC_Start()` + `HAL_ADC_PollForConversion()` |
-| 读温度 | `ADC_Channel_16` + 公式计算 | CubeMX 勾选内部温度传感器 |
-| DMA 多通道 | `ADC_DMACmd()` + 手配 DMA | `HAL_ADC_Start_DMA()` + 回调 |
-| 通道配置 | `ADC_RegularChannelConfig()` | CubeMX 自动 + `ADC_ChannelConfTypeDef` |
-
-SPL 的 ADC 配置更透明——配通道顺序、采样时间、校准步骤都在代码里。HAL 把这些封装到 `HAL_ADC_ConfigChannel()` 中，更简洁但学到的细节更少。
-
-## 9.8 模拟输入的电气边界
-
-ADC 读数正确的前提不是“代码调用了 ADC1_Read”，而是输入电路满足条件：
-
-- PA0/PA1 等 ADC 引脚电压必须在 GND 到模拟参考电压之间；
-- 未使用的 ADC 输入不能悬空，否则读数会随机漂移；
-- 高阻传感器或电阻分压需要更长采样时间；
-- 用万用表量实际电压，再与 ADC 换算结果对比；
-- 任何可能高于 3.3V 的信号都应先分压或用合适的前端电路；
-- ADC 可测电压，不等于 GPIO 能承受任意外部模拟源。
-
-第一次实验优先用电位器或 3.3V/GND 分压；不要直接把未知模块输出接到 ADC。
-
-## 9.9 ADC 实测、误差与排错
-
-最低实验要求不是“打印了一个数字”，而是让数字与万用表读数趋势一致：
-
-1. 用万用表测电位器滑动端电压；
-2. 打印 `raw`、换算电压和采样次数；
-3. 从接近 0V 缓慢转到接近 3.3V，确认数值单调变化；
-4. 再打开 DMA 连续采样，比较原始值的抖动范围。
+## 9.7 验收、排错与练习
 
 | 现象 | 优先检查 |
 |---|---|
-| 始终为 0 或满量程 | GPIO 是否为模拟输入、通道号/ADC 时钟、输入是否真的有电压 |
-| 数值跳动很大 | 信号源阻抗、采样时间、供电噪声、GND、软件平均 |
-| 电压换算整体偏差 | 实际 Vref、分压比、校准假设 |
-| 多通道数据错位 | 规则通道顺序、DMA 缓冲区长度和半传输/完成边界 |
-| 板子异常或 ADC 损坏风险 | 输入是否超过 3.3V；立即断开未知信号 |
+| ADC 读数全 0/4095 | 输入电压、GPIO 模式、通道、供电/共地、超过量程 |
+| ADC 偶发错误 | ADCCLK、采样时间、源阻抗、转换完成/校准状态 |
+| DMA 缓冲像随机撕裂 | CPU 与 DMA 同时访问同一块；使用半传输/完成边界 |
+| 内部温度离室温很远 | 这是预期风险；确认稳定时间和校准用途，不把它当环境计 |
+| DAC 输出不等于公式 | VDDA、缓冲/负载、万用表带宽和端点规格 |
+| DAC 没波形 | PA4/PA5 是否被其他复用占用；DAC 时钟和使能、代码/对齐是否正确 |
 
-练习：为一个通道记录 100 次采样的最小值、最大值和平均值；解释为什么平均能减小随机噪声，却不能修复错误接线。
+练习：
 
-## 9.10 本章要点
+1. 量出实际 VDDA，比较用 3300mV 假设与实测参考换算的误差；
+2. 以 1、8、32 个样本求平均，记录噪声下降和响应变慢的折衷；
+3. 把 ADC DMA 缓冲拆成两个半区，在半传输/完成事件中各自处理；
+4. 用 DAC 输出五个静态码，作一张“理论/实测/负载”表；
+5. 画出自己的 NTC 分压电路，再决定是否有足够信息计算温度。
 
-- ADC = 模拟→数字桥梁，12 位分辨率 → 4096 个台阶，每步 0.8mV（3.3V 参考）
-- STM32 ADC 是逐次逼近型（SAR）——二分法比较 12 次得出 12 位结果
-- **每条 GPIO 配成模拟输入前必须关数字功能**（`GPIO_Mode_AIN`），否则内部数字缓存干扰模拟信号
-- **每次上电必须做 ADC 校准**——否则读数可能整体偏移几十个 LSB
-- DMA + ADC = 嵌入式「数据采集」最佳拍档：DMA 负责搬运，CPU 负责计算
-- 内部温度传感器很方便但不精确（±1.5°C），用于检测芯片过热而非环境温度
+## 9.8 本章要点
+
+- ADC/DAC 码值的尺度是 VDDA；先保护量程、再讨论精度。
+- F103 的 ADCCLK 不超过 14MHz；72MHz PCLK2 常用 `/6` 得到 12MHz。
+- 采样时间必须匹配源阻抗；“稳定”不代表“正确”。
+- ADC DMA1 Channel1 能减轻 CPU 搬运，但缓冲一致性仍需明确协议；`volatile` 不是锁。
+- ZET6 有两路 DAC；PA4/PA5 的输出要用仪器和负载条件验证。
 
 ---
 
-> **上一章**：[第 8 章 · 串口通信 UART](./08-chapter.md)
+> **上一章**：[第 8 章 · UART](./08-chapter.md)
 >
-> **下一章**：[第 10 章 · I2C 总线](./10-chapter.md)
->
-> 你学会了「感知电压」。下一步学「设备之间通信」——I2C 是芯片间最常用的协议，一根数据线一根时钟线，连 OLED、传感器全都靠它。
+> **下一章**：[第 10 章 · I2C](./10-chapter.md)

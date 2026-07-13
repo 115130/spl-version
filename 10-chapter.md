@@ -1,619 +1,291 @@
-# 第 10 章 · I2C 总线
+# 第 10 章 · I2C：有状态、有超时、可恢复的两线总线（SPL 版）
 
-> **本章产出**：能从 I2C 的电气规则、起止条件、ACK 和地址开始，稳定驱动一个 OLED、EEPROM 或传感器；总线出错时能判断是接线、上拉、地址还是状态机问题。
+> **本章产出**：以 I2C1/PB6/PB7 建立一条 100kHz 外接总线；用带超时与错误码的写事务验证 ACK；理解 F1 BUSY 勘误恢复和 OLED 帧缓冲的必要性。
 >
-> **前置知识**：第 3、5、8 章；第 8 章 UART 用作 I2C 调试日志。
+> **前置知识**：第 3 章开漏、第 5 章时钟、第 8 章 UART 日志。
 >
-> **硬件准备**：3.3V I2C 模块、SCL/SDA 上拉电阻或带上拉的模块；不要把未知 5V I2C 信号直接连到 ZET6。
-
-## 10.1 为什么需要总线
-
-8 个传感器如果各用 3 根线，需要 24 根 GPIO。如果共享 2 根线——只需要 2 根。**I2C 就是这 2 根线的总线协议。**
-
-### 物理层
-
-```
-SDA (数据) ──┬──┬──┬── ... ──┬── VDD (上拉电阻)
-SCL (时钟) ──┼──┼──┼── ... ──┼── VDD (上拉电阻)
-             │  │  │         │
-          ┌──┴──┴──┴─┐    ┌──┴──┐
-          │   MCU    │    │ 设备 │
-          │  (主机)   │    │ (从机)│
-          └──────────┘    └─────┘
-```
-
-两根线都需要**上拉电阻**（4.7kΩ→VDD）。I2C 用**开漏输出**——设备只能拉低，不能拉高。高电平由上拉电阻提供。为什么？多设备共享同一条线，推挽输出会导致短路。开漏确保「谁拉低谁赢」的**线与**逻辑。
-
-### 速度
-
-| 模式 | 速率 | 常用 |
-|------|------|------|
-| 标准 | 100kHz | 大多数传感器 |
-| 快速 | 400kHz | OLED 屏 |
-| Fm+ | 1MHz | 高速传输 |
-
-STM32F103 支持标准和快速模式。
-
-### 协议
-
-```
-起始条件 → 地址 + R/W → ACK → 数据 → ACK → ... → 停止条件
-
-起始条件：SCL 高时 SDA 下降沿
-停止条件：SCL 高时 SDA 上升沿
-地址：7 位地址 + 1 位 R/W（0=写, 1=读）
-ACK：第 9 个 SCL 脉冲，从机拉低 SDA 表示「收到」
-```
-
-常见 I2C 设备地址：SSD1306 OLED = 0x3C，AT24C02 EEPROM = 0x50。
+> **硬件前提**：SCL/SDA 均需上拉到安全的 3.3V 电平并共地。PB6/PB7 是外接默认映射，不代表所有板载 I2C 器件都接在这里。
 
 ---
 
-### 10.1.5 I²C 外设的有限状态机
+## 10.1 I2C 的物理层与地址边界
 
-新手写 I²C 代码最困惑的就是——"为什么地址要左移一位？" 和 "`I2C_CheckEvent` 到底在等什么？"
+I2C 的 SCL、SDA 都是开漏“线与”总线：任一设备只能主动拉低，释放后由上拉电阻变高。因此第一件事不是 `I2C_Init()`，而是断电检查上拉/电平、上电后测两根线在空闲时都为高。
 
-#### ① 地址左移一位的真相
-
-I²C 总线上传输的 **7 位地址**是裸地址，不包含 R/W 位。STM32 的 I²C 外设要求你把地址**左移 1 位**，最低位填 R/W：
-
-```
-I²C 设备地址 = 0x3C（7 位）
-
-    7 位地址        R/W
-┌──┬──┬──┬──┬──┬──┬──┬──┐
-│ 0│ 1│ 1│ 1│ 1│ 0│ 0│ 0│      ← 0x3C << 1 = 0x78（写）
-└──┴──┴──┴──┴──┴──┴──┴──┘
-└──┬──┬──┬──┬──┬──┬──┘  ↑
-   裸的 7 位地址         最后 1 位 = R/W
-
-    0x78 = 写（R/W=0）
-    0x79 = 读（R/W=1）
+```text
+3.3V ── Rp ── SCL ── MCU / 从机 A / 从机 B
+3.3V ── Rp ── SDA ── MCU / 从机 A / 从机 B
+GND  ───────────────── 共地
 ```
 
-所以代码里写的：
+地址要分清：数据手册常写 7 位地址 `0x3C`；SPL 的 `I2C_Send7bitAddress()` 参数是左移过的地址字节，因此传 `addr7 << 1`，不要再把读写位手工 OR 进去。
+
+| 写法 | 含义 |
+|---|---|
+| `0x3C` | 7 位设备地址（例：某些 SSD1306 模块） |
+| `0x3C << 1` | 传给 SPL 发送函数的地址字段 |
+| `0x78/0x79` | 线上写/读地址字节；不应同时作为“7 位地址”存储 |
+
+`0x3C`、`0x50`、`0x68` 只是在不同模块上常见，不是 ZET6 开发板的保证。先查模块数据手册/原理图，再用单一从机做 ACK 验证。
+
+## 10.2 初始化：从 100kHz 开始
+
+400kHz 不是“更高级的默认”。上拉阻值、线长、电容、从机支持和 F1 勘误都影响可靠性；先稳定跑 100kHz，再逐项测量升级。
 
 ```c
-I2C_Send7bitAddress(I2C1, 0x3C << 1, I2C_Direction_Transmitter);
-//                     ↑
-//                 左移一位，填入 R/W 位
-```
-
-不是 STM32 故意设计得别扭——是因为 I²C 协议在线上传输的就是 8 位（7 位地址 + 1 位 R/W），STM32 外设只是如实反映了协议定义。
-
-#### ② SPL I²C 的事件序列（有限状态机）
-
-STM32 的 I²C 外设内部是一个**有限状态机**——它不会一次性帮你完成"发起始→发地址→发数据→收应答→发停止"这一整串操作。它每完成一步，就设一个事件标志等你检查。**你的代码必须逐个等这些事件，告诉外设"继续下一步"**。
-
-以一个写操作为例，状态机跑过的状态：
-
-```
-主机写一字节到 I²C 从机的完整状态序列：
-
-CPU 写 CR1_START=1
-    │
-    ▼
-┌─────────────────────────────────┐
-│ SB（Start Bit）= 1              │ ← 起始条件已发出
-│ I2C_EVENT_MASTER_MODE_SELECT    │
-│           ↓ CPU 读 SR1 清 SB    │
-├─────────────────────────────────┤
-│ ADDR（Address Sent）= 1         │ ← 地址+R/W 已发出，收到 ACK
-│ I2C_EVENT_MASTER_TRANSMITTER    │
-│    _MODE_SELECTED               │
-│           ↓ CPU 读 SR1+SR2 清   │
-├─────────────────────────────────┤
-│ TXE（Data Register Empty）= 1   │ ← TDR 空，CPU 可以写数据
-│ I2C_EVENT_MASTER_BYTE_TRANSMITT │
-│    ING                          │
-│           ↓ CPU 写 DR           │
-├─────────────────────────────────┤
-│ BTF（Byte Transfer Finished）   │ ← 一字节已发出，收到 ACK
-│ I2C_EVENT_MASTER_BYTE_TRANSMITT │
-│    ED                           │
-│           ↓ CPU 写下一字节       │
-├─────────────────────────────────┤
-│ 重复或 CPU 写 STOP=1            │
-│           ↓                     │
-└─────────────────────────────────┘
-```
-
-所以 SPL 的 I²C 代码看起来像是在反复检查标志：
-
-```c
-void I2C_WriteByte(uint8_t dev_addr, uint8_t reg, uint8_t data) {
-    I2C_GenerateSTART(I2C1, ENABLE);                        // 发起始
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECTED));  // 等 SB
-
-    I2C_Send7bitAddress(I2C1, dev_addr << 1, I2C_Direction_Transmitter);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));  // 等 ADDR
-
-    I2C_SendData(I2C1, reg);                                // 写寄存器地址
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));  // 等 BTF
-
-    I2C_SendData(I2C1, data);                               // 写数据
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));  // 等 BTF
-
-    I2C_GenerateSTOP(I2C1, ENABLE);                         // 发停止
-}
-```
-
-**每一个 `while` 都是在等 I²C 外设状态机走到下一步。** 你不等它，下一步的动作会失效，或者上一个动作还没完成就被覆盖了。
-
-#### ③ 什么是时钟拉伸
-
-I²C 从机有一个"刹车"机制——如果从机来不及处理收到的数据，会主动把 SCL **拉低**，强制主机等待：
-
-```
-正常情况下 SCL 由主机驱动：
-主机 ──┬──┬──┬──┬──┬──┬──┬──  （主机控制 SCL 高低）
-       │  │  │  │  │  │  │
-
-从机来不及处理时，从机拉低 SCL：
-主机 ──┬──┬──┬──┬──┬─────────
-       │  │  │  │  │  ← 从机把 SCL 拉低不放
-       └──┴──┴──┴──┘
-                      └── 从机处理完了释放 SCL → 继续
-```
-
-STM32 的 I²C 外设**自动处理时钟拉伸**——硬件检测到 SCL 被拉低，就自动等待。你的代码不需要管这件事。但知道它的存在有助于你理解"为什么 I²C 上传一字节的时间不固定"。
-
-#### ④ 错误场景：NACK
-
-如果从机没收到数据（或根本不存这个地址），它会不发 ACK，即 SDA 在第 9 个 SCL 脉冲时继续保持高电平。STM32 外设此时会置 `AF`（Acknowledge Failure）标志：
-
-```c
-if (I2C_GetFlagStatus(I2C1, I2C_FLAG_AF) == SET) {
-    // 从机没有响应！
-    printf("I²C 设备无应答（地址 0x%02X）\r\n", dev_addr);
-    I2C_ClearFlag(I2C1, I2C_FLAG_AF);
-}
-```
-
-如果总线上根本没接那个设备、或者地址不对、或者接线断了，`I2C_CheckEvent` 就会一直等不到 ADDR 事件——程序卡死。所以工业代码里要么加超时，要么加 NACK 检测。
-
----
-
-## 10.2 SPL I2C 初始化（SSD1306 OLED）
-
-```c
+#include <stdbool.h>
+#include "stm32f10x_gpio.h"
 #include "stm32f10x_i2c.h"
+#include "stm32f10x_rcc.h"
 
-void I2C1_Init(void) {
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_I2C1, ENABLE);
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
-
-    // PB6 = SCL, PB7 = SDA（复用开漏）
-    GPIO_InitTypeDef gpio;
-    gpio.GPIO_Pin   = GPIO_Pin_6 | GPIO_Pin_7;
-    gpio.GPIO_Mode  = GPIO_Mode_AF_OD;  // 开漏！
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(GPIOB, &gpio);
-
+static void I2C1_Apply100kHzConfig(void)
+{
     I2C_InitTypeDef i2c;
     I2C_StructInit(&i2c);
-    i2c.I2C_Mode              = I2C_Mode_I2C;
-    i2c.I2C_ClockSpeed        = 400000;    // 快速模式 400kHz
-    i2c.I2C_DutyCycle         = I2C_DutyCycle_2;
-    i2c.I2C_Ack               = I2C_Ack_Enable;
+    i2c.I2C_Mode = I2C_Mode_I2C;
+    i2c.I2C_DutyCycle = I2C_DutyCycle_2;
+    i2c.I2C_OwnAddress1 = 0U;           /* 单主机主模式仍填一个合法值。 */
+    i2c.I2C_Ack = I2C_Ack_Enable;
     i2c.I2C_AcknowledgedAddress = I2C_AcknowledgedAddress_7bit;
-    i2c.I2C_OwnAddress1       = 0x00;      // 主机模式不需要自己的地址
+    i2c.I2C_ClockSpeed = 100000U;
     I2C_Init(I2C1, &i2c);
     I2C_Cmd(I2C1, ENABLE);
 }
-```
 
-### SPL I2C 写入（写命令/数据到 SSD1306）
+static void I2C1_Init(void)
+{
+    GPIO_InitTypeDef gpio;
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_I2C1, ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
 
-### SPL I2C 写入（SSD1306 命令/数据）
-
-SSD1306 OLED 用 I2C 发送时，需要区分**命令**和**数据**：
-
-```c
-// 发命令：reg=0x00, data=命令字节
-void OLED_WriteCmd(uint8_t cmd) {
-    I2C_GenerateSTART(I2C1, ENABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
-
-    I2C_Send7bitAddress(I2C1, 0x3C << 1, I2C_Direction_Transmitter);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));
-
-    I2C_SendData(I2C1, 0x00);              // 命令标识
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    I2C_SendData(I2C1, cmd);               // 命令内容
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    I2C_GenerateSTOP(I2C1, ENABLE);
-}
-
-// 发数据：reg=0x40, data=显示像素
-void OLED_WriteData(uint8_t data) {
-    I2C_GenerateSTART(I2C1, ENABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
-
-    I2C_Send7bitAddress(I2C1, 0x3C << 1, I2C_Direction_Transmitter);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));
-
-    I2C_SendData(I2C1, 0x40);              // 数据标识
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    I2C_SendData(I2C1, data);              // 像素数据
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    I2C_GenerateSTOP(I2C1, ENABLE);
+    GPIO_StructInit(&gpio);
+    gpio.GPIO_Pin = GPIO_Pin_6 | GPIO_Pin_7;
+    gpio.GPIO_Mode = GPIO_Mode_AF_OD;
+    gpio.GPIO_Speed = GPIO_Speed_2MHz;
+    GPIO_Init(GPIOB, &gpio);
+    I2C1_Apply100kHzConfig();
 }
 ```
 
----
+`I2C_Init()` 用当前 PCLK1 计算时序；因此必须在第 5 章时钟稳定、`SystemCoreClockUpdate()` 后执行。时钟切换后重新初始化 I2C，而不是继续使用旧分频。
 
-## 10.3 动手：让 OLED 显示「Hello」
+## 10.3 把等待变成可返回的结果
 
-### 接线
-
-SSD1306 OLED 模块（4 针 I2C 版，如果买了的话）接 PB6/PB7：
-
-| OLED | STM32 |
-|------|-------|
-| VCC | 3.3V |
-| GND | GND |
-| SCL | PB6 (I2C1_SCL) |
-| SDA | PB7 (I2C1_SDA) |
-
-> 没有 OLED 也不影响——板载的 AT24C02 EEPROM 和 MPU6050 也是 I²C 设备，下面直接用它们做实验。
-
-### SSD1306 初始化序列
-
-每个外设芯片上电后都需要发一组配置命令：
+裸 `while (!I2C_CheckEvent(...));` 会在断线、NACK、BUSY 或异常 STOP 时永久卡死。先定义可传播的错误：
 
 ```c
-void OLED_Init(void) {
-    Delay_ms(100);
-    OLED_WriteCmd(0xAE);
-    OLED_WriteCmd(0x20); OLED_WriteCmd(0x00);
-    OLED_WriteCmd(0xC8);
-    OLED_WriteCmd(0x81); OLED_WriteCmd(0xFF);
-    OLED_WriteCmd(0xA1);
-    OLED_WriteCmd(0xA8); OLED_WriteCmd(0x3F);
-    OLED_WriteCmd(0xD5); OLED_WriteCmd(0xF0);
-    OLED_WriteCmd(0xDA); OLED_WriteCmd(0x12);
-    OLED_WriteCmd(0x8D); OLED_WriteCmd(0x14);
-    OLED_WriteCmd(0xAF);
-}
-```
+typedef enum {
+    I2C_OK,
+    I2C_TIMEOUT,
+    I2C_NACK,
+    I2C_BUS_ERROR,
+    I2C_ARBITRATION_LOST
+} I2C_Result;
 
-### 清屏
-
-```c
-void OLED_Clear(void) {
-    for (uint8_t p = 0; p < 8; p++) {
-        OLED_WriteCmd(0xB0 + p);
-        OLED_WriteCmd(0x00); OLED_WriteCmd(0x10);
-        for (uint8_t c = 0; c < 128; c++)
-            OLED_WriteData(0x00);
+static I2C_Result I2C1_ReadAndClearError(void)
+{
+    uint16_t sr1 = I2C1->SR1;
+    if ((sr1 & I2C_SR1_AF) != 0U) {
+        I2C1->SR1 &= (uint16_t)~I2C_SR1_AF;
+        return I2C_NACK;
     }
-}
-```
-
-### 点亮全屏
-
-```c
-void OLED_Fill(uint8_t data) {
-    for (uint8_t p = 0; p < 8; p++) {
-        OLED_WriteCmd(0xB0 + p);
-        OLED_WriteCmd(0x00); OLED_WriteCmd(0x10);
-        for (uint8_t c = 0; c < 128; c++)
-            OLED_WriteData(data);
+    if ((sr1 & (I2C_SR1_BERR | I2C_SR1_OVR)) != 0U) {
+        I2C1->SR1 &= (uint16_t)~(I2C_SR1_BERR | I2C_SR1_OVR);
+        return I2C_BUS_ERROR;
     }
-}
-
-OLED_Fill(0xFF);  Delay_ms(500);
-OLED_Fill(0x00);  Delay_ms(500);
-OLED_Fill(0xF0);  Delay_ms(500);
-```
-
-### 画像素
-
-SSD1306 显存按页组织：128 列 x 8 页（每页 8 行，1 bit/像素）：
-
-```c
-void OLED_DrawPixel(uint8_t x, uint8_t y, uint8_t color) {
-    uint8_t page = y / 8;
-    uint8_t bit  = y % 8;
-    OLED_WriteCmd(0xB0 + page);
-    OLED_WriteCmd(0x00 + (x & 0x0F));
-    OLED_WriteCmd(0x10 + (x >> 4));
-    OLED_WriteData(color ? (1 << bit) : 0);
-}
-```
-
-> OLED 不能读——需帧缓冲。
-
----
-
-## 10.4 动手：读写 AT24C02 EEPROM
-
-板载的 **AT24C02** 是一个 2Kbit（256 字节）的 I²C EEPROM——掉电不丢数据，适合存配置参数、校准值、设备序列号。
-
-**地址**：0x50（7 位，左移 1 位后 = 0xA0 写 / 0xA1 读）
-
-**接线**：什么线都不用接——AT24C02 已经在你的板子上连好了 I²C 总线（SCL→PB6, SDA→PB7），和 OLED、MPU6050 共用同一条 I²C 总线。
-
-### 写一个字节
-
-```c
-void AT24C02_WriteByte(uint8_t addr, uint8_t data) {
-    I2C_GenerateSTART(I2C1, ENABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
-
-    I2C_Send7bitAddress(I2C1, 0x50 << 1, I2C_Direction_Transmitter);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));
-
-    I2C_SendData(I2C1, addr);        // 写入地址（0~255）
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    I2C_SendData(I2C1, data);        // 写入数据
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    I2C_GenerateSTOP(I2C1, ENABLE);
-
-    Delay_ms(10);                    // AT24C02 内部写时间~5ms
-}
-```
-
-### 读一个字节
-
-```c
-uint8_t AT24C02_ReadByte(uint8_t addr) {
-    uint8_t data;
-
-    // 先「假写」——发地址，告诉 EEPROM 要读哪个位置
-    I2C_GenerateSTART(I2C1, ENABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
-
-    I2C_Send7bitAddress(I2C1, 0x50 << 1, I2C_Direction_Transmitter);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));
-
-    I2C_SendData(I2C1, addr);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    // 重新发起 START，这次读
-    I2C_GenerateSTART(I2C1, ENABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
-
-    I2C_Send7bitAddress(I2C1, 0x50 << 1, I2C_Direction_Receiver);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_RECEIVER_MODE_SELECTED));
-
-    // 读之前关 ACK——只读一个字节，读完就 STOP
-    I2C_AcknowledgeConfig(I2C1, DISABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_RECEIVED));
-    data = I2C_ReceiveData(I2C1);
-
-    I2C_GenerateSTOP(I2C1, ENABLE);
-    I2C_AcknowledgeConfig(I2C1, ENABLE);   // 恢复 ACK，不影响后面传输
-
-    return data;
-}
-```
-
-### 验证：写入再读出
-
-```c
-int main(void) {
-    I2C1_Init();
-    USART1_Init();
-
-    // 写位置 0x10 存 0xAA，位置 0x11 存 0xBB
-    AT24C02_WriteByte(0x10, 0xAA);
-    AT24C02_WriteByte(0x11, 0xBB);
-
-    Delay_ms(10);
-
-    uint8_t v1 = AT24C02_ReadByte(0x10);
-    uint8_t v2 = AT24C02_ReadByte(0x11);
-
-    printf("读回: 0x%02X 0x%02X\r\n", v1, v2);
-    // 输出: 读回: 0xAA 0xBB
-
-    while (1);
-}
-```
-
-**关掉开发板电源再开，重新读——数据还在！** 这就是非易失存储的意义。以后你的项目里设 Wi-Fi 密码、PID 参数、设备地址，都存在这里。
-
-### EEPROM vs Flash
-
-| 特性 | AT24C02 (EEPROM) | W25Q64 (SPI Flash) |
-|------|-----------------|-------------------|
-| 容量 | 256 字节 | 8MB |
-| 写入 | 字节写入（可改单个字节） | 必须先擦除整个扇区（4KB）再写 |
-| 寿命 | 100 万次 | 10 万次 |
-| 用途 | 配置参数、校准数据 | 字库、固件包、大量日志 |
-
-EEPROM 的好处是**字节级随机写**——改一个配置不用擦除整个扇区。
-
----
-
-## 10.5 动手：读取 MPU6050 六轴数据
-
-**MPU6050** 是板载的六轴运动传感器（三轴加速度计 + 三轴陀螺仪），有硬件 DMP 可做姿态解算。I²C 地址：**0x68**。
-
-接线也什么都不用加——MPU6050 和 AT24C02、OLED 共用同一条 I²C 总线。
-
-### 初始化
-
-```c
-#define MPU6050_ADDR  0x68
-
-// 对 MPU6050 写寄存器
-void MPU_WriteReg(uint8_t reg, uint8_t data) {
-    I2C_GenerateSTART(I2C1, ENABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
-
-    I2C_Send7bitAddress(I2C1, MPU6050_ADDR << 1, I2C_Direction_Transmitter);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));
-
-    I2C_SendData(I2C1, reg);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    I2C_SendData(I2C1, data);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    I2C_GenerateSTOP(I2C1, ENABLE);
-}
-
-// 从 MPU6050 读寄存器
-uint8_t MPU_ReadReg(uint8_t reg) {
-    uint8_t data;
-
-    I2C_GenerateSTART(I2C1, ENABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
-
-    I2C_Send7bitAddress(I2C1, MPU6050_ADDR << 1, I2C_Direction_Transmitter);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));
-
-    I2C_SendData(I2C1, reg);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
-
-    I2C_GenerateSTART(I2C1, ENABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
-
-    I2C_Send7bitAddress(I2C1, MPU6050_ADDR << 1, I2C_Direction_Receiver);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_RECEIVER_MODE_SELECTED));
-
-    I2C_AcknowledgeConfig(I2C1, DISABLE);
-    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_RECEIVED));
-    data = I2C_ReceiveData(I2C1);
-
-    I2C_GenerateSTOP(I2C1, ENABLE);
-    I2C_AcknowledgeConfig(I2C1, ENABLE);
-    return data;
-}
-
-void MPU6050_Init(void) {
-    MPU_WriteReg(0x6B, 0x00);   // 退出休眠模式
-    MPU_WriteReg(0x19, 0x07);   // 采样率分频
-    MPU_WriteReg(0x1A, 0x00);   // 无低通滤波
-    MPU_WriteReg(0x1B, 0x00);   // 陀螺仪满量程 ±250°/s
-    MPU_WriteReg(0x1C, 0x00);   // 加速度计满量程 ±2g
-
-    printf("MPU6050 WHO_AM_I = 0x%02X\r\n", MPU_ReadReg(0x75));
-    // 应该读到 0x68，说明通信成功
-}
-```
-
-### 读取原始数据
-
-加速度计和陀螺仪各 3 轴，每个值 16 位（高 8 位 + 低 8 位），连续存放：
-
-```c
-typedef struct {
-    int16_t accel_x, accel_y, accel_z;   // 加速度计（±2g: 16384 LSB/g）
-    int16_t temp;                          // 温度
-    int16_t gyro_x, gyro_y, gyro_z;       // 陀螺仪（±250°/s: 131 LSB/°/s）
-} MPU6050_Data_t;
-
-void MPU6050_ReadAll(MPU6050_Data_t *d) {
-    uint8_t buf[14];
-    // 从 0x3B 开始连续读 14 个字节
-    for (int i = 0; i < 14; i++)
-        buf[i] = MPU_ReadReg(0x3B + i);
-
-    d->accel_x = (buf[0]  << 8) | buf[1];
-    d->accel_y = (buf[2]  << 8) | buf[3];
-    d->accel_z = (buf[4]  << 8) | buf[5];
-    d->temp    = (buf[6]  << 8) | buf[7];
-    d->gyro_x  = (buf[8]  << 8) | buf[9];
-    d->gyro_y  = (buf[10] << 8) | buf[11];
-    d->gyro_z  = (buf[12] << 8) | buf[13];
-}
-
-int main(void) {
-    I2C1_Init();
-    USART1_Init();
-    MPU6050_Init();
-
-    MPU6050_Data_t mpu;
-
-    while (1) {
-        MPU6050_ReadAll(&mpu);
-        printf("ACC: %6d %6d %6d  "
-               "GYRO: %6d %6d %6d\r\n",
-               mpu.accel_x, mpu.accel_y, mpu.accel_z,
-               mpu.gyro_x,  mpu.gyro_y,  mpu.gyro_z);
-        Delay_ms(200);
+    if ((sr1 & I2C_SR1_ARLO) != 0U) {
+        I2C1->SR1 &= (uint16_t)~I2C_SR1_ARLO;
+        return I2C_ARBITRATION_LOST;
     }
+    return I2C_OK;
+}
+
+static I2C_Result I2C1_WaitEvent(uint32_t event, uint32_t timeout_ms)
+{
+    const uint32_t start = Timebase_NowMs();
+    while (I2C_CheckEvent(I2C1, event) == ERROR) {
+        I2C_Result error = I2C1_ReadAndClearError();
+        if (error != I2C_OK)
+            return error;
+        if ((uint32_t)(Timebase_NowMs() - start) >= timeout_ms)
+            return I2C_TIMEOUT;
+    }
+    return I2C_OK;
+}
+
+static I2C_Result I2C1_WaitBusFree(uint32_t timeout_ms)
+{
+    const uint32_t start = Timebase_NowMs();
+    while (I2C_GetFlagStatus(I2C1, I2C_FLAG_BUSY) != RESET) {
+        if ((uint32_t)(Timebase_NowMs() - start) >= timeout_ms)
+            return I2C_TIMEOUT;
+    }
+    return I2C_OK;
 }
 ```
 
-### 转换成物理值
+下一层的接口接收**7 位地址**和缓冲区，而不是把 OLED/EEPROM 的地址/控制字节写死在总线驱动里：
 
 ```c
-// 加速度 m/s²（满量程 ±2g 时，1g = 16384 LSB）
-float ax = mpu.accel_x / 16384.0f * 9.8f;
+static I2C_Result I2C1_MasterWrite7(uint8_t addr7,
+                                    const uint8_t *data, uint16_t len)
+{
+    I2C_Result r;
+    if (data == NULL || len == 0U)
+        return I2C_BUS_ERROR;
 
-// 角速度 °/s（满量程 ±250°/s 时，1°/s = 131 LSB）
-float gx = mpu.gyro_x / 131.0f;
+    if ((r = I2C1_WaitBusFree(20U)) != I2C_OK)
+        return r;
+
+    I2C_GenerateSTART(I2C1, ENABLE);
+    if ((r = I2C1_WaitEvent(I2C_EVENT_MASTER_MODE_SELECT, 20U)) != I2C_OK)
+        goto abort;
+
+    I2C_Send7bitAddress(I2C1, (uint8_t)(addr7 << 1),
+                         I2C_Direction_Transmitter);
+    if ((r = I2C1_WaitEvent(I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED, 20U)) != I2C_OK)
+        goto abort;
+
+    while (len-- != 0U) {
+        I2C_SendData(I2C1, *data++);
+        if ((r = I2C1_WaitEvent(I2C_EVENT_MASTER_BYTE_TRANSMITTED, 20U)) != I2C_OK)
+            goto abort;
+    }
+    I2C_GenerateSTOP(I2C1, ENABLE);
+    return I2C_OK;
+
+abort:
+    I2C_GenerateSTOP(I2C1, ENABLE);
+    return r;
+}
 ```
 
-### 你能看到什么
+这是一个轮询、单主机、写事务的教学基础，不是完整 I2C 框架。对“读 1/2/N 字节”，F1 的 ACK、ADDR、BTF、STOP 顺序不同，且该系列有接收相关勘误；应在一个专门的读状态机中按 RM0008 和勘误表处理，而不是把“写事务”复制后把方向改为 Receiver。
 
-- 板子静止水平放：**ACC_Z ≈ 16384**（1g 重力），ACC_X/Y ≈ 0
-- 快速转动板子：陀螺仪值剧烈变化
-- 温度值可读出芯片内部温度
+## 10.4 F1 BUSY 锁死：区分两种恢复
 
-**注意**：同一个 I²C 总线上挂了多个设备，地址不能冲突。AT24C02=0x50，MPU6050=0x68，SSD1306=0x3C——各不冲突，共享 SCL/SDA 没问题。
+如果 SDA/SCL 物理上都高，而 `I2C_FLAG_BUSY` 仍在复位后重新置位，可能是 F103 的模拟滤波器勘误。ST 的 [ES0340 2.9.7](https://www.st.com/resource/en/errata_sheet/es0340-stm32f101xcde-stm32f103xcde-device-errata-stmicroelectronics.pdf) 要求通过 GPIO 开漏强制**指定的电平转换序列**，随后 SWRST；它不是泛用“发九个时钟”。
+
+```c
+static bool I2C1_RecoverBusyErrata(void)
+{
+    GPIO_InitTypeDef gpio;
+
+    I2C_Cmd(I2C1, DISABLE);                         /* 1 */
+    GPIO_StructInit(&gpio);
+    gpio.GPIO_Pin = GPIO_Pin_6 | GPIO_Pin_7;
+    gpio.GPIO_Mode = GPIO_Mode_Out_OD;
+    gpio.GPIO_Speed = GPIO_Speed_2MHz;
+    GPIO_Init(GPIOB, &gpio);
+
+    GPIO_SetBits(GPIOB, GPIO_Pin_6 | GPIO_Pin_7);   /* 2: 两线高 */
+    if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_6) == Bit_RESET ||
+        GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_7) == Bit_RESET)
+        goto failed;                                 /* 3: 外部仍拉低，不能强行继续 */
+
+    GPIO_ResetBits(GPIOB, GPIO_Pin_7);               /* 4: SDA 低 */
+    if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_7) != Bit_RESET) goto failed;
+    GPIO_ResetBits(GPIOB, GPIO_Pin_6);               /* 6: SCL 低 */
+    if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_6) != Bit_RESET) goto failed;
+    GPIO_SetBits(GPIOB, GPIO_Pin_6);                 /* 8: SCL 高 */
+    if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_6) != Bit_SET) goto failed;
+    GPIO_SetBits(GPIOB, GPIO_Pin_7);                 /* 10: SDA 高 */
+    if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_7) != Bit_SET) goto failed;
+
+    gpio.GPIO_Mode = GPIO_Mode_AF_OD;                /* 12 */
+    GPIO_Init(GPIOB, &gpio);
+    I2C_SoftwareResetCmd(I2C1, ENABLE);              /* 13 */
+    I2C_SoftwareResetCmd(I2C1, DISABLE);             /* 14 */
+    I2C1_Apply100kHzConfig();                        /* 15: 重新写时序并使能 */
+    return I2C_GetFlagStatus(I2C1, I2C_FLAG_BUSY) == RESET;
+
+failed:
+    /* 失败时释放两根线并恢复 AF 开漏；由调用者上报物理总线故障。 */
+    GPIO_SetBits(GPIOB, GPIO_Pin_6 | GPIO_Pin_7);
+    gpio.GPIO_Mode = GPIO_Mode_AF_OD;
+    GPIO_Init(GPIOB, &gpio);
+    I2C1_Apply100kHzConfig();
+    return false;
+}
+```
+
+若 SDA 本来就被从机拉低，或电平检查失败，停止恢复并检查上拉、供电、短路、从机复位状态。对“从机卡在未完成字节”这类协议层总线恢复，9 个 SCL 脉冲可能有帮助，但它是另一问题：只能在知道总线、电平和从机允许时使用，并且仍须重新初始化/验证 ACK。
+
+## 10.5 OLED：控制字节、寻址模式与帧缓冲
+
+以一个已确认地址为 `OLED_ADDR7` 的 128×64 SSD1306 I2C 模块为例。OLED 的 `0x00` 是“后面是命令”、`0x40` 是“后面是显示数据”的**控制字节**，不是寄存器地址。分辨率、COM 引脚配置、地址、上拉和初始化序列随模块而变，先核对数据手册。
+
+采用页寻址时，显示 RAM 是 8 页 × 128 列，每个字节代表垂直 8 个像素。单像素函数若直接写 `0` 或 `1<<bit` 到 OLED，会擦掉同一字节的其余 7 个像素；因此先修改 1024B 帧缓冲：
+
+```c
+#define OLED_ADDR7 0x3CU       /* 仅示例：须由实物确认。 */
+#define OLED_WIDTH 128U
+#define OLED_PAGES 8U
+
+static uint8_t oled_fb[OLED_WIDTH * OLED_PAGES];
+
+static void OLED_SetPixel(uint8_t x, uint8_t y, uint8_t on)
+{
+    if (x >= OLED_WIDTH || y >= 64U)
+        return;
+    uint16_t index = (uint16_t)(y >> 3) * OLED_WIDTH + x;
+    uint8_t mask = (uint8_t)(1U << (y & 7U));
+    if (on != 0U) oled_fb[index] |= mask;
+    else          oled_fb[index] &= (uint8_t)~mask;
+}
+
+static I2C_Result OLED_FlushPage(uint8_t page)
+{
+    uint8_t packet[1U + OLED_WIDTH];
+    if (page >= OLED_PAGES)
+        return I2C_BUS_ERROR;
+
+    packet[0] = 0x40U;
+    for (uint8_t x = 0U; x < OLED_WIDTH; ++x)
+        packet[1U + x] = oled_fb[(uint16_t)page * OLED_WIDTH + x];
+    return I2C1_MasterWrite7(OLED_ADDR7, packet, sizeof packet);
+}
+```
+
+初始化时必须选择一种寻址模式并匹配刷新方式。例如页寻址使用页/列命令；若初始化为水平寻址，就应设置列/页窗口并连续发送。不要把两种模式的命令片段混在一起。先验证：ACK → 固定全亮/全灭 → 单页图案 → 帧缓冲像素，逐级排错。
+
+## 10.6 验收、排错与练习
+
+| 现象 | 优先检查 |
+|---|---|
+| 永远等不到 START/EV5 | SCL/SDA 是否空闲高、BUSY、时钟/上拉、F1 勘误恢复 |
+| 地址 NACK | 7 位/左移是否混淆、模块供电、电平、地址脚/器件型号 |
+| 事务偶发卡死 | 每个等待是否有超时；错误后是否 STOP；是否需要恢复/重新初始化 |
+| SDA 永远低 | 外部设备/短路/上拉问题；不要盲目强推高 |
+| 400kHz 不稳定 | 线长/电容/上拉/从机能力；先退回 100kHz |
+| OLED 有电却图像破碎 | 地址/初始化寻址模式、控制字节、页/列顺序、帧缓冲刷新 |
+
+验收顺序：
+
+1. 不接从机，测 SCL/SDA 空闲高；
+2. 只接一台已知从机，记录地址、ACK/NACK、错误码和总线频率；
+3. 断线/错误地址测试超时路径，确认程序可继续运行；
+4. 若遇 BUSY，先检查物理线，再按勘误序列恢复并重新验证；
+5. OLED 最后加入，先刷固定页，再上帧缓冲。
+
+练习：
+
+1. 把 `I2C1_MasterWrite7` 的每个状态与 START、SLA+W、ACK、DATA、STOP 对应画成时序图；
+2. 写一个只检查 ACK 的地址探测工具，并限制为你允许扫描的地址范围；
+3. 在 `I2C_Result` 中区分“总线线低”“NACK”“时间到”，把它们输出到 UART；
+4. 实现一个专用的单字节寄存器读状态机，并逐步核对 ACK/ADDR/STOP 的 F1 接收序列和勘误；
+5. 给 OLED 帧缓冲加入 `dirty_pages`，只刷新修改过的页。
+
+## 10.7 本章要点
+
+- I2C 高电平来自上拉，不来自推挽输出；空闲前先确认 SCL/SDA 都高。
+- 设备地址与线上地址字节不同：应用层保存 7 位地址，SPL 调用时左移一次。
+- 所有状态等待都需要超时、错误识别、STOP/恢复路径；轮询不等于可靠。
+- F103 的 BUSY 模拟滤波器勘误有官方 GPIO 电平转换 + SWRST 序列，不能用泛用 9 时钟代替。
+- OLED 单像素绘制要先改帧缓冲；寻址模式、控制字节、分辨率和地址必须互相一致。
 
 ---
 
-## 10.6 SPL vs HAL I2C 对照
-
-| 操作 | SPL | HAL |
-|------|-----|-----|
-| 初始化 | `I2C_Init()` + 手配 GPIO 开漏 | `HAL_I2C_Init()` + CubeMX 自动 |
-| 主机发 | 手动 START->ADDR->DATA->STOP | `HAL_I2C_Master_Transmit()` 一步 |
-| 状态检查 | `I2C_CheckEvent()` 查事件标志 | `HAL_I2C_GetState()` 查状态机 |
-| OLED 命令 | 自己封装 `OLED_WriteCmd` | `HAL_I2C_Mem_Write()` 一步 |
-
-## 10.7 上拉、电平与 I2C 总线恢复
-
-I2C 的 SDA/SCL 是开漏信号：设备只能主动拉低，变成高电平依赖上拉电阻。因此“代码没有错但总线一直 BUSY”时，优先检查：
-
-1. SDA/SCL 是否有合适上拉；
-2. 设备地址是否为 7 位地址，读写位是否由驱动处理；
-3. MCU 与模块是否共地、逻辑电平是否兼容；
-4. 某个从设备是否在异常复位后一直把 SDA 拉低；
-5. 时钟频率是否超过模块允许范围。
-
-若总线被拉死，常见恢复方法是临时将 SCL 配为 GPIO，手动输出若干个时钟脉冲，再重新初始化 I2C。恢复前先断定问题来自总线，而不是盲目重启整个系统。
-
-## 10.8 I2C 验收与“总线卡死”排错
-
-先让一台设备 ACK，再写 OLED 或读传感器；不要一次同时连三个模块。
-
-| 现象 | 优先检查 | 典型恢复动作 |
-|---|---|---|
-| 一直等 EV5/EV6 | 7 位地址是否左移、SCL/SDA 是否接反、上拉是否存在 | 用逻辑分析仪或 GPIO 手动观察两根线 |
-| ACK 永远收不到 | 设备地址、供电、电平、模块是否已经被占用 | 断电后只保留一个从机测试 |
-| SDA 永远低 | 从机在中途复位、上拉太弱、主机异常停止 | 临时把 SCL 配 GPIO，输出 9 个时钟并生成 STOP |
-| 偶发 NACK | 频率过高、线太长、上拉不合适、读写时序错误 | 降速、缩短线、核对手册时序 |
-| OLED 有电但不显示 | 地址、初始化命令、屏幕分辨率、控制字节 | 先发送单一像素/固定字符串 |
-
-练习：在 UART 上输出每次 START、地址、ACK/NACK 和 STOP 的结果；遇到失败时只修改一个变量（地址、频率或上拉）再复测。
-
-## 10.9 本章要点
-
-- I2C = 两根线（SCL+SDA）+ 上拉电阻，开漏输出多设备共享。谁拉低谁赢
-- 每个从机有唯一 7 位地址，SSD1306 = 0x3C
-- 完整写流程：START -> 地址+R/W -> ACK -> 数据 -> ACK -> STOP
-- SSD1306 需要 25 条初始化命令——配外设的标准流程
-- 显存页模式：128x64 = 8 页 x 每页 128 字节
-- 帧缓冲是显示复杂画面的前提
-
----
-
-> **上一章**：[第 9 章 · ADC 模数转换](./09-chapter.md)
+> **上一章**：[第 9 章 · ADC、DMA 与 DAC](./09-chapter.md)
 >
-> **下一章**：[第 11 章 · SPI 总线](./11-chapter.md)
->
-> I2C 是你的芯片间短距通信利器，下一步 SPI——更快、更灵活。
+> **下一章**：[第 11 章 · SPI 与 SD 卡](./11-chapter.md)

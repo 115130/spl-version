@@ -1,398 +1,235 @@
-# 第 6 章 · 中断系统（SPL版）
+# 第 6 章 · 中断、事件与并发边界（SPL 版）
 
-> **本章产出**：能把一个按键或外部信号配置为 EXTI 中断，并能安全地在 ISR 与主循环/任务之间交接数据。
+> **本章产出**：能把 GPIO 边沿变成一个可消费的事件，配置 NVIC 优先级分组，并安全地在 ISR 与主循环之间交接最小数据。
 >
-> **前置知识**：第 3 章 GPIO、第 5 章时钟。
+> **前置知识**：第 3 章 GPIO、第 5 章 1ms 时基。
 >
-> **硬件准备**：ZET6 板载按键或外接按键；输入不能浮空，接线变化先断电。
-
-> **本章产出**：理解 NVIC 中断管理、EXTI 外部中断、用 SPL 手写 ISR、中断与主循环安全共享数据
->
-> **用到项目的哪里**：按键不再需要轮询、串口数据到达时自动接收、定时器到点自动触发——所有项目中，中断无处不在
+> **通过标准**：连续按键、抖动和两个中断源同时发生时不死锁、不无限重入；能解释为什么“`volatile` + `counter++`”仍会丢更新。
 
 ---
 
-## 6.1 什么是中断
+## 6.1 中断是硬件事件到代码入口的路径
 
-### 生活的类比
+轮询是 CPU 反复问“发生了吗？”；中断是外设在事件到来时请求 CPU 跳到预先登记的处理函数。对一次 PA0 按键下降沿，路径是：
 
-你在认真看书（CPU 在执行主程序）。
-
-- **轮询方式**：每隔 30 秒抬头看看门口有没有快递。可能没来，也可能错过了。
-- **中断方式**：门铃响了（中断信号）。你放下书，记下页码（保存现场），去开门（中断服务函数），回来继续读（恢复现场）。
-
-**中断的核心价值**：CPU 不用一直等，外设主动通知 CPU「我有事找你」。
-
-### 中断在 STM32 上的流程
-
-```
-外设触发中断信号（如 GPIO 引脚电平变化）
-    ↓
-EXTI（外部中断/事件控制器）检测
-    ↓
-NVIC（嵌套向量中断控制器）仲裁优先级
-    ↓
-CPU 暂停当前执行
-    ↓
-硬件自动保存 R0-R3, R12, LR, PC, xPSR 到栈上
-    ↓
-CPU 从向量表查中断服务函数（ISR）地址，跳转过去
-    ↓
-执行你的 ISR 代码
-    ↓
-硬件自动恢复寄存器，回到断点继续执行
+```text
+PA0 电平变化 → AFIO 把 GPIOA.0 连接到 EXTI0
+             → EXTI0 检测下降沿并置 pending
+             → NVIC 根据使能/优先级发出异常请求
+             → 向量表的 EXTI0_IRQHandler 被执行
+             → ISR 清 pending、记录最小事件
+             → 异常返回，主循环稍后处理业务
 ```
 
-**关键**：中断的「打断」是硬件级的——不是代码里调函数，是 CPU 在执行指令时检测到中断信号，自动插入了跳转逻辑。
+ISR 不是线程：它打断当前代码，在同一栈上运行，可能被更高抢占优先级的中断再次打断。因此 ISR 的职责应尽量短：读取必要状态、清硬件标志、写事件/放数据；不要 `printf`、`Delay_ms`、等待外设或访问文件系统。
 
-## 6.2 NVIC 嵌套向量中断控制器
+## 6.2 NVIC：先确定优先级分组，再分配数字
 
-### 为什么叫「嵌套向量」？
+Cortex-M3 的 NVIC 负责使能、pending、嵌套与优先级。F103 实现 4 个有效优先级位；“抢占优先级”和“子优先级”如何切分，取决于**全局优先级分组**。必须在初始化任何中断前只配置一次：
 
-- **向量**：每个中断源在向量表中有固定位置，存的是 ISR 地址。CPU 直接读表跳转，不用软件查询。
-- **嵌套**：低优先级中断正在执行时，可以被高优先级中断打断。
-
-### 中断优先级
-
-STM32F103 的 NVIC 支持 **16 个可编程优先级**（4 位字段），分为两种分组：
-
-```
-优先级分组：
-  Group_0：0 位抢占 + 4 位子优先级（16 级子优先，无嵌套）
-  Group_1：1 位抢占 + 3 位子优先级（2 级抢占，8 级子优先）
-  Group_2：2 位抢占 + 2 位子优先级（4 级抢占，4 级子优先）← SPL 默认
-  Group_3：3 位抢占 + 1 位子优先级（8 级抢占，2 级子优先）
-  Group_4：4 位抢占 + 0 位子优先级（16 级抢占，无子优先）
+```c
+/* 2 位抢占优先级 + 2 位子优先级。本书的示例统一采用它。 */
+NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
 ```
 
-**抢占优先级 vs 子优先级**：
-
-| | 高抢占优先级 | 低抢占优先级 |
+| 字段 | 决定什么 | 例子 |
 |---|---|---|
-| **能打断低抢占优先级？** | ✅ 可以 | ❌ 不能 |
-| **同抢占、不同子优先同时到达** | 子优先级高的先执行 | 子优先级低的等 |
-| **同抢占、高子优先到来时低子优先正在执行** | ❌ 不能打断 | — |
+| 抢占优先级 | 一个 ISR 能否打断另一个 ISR | SysTick=0 可打断按键=2 |
+| 子优先级 | 两个同时 pending 的 ISR 先后顺序 | 同一抢占级下 UART=0 先于 DMA=1 |
+| 数字方向 | 数字越小优先级越高 | `0` 高于 `3` |
 
-### STM32F103 常用中断向量
-
-| 中断号 | 名称 | 来源 |
-|--------|------|------|
-| -14 | SysTick | Cortex-M3 内核 |
-| 6 | EXTI0 | PA0-PG0 引脚 |
-| 7 | EXTI1 | PA1-PG1 引脚 |
-| 28 | TIM2 | 通用定时器 2 |
-| 37 | USART1 | 串口 1 |
-| 11 | DMA1_Channel1 | DMA1 通道 1 |
-
-中断号越小，同优先级时越先响应（硬件自然优先级）。
-
-## 6.3 EXTI：外部中断/事件控制器
-
-### 信号通路
-
-EXTI 是 GPIO 和 NVIC 之间的「翻译官」。一条完整的信号链路：
-
-```
-GPIO 引脚 (PA0, PB0...)
-    │
-    ├──→ GPIO 输入数据寄存器 (IDR)  ← CPU 轮询读
-    │
-    └──→ EXTI 边沿检测电路            ← 电平变化
-              │
-              ├── 软件可屏蔽（中断掩码）
-              │
-        EXTI 线 → NVIC 中断控制器 → CPU 内核
-```
-
-**GPIO 只管电平**——引脚上是 0 还是 1，写到 IDR 里。**EXTI 管变化**——电平从 0→1（上升沿）或 1→0（下降沿）时产生一个脉冲，送到 NVIC。
-
-### 为什么只有 16 条 EXTI 线
-
-STM32F103 有几十个 GPIO 引脚，但 EXTI 只有 16 个通道（EXTI0-EXTI15）。**不是每个引脚独占一条 EXTI 线**——同编号的引脚共享一条：
-
-```
-EXTI0 ──┬── PA0
-        ├── PB0
-        ├── PC0
-        └── ...（同一时间只能选一个端口连接到 EXTI0）
-```
-
-你不能同时让 PA0 和 PB0 都触发 EXTI0 中断——只能用 AFIO 选择其中一个。这就是为什么 AFIO 的时钟需要先打开（`RCC_APB2Periph_AFIO`）。AFIO 里面有一组选择器寄存器，决定哪个端口的引脚连到哪条 EXTI 线。
-
-> **实际项目最常用**：EXTI0 配 PA0（一个按键），EXTI1-EXTI15 配其他引脚。如果你的按键多于 16 个——使用**GPIO 位 OR**，把所有按键接到同一条 EXTI 线共用。
-
-### 触发方式与配置
+不要在不同驱动里各自调用 `NVIC_PriorityGroupConfig()`。那会改变已有优先级数字的解释。先做系统表，再填 `NVIC_InitTypeDef`：
 
 ```c
-EXTI_InitTypeDef exti;
-EXTI_StructInit(&exti);
-exti.EXTI_Line    = EXTI_Line0;         // 选择哪条 EXTI 线
-exti.EXTI_Mode    = EXTI_Mode_Interrupt; // 中断模式（另一种是事件模式）
-exti.EXTI_Trigger = EXTI_Trigger_Falling; // 下降沿触发（按下按键=低电平）
-exti.EXTI_LineCmd = ENABLE;
-EXTI_Init(&exti);
+NVIC_InitTypeDef nvic;
+nvic.NVIC_IRQChannel = EXTI0_IRQn;
+nvic.NVIC_IRQChannelPreemptionPriority = 2U;
+nvic.NVIC_IRQChannelSubPriority = 0U;
+nvic.NVIC_IRQChannelCmd = ENABLE;
+NVIC_Init(&nvic);
 ```
 
-三种触发方式：
+## 6.3 EXTI 的硬件限制与按键接法
 
-| 触发 | 含义 | 使用场景 |
-|------|------|---------|
-| **上升沿** | 引脚从 0→1 | 检测按键释放、脉冲上升 |
-| **下降沿** | 引脚从 1→0 | 检测按键按下、信号下降 |
-| **双边沿** | 任一变化 | 编码器、脉冲宽度测量 |
+EXTI 有 0–15 共 16 条线。每条线一次只能选 A–G 中一个同号引脚：例如 EXTI0 可以来自 PA0 或 PB0，但不能同时来自两者。选择由 AFIO 配置，触发边沿和 pending 由 EXTI 配置。
 
-### 中断模式 vs 事件模式
-
-`EXTI_Mode` 有两个选项：
-
-| 模式 | 行为 | 用途 |
-|------|------|------|
-| `EXTI_Mode_Interrupt` | 产生中断信号 → NVIC → CPU 跳 ISR | **最常用**，需要 CPU 响应 |
-| `EXTI_Mode_Event` | 仅触发一个脉冲信号到外设（如定时器捕获） | 高频信号直接驱动外设，不占用 CPU |
-
-事件模式不产生中断——它直接给其他外设（如定时器）发一个触发信号，适合高速场景。初学只用中断模式。
-
-## 6.4 SPL 配置按键中断
-
-### 完整配置流程
-
-要配一个按键中断，需要 5 步，每一步对应芯片里的一个硬件模块：
-
-| 步骤 | 做什么 | 对应硬件 |
-|------|--------|---------|
-| ① 开时钟 | GPIO + AFIO 时钟打开 | RCC 寄存器 |
-| ② 配 GPIO | PA0 设为浮空输入 | CRL 寄存器 |
-| ③ 选择 EXTI 线 | 把 PA0 连到 EXTI0 线（AFIO 选择器） | AFIO_EXTICR 寄存器 |
-| ④ 配 EXTI | EXTI0 下降沿触发，中断模式 | EXTI 的边沿检测寄存器 |
-| ⑤ 配 NVIC | EXTI0 中断使能，设优先级 | NVIC_ISER + NVIC_IPR |
-
-### 代码
+本章采用**外接**默认实验：PA0 通过按键接 GND，MCU 开内部上拉；松开为高、按下为低，所以选择下降沿。它不是板载按键的断言，实际接线先写进 [板卡资源约定](./board-zet6-profile.md)。
 
 ```c
-#include "stm32f10x_exti.h"
-#include "stm32f10x_gpio.h"
-#include "stm32f10x_rcc.h"
-#include "misc.h"  // NVIC 配置
-
-void Button_EXTI_Init(void) {
-    // ① 开启 GPIOA 和 AFIO 时钟
-    //    AFIO 不开启，第 ③ 步的 GPIO_EXTILineConfig 不会生效
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_AFIO, ENABLE);
-
-    // ② PA0 配成浮空输入
+static void ButtonExti_Init(void)
+{
     GPIO_InitTypeDef gpio;
-    gpio.GPIO_Pin  = GPIO_Pin_0;
-    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    EXTI_InitTypeDef exti;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA |
+                            RCC_APB2Periph_AFIO, ENABLE);
+
+    GPIO_StructInit(&gpio);
+    gpio.GPIO_Pin = GPIO_Pin_0;
+    gpio.GPIO_Mode = GPIO_Mode_IPU;       /* 内部上拉，按下接地 */
     GPIO_Init(GPIOA, &gpio);
 
-    // ③ 把 PA0 映射到 EXTI0 线
     GPIO_EXTILineConfig(GPIO_PortSourceGPIOA, GPIO_PinSource0);
-
-    // ④ 配置 EXTI0：下降沿触发，中断模式
-    EXTI_InitTypeDef exti;
     EXTI_StructInit(&exti);
-    exti.EXTI_Line    = EXTI_Line0;
-    exti.EXTI_Mode    = EXTI_Mode_Interrupt;     // 中断模式
-    exti.EXTI_Trigger = EXTI_Trigger_Falling;     // 高→低触发
+    exti.EXTI_Line = EXTI_Line0;
+    exti.EXTI_Mode = EXTI_Mode_Interrupt;
+    exti.EXTI_Trigger = EXTI_Trigger_Falling;
     exti.EXTI_LineCmd = ENABLE;
     EXTI_Init(&exti);
+    EXTI_ClearITPendingBit(EXTI_Line0);    /* 开 NVIC 前清遗留 pending */
 
-    // ⑤ 配置 NVIC：EXTI0 中断优先级
     NVIC_InitTypeDef nvic;
-    nvic.NVIC_IRQChannel                   = EXTI0_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 0x01;
-    nvic.NVIC_IRQChannelSubPriority        = 0x00;
-    nvic.NVIC_IRQChannelCmd                = ENABLE;
+    nvic.NVIC_IRQChannel = EXTI0_IRQn;
+    nvic.NVIC_IRQChannelPreemptionPriority = 2U;
+    nvic.NVIC_IRQChannelSubPriority = 0U;
+    nvic.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&nvic);
 }
 ```
 
-### 中断服务函数（ISR）
+## 6.4 ISR 与主循环：事件不是变量“恰好能用”
 
-中断触发后 CPU 停止当前指令，跳转到启动文件中定义的中断向量表——找到 `EXTI0_IRQHandler` 这个函数名开始执行：
-
-```c
-// 这个函数名是固定的——由启动文件 startup_stm32f10x_hd.s 的
-// 中断向量表决定。名字写错、写漏，中断来了 CPU 找不到入口。
-// 正确写法：EXTI0_IRQHandler（向量表第 0x10 项）
-void EXTI0_IRQHandler(void) {
-    if (EXTI_GetITStatus(EXTI_Line0) != RESET) {  // 确认是 EXTI0 触发
-        EXTI_ClearITPendingBit(EXTI_Line0);        // 清挂起位（必须！否则反复进中断）
-        GPIOB->ODR ^= GPIO_Pin_5;                  // ISR 中直接翻转
-    }
-}
-```
-
-### 主函数
+机械按键会在 5–20ms 内产生多次边沿。ISR 不在里面延时消抖；它只把多个边沿合并为“有一个按键候选事件”，主循环用第 5 章时基验证稳定电平：
 
 ```c
-int main(void) {
-    SystemClock_Config();
-    SysTick_Init();
-    LED_Init();
-    Button_EXTI_Init();     // 配好 PA0 的外部中断
+static volatile uint8_t g_button_edge;
 
-    while (1) {
-        // CPU 自由了！按键自行触发中断，主循环不用轮询
-        // 甚至可以进低功耗等待中断：__WFI();
-    }
-}
-```
-
-### ISR 注意事项
-
-- **ISR 要短**：中断执行期间，同优先级和低优先级的中断被阻塞。ISR 跑 10μs = CPU 损失 10μs
-- **不能阻塞等待**：`Delay_ms(30)` 依赖 SysTick，如果 SysTick 中断优先级比当前低，SysTick 进不来——`uwTick` 不更新——死锁
-- **不能在 ISR 里做的**：printf（太慢）、malloc（不确定时间）、复杂的 I²C/SPI 通信
-- **正确做法**：ISR 只设一个 `volatile` 标志位，主循环检测到标志再处理耗时操作。这就是下面 6.5 要讲的模式
-
----
-
-## 6.5 ISR 与主循环的数据共享
-
-### 基本原则：ISR 只设标志，主循环处理
-
-中断 ISR 和主循环 `while(1)` 是两个「线程」（虽然 Cortex-M3 没有 MMU，但逻辑上就是多线程）。它们共享的变量需要特殊处理：
-
-```
-时间轴 ─────────────────────────────────────────►
-           ISR 触发                        ISR 触发
-             │                               │
-主循环 ──────┼───────────────┼───────────────┼──────►
-             │               │               │
-             └──→ 设 flag=1   │  设 flag=1    │
-             主循环读到        │  主循环读到
-             flag=1 → 处理     │  flag=1 → 处理
-```
-
-```c
-// 全局共享变量——必须用 volatile！
-// volatile 让编译器每次读都从内存读，而不是从 CPU 寄存器取缓存值
-volatile uint8_t button_pressed = 0;
-
-void EXTI0_IRQHandler(void) {
+void EXTI0_IRQHandler(void)
+{
     if (EXTI_GetITStatus(EXTI_Line0) != RESET) {
         EXTI_ClearITPendingBit(EXTI_Line0);
-        button_pressed = 1;  // 只设标志，尽快退出
+        g_button_edge = 1U;      /* 多次抖动可安全合并为一个候选事件。 */
     }
 }
 
-int main(void) {
-    // ... 各种初始化 ...
-    while (1) {
-        if (button_pressed) {        // 主循环检测标志
-            button_pressed = 0;      // 清标志
+static uint8_t TakeButtonEdge(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint8_t edge = g_button_edge;
+    g_button_edge = 0U;
+    if (primask == 0U)
+        __enable_irq();
+    return edge;
+}
 
-            // 耗时操作在中断外做——消抖后确认
-            Delay_ms(30);
-            if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_RESET) {
-                GPIOB->ODR ^= GPIO_Pin_5;
-            }
+typedef enum {
+    BUTTON_IDLE,
+    BUTTON_DEBOUNCING_PRESS,
+    BUTTON_WAIT_RELEASE,
+    BUTTON_DEBOUNCING_RELEASE
+} ButtonState;
+
+static uint8_t Button_PollPressed(void)
+{
+    static ButtonState state;
+    static uint32_t confirm_at;
+    uint32_t now = Timebase_NowMs();
+
+    if (state == BUTTON_IDLE && TakeButtonEdge() != 0U) {
+        state = BUTTON_DEBOUNCING_PRESS;
+        confirm_at = now + 30U;
+    }
+
+    if (state == BUTTON_DEBOUNCING_PRESS &&
+        (int32_t)(now - confirm_at) >= 0) {
+        if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_RESET) {
+            state = BUTTON_WAIT_RELEASE;
+            return 1U;            /* 只在一次稳定按下时发事件。 */
         }
+        state = BUTTON_IDLE;
     }
+
+    if (state == BUTTON_WAIT_RELEASE &&
+        GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_SET) {
+        state = BUTTON_DEBOUNCING_RELEASE;
+        confirm_at = now + 30U;
+    }
+
+    if (state == BUTTON_DEBOUNCING_RELEASE &&
+        (int32_t)(now - confirm_at) >= 0) {
+        state = GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_SET
+              ? BUTTON_IDLE : BUTTON_WAIT_RELEASE;
+    }
+
+    /* 消费抖动期间的重复边沿；真正状态由稳定电平决定。 */
+    if (state != BUTTON_IDLE)
+        (void)TakeButtonEdge();
+    return 0U;
 }
 ```
 
-> **为什么 `volatile` 是必须的？**
-> 没有 `volatile`，编译器看到 `button_pressed` 在主循环里只读不写，可能会优化成：
-> ```c
-> // 编译器的「优化」版本：
-> register uint8_t cached = button_pressed;
-> while (1) {
->     if (cached) ...  // ← 永远读的是缓存值，ISR 修改了内存，但 CPU 不知道
-> }
-> ```
-> `volatile` 强制每次 `if` 都从真实地址读，不缓存。详见第 4 章。
+这个模型故意使用一个 bit，因为按键不关心“30ms 内到底抖了几次”。串口、采样或网络数据不能这样丢事件，后续章节会使用环形缓冲、DMA、队列和序号。
 
-### `counter++` 不是原子的
+### 为什么 `volatile` 还不够
+
+`volatile uint32_t counter; counter++;` 至少包含读取、加法、写回三个动作。主循环和 ISR 若同时执行，可能发生：
+
+```text
+main 读取 10 → 被 ISR 打断 → ISR 写回 11 → main 用旧值写回 11
+```
+
+最终只增加一次。对齐的单次 8/16/32 位加载或存储通常可在 Cortex-M3 上作为单条访问完成，但“读取再修改再写回”不是原子的；64 位对象、结构体和数组更不能假设原子。临界区必须保存原有 PRIMASK：
 
 ```c
-volatile uint32_t counter = 0;
+static volatile uint32_t counter;
 
-void ISR(void) {
-    counter++;   // CPU 执行三条指令：读 counter → 加 1 → 写回 counter
+static uint32_t Counter_TakeAndClear(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t value = counter;
+    counter = 0U;
+    if (primask == 0U)
+        __enable_irq();
+    return value;
 }
-
-// 主循环也在读 counter：
-uint32_t c = counter;  // 可能读到「加 1 写到一半」的值！
 ```
 
-`counter++` 在汇编级是读→改→写三条指令。如果主循环在读的过程中被中断打断去执行 ISR，ISR 改了 `counter`，回到主循环时读到的值就是旧的。对于整型赋值（`flag = 0` 或 `flag = 1`），单次 32 位写是原子的，不需要保护。但对于 `++` 需要用临界区：
+临界区只包住必要的读写；在里面 `printf`、I2C 轮询或延时会增加中断延迟。FreeRTOS 启用后不能直接照搬裸机 `__disable_irq()` 规则，应使用其临界区和 ISR 安全 API。
 
-```c
-// 临时关所有中断——保护这段代码不被中断打断
-__disable_irq();     // 关全局中断
-counter++;
-__enable_irq();      // 开全局中断
-```
+## 6.5 中断设计检查表
 
-临界区的代价：关中断期间，所有外设的中断请求都被延迟响应。所以临界区要**尽可能短**——只包住那一条 `counter++`，不要包住整个函数。
+每加一个 IRQ，填写以下表，避免“代码有 Handler 就算完成”：
 
-### 三种共享数据的保护方式
-
-| 场景 | 方案 | 说明 |
-|------|------|------|
-| 标志位赋值（`flag = 1`） | `volatile` 就够了 | 单次 32 位写是原子的，ISR 和主循环间简单传递信号 |
-| 计数增减（`counter++`） | `volatile` + 临界区 | `__disable_irq()` / `__enable_irq()` 包住读写 |
-| 复杂数据类型（数组/结构体） | 临界区或双缓冲 | 超过 4 字节的操作必须加临界区保护 |
-
----
-
-## 6.6 SPL vs HAL 中断对照
-
-| 操作 | SPL | HAL |
-|------|-----|-----|
-| GPIO→EXTI 映射 | `GPIO_EXTILineConfig()` | CubeMX 自动 |
-| EXTI 配置 | `EXTI_Init()` | CubeMX 自动 |
-| NVIC 配置 | `NVIC_Init()` | CubeMX 自动 |
-| 清中断标志 | `EXTI_ClearITPendingBit()` | HAL 回调内部清 |
-| ISR | 直接写在 `IRQHandler` 里 | `HAL_GPIO_EXTI_Callback()` |
-
-SPL 方式更直白——每一步你都能在参考手册里找到对应的寄存器操作。HAL 也做同样的事，只是包了一层。
-
----
-
-## 6.7 ISR 的安全边界与验收
-
-中断服务函数应当短、确定、可恢复：
-
-- 读入硬件数据、清除标志、设置标志位或发轻量通知；
-- 不执行长延时、printf、文件系统、网络请求或等待循环；
-- 主循环/任务和 ISR 共享变量时，先考虑 volatile、原子性和临界区；
-- 同一个中断反复触发时，必须确认标志位被正确清除。
-
-验收时，连续快速按键或模拟多个中断源，观察是否漏触发、重复触发或卡死。能稳定处理“最坏情况”比偶尔按一次成功更重要。
-
-## 6.8 中断实验闭环与排错
-
-把“按一次会亮”升级为可重复验证：连续快速按键、长按、抖动和两个中断源同时到来时，系统都不能卡死或无限重入。
-
-| 现象 | 首先检查 |
+| 项 | 要回答的问题 |
 |---|---|
-| 中断一次也不进 | GPIO/AFIO/EXTI/NVIC 四步是否都配置；IRQHandler 名称是否正确 |
-| 一按触发很多次 | 机械抖动、边沿选择、软件消抖时间 |
-| 进中断后主程序卡死 | 是否清除了 pending 标志；ISR 是否执行了延时、printf 或等待 |
-| 变量偶尔异常 | ISR 与主循环共享变量的 volatile、原子性和临界区 |
+| 来源 | 外设/引脚/边沿或状态位是什么？ |
+| 清除 | 哪个 pending/状态位在什么时候清？ |
+| 交接 | ISR 给主循环/任务的是标志、计数、缓冲区还是队列？ |
+| 并发 | 谁写、谁读、需要临界区还是原子协议？ |
+| 优先级 | 分组已定吗？是否会与 SysTick/UART/DMA 互相抢占？ |
+| 预算 | ISR 最长执行时间、允许的中断延迟是什么？ |
+| 验收 | 用什么信号证明没有漏、重、卡死？ |
+
+## 6.6 验收、排错与练习
+
+| 现象 | 优先检查 |
+|---|---|
+| 一次也不进 ISR | GPIO 时钟、AFIO 时钟、端口到 EXTI 映射、边沿选择、NVIC 使能、Handler 名称 |
+| 一按进很多次 | 机械抖动；确认 ISR 只置事件，主循环负责确认 |
+| 进一次后持续重入 | pending 位没有清，或电平/边沿配置不符合接线 |
+| 主程序偶发卡死 | ISR 中有延时/等待/printf，或临界区没有恢复原 PRIMASK |
+| 变量偶尔错误 | 复合操作没有保护；多个写者没有协议 |
+| 优先级“数字正确却行为怪” | 优先级分组被不同模块改过，或混淆了抢占与子优先级 |
 
 练习：
-1. 实现“按键只设置事件标志，主循环再切换 LED”；
-2. 用一个定时器做 20ms 消抖，不在 ISR 里 delay；
-3. 给每次 ISR 入口计数，并通过 UART 输出统计值。
 
-## 6.9 本章要点
+1. 让 PA0 按下只设置事件位，主循环切换 `BoardLed_Write()`；连续按 20 次并记录漏/重触发；
+2. 给 EXTI0 和一个定时器分别设不同抢占优先级，用 GPIO 脉冲观察嵌套顺序；
+3. 把事件 bit 改成计数器，先演示 `++` 丢计数，再通过最小临界区修复；
+4. 删除 `BUTTON_WAIT_RELEASE` 分支并长按按键，观察为何会出现重复事件；恢复该状态后再验证。
 
-- 中断 = 外设主动通知 CPU，不用轮询；打断是硬件级的
-- NVIC 管理优先级：抢占优先级决定谁能打断谁，子优先级决定排队顺序
-- EXTI 把 GPIO 电平变化变成中断信号，16 条线，每条对应所有端口同号引脚
-- ISR 要**短、快、不阻塞**——只设标志位，实际处理放主循环
-- ISR 和主循环共享的变量必须 `volatile`；复杂操作（`++`）需要临界区保护
+## 6.7 本章要点
 
----
-> **上一章**：[第 5 章 · 时钟与系统滴答](./05-chapter.md)
-> **下一章**：[第 7 章 · 定时器（SPL版）](./07-chapter.md)
-
-> SysTick 只能做简单定时。STM32 的通用定时器能做 PWM、能测脉冲宽度、能做编码器接口——这是电机控制、灯光、音频的基础。
+- 中断路径包含 GPIO/外设、pending、NVIC、向量表和正确命名的 Handler；漏任一步都不会工作。
+- 优先级数字只有在固定的 `NVIC_PriorityGroupConfig()` 下才有含义。
+- ISR 短、确定、只交接最小数据；耗时业务和消抖进入主循环/任务。
+- `volatile` 保留访问，但不让复合操作原子；读清/计数/结构体交接需要明确并发协议。
+- 临界区要保存并恢复先前的 PRIMASK，且范围应尽可能小。
 
 ---
 
-
+> **上一章**：[第 5 章 · 时钟、时基与可测时间](./05-chapter.md)
+>
+> **下一章**：[第 7 章 · 定时器](./07-chapter.md)

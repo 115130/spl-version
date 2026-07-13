@@ -6,7 +6,7 @@
 
 - 学过 Java 或 Python，能写像样的程序
 - 上过数据结构、操作系统、计算机网络、计算机组成原理这几门课
-- C 语言基础过硬——指针、内存、位运算你都不怕
+- 会读和改 C：函数、结构体、指针、位运算不陌生即可；复杂的并发、链接和启动过程会在书中从零建立
 - 但是——**你从来没有碰过嵌入式**
 - 你用的是 **Linux 系统**（如 NixOS、Ubuntu、Arch），习惯命令行，不想碰 IDE
 
@@ -72,10 +72,8 @@ SPL 给你底气，HAL 给你效率。两样都学了，你才是完整的嵌入
 - 1 块 STM32F103ZET6 开发板（本书唯一硬件基线）
 - 1 个 ST-Link v2 / DAP-Link 调试烧录器（¥15）
 - 1 块面包板 + 若干杜邦线
-- 1 块 DX-WF24 WiFi/BLE 模块（或 ESP8266 AT 兼容模块）
-- 1 块 HC-05 蓝牙模块
-- 传感器：DHT22、BH1750、SSD1306 OLED 屏
-- 硬件基线、接线和工具见 [附录 A](./appendix-a-zet6-reference.md) 与 [附录 C](./appendix-c-tools-and-measurement.md)
+- 传感器与无线模块按章节再买：先只需 LED、按键、一个 3.3V USB-TTL 和万用表；WiFi/BLE 不是第 0 章的前置条件
+- 硬件基线、接线和工具见 [板卡资源约定](./board-zet6-profile.md)、[附录 A](./appendix-a-zet6-reference.md) 与 [附录 C](./appendix-c-tools-and-measurement.md)
 
 ### 软件（全部免费，Linux 原生）
 
@@ -87,7 +85,7 @@ SPL 给你底气，HAL 给你效率。两样都学了，你才是完整的嵌入
 
 ### 知识储备
 
-- C 语言：指针、结构体、位运算、`volatile`
+- C 语言：指针、结构体、位运算；`volatile`、中断并发和链接脚本会在用到时说明其边界
 - 基本的电路常识：电压、电流、电阻、上拉/下拉（不熟没关系，附录 B 有速览）
 - 英语：能读数据手册
 - Linux 命令行：`cd`、`ls`、`make`、`gcc` 基本使用
@@ -105,28 +103,34 @@ SPL 库虽然官方已停止更新，但它是一套**最透明**的库——每
 ## 本书代码约定
 
 - 开发环境：**Linux + arm-none-eabi-gcc + Makefile + OpenOCD**
+- 唯一 MCU 基线：**STM32F103ZET6 / `STM32F10X_HD` / 512KB Flash / 64KB SRAM**
 - 库：**SPL (STM32F10x_StdPeriph_Lib)**（第 1-13 章），**FreeRTOS + HAL/SPL 混用**（第 14 章起）
 - 构建系统：**手写 Makefile**
 - 代码注释使用中文
 
 ```c
-// SPL 代码风格示例
-#include "stm32f10x_gpio.h"
-#include "stm32f10x_rcc.h"
+// 可变的板卡接线只放 board.h；业务代码不猜 LED 在哪个引脚。
+#include "board.h"
 
-void LED_Init(void) {
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
-
-    GPIO_InitTypeDef gpio;
-    gpio.GPIO_Pin   = GPIO_Pin_5;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
-    GPIO_Init(GPIOB, &gpio);
+void AppLed_Init(void)
+{
+    BoardLed_Init();
+    BoardLed_Write(0);
 }
-
-void LED_On(void)  { GPIO_ResetBits(GPIOB, GPIO_Pin_5); }
-void LED_Off(void) { GPIO_SetBits(GPIOB, GPIO_Pin_5);   }
 ```
+
+## 怎样使用每一章
+
+从第 0 章开始，章节按同一个工程闭环编写：先给出**要解决的问题和硬件前提**，再解释原理与最小实现，最后给出**可观察的验收信号、常见失败路径和可扩展练习**。不要只把代码复制到工程里；每次实验都应留下四项记录：
+
+| 记录 | 例子 |
+|---|---|
+| 目标 | “每 500 ms 翻转一次 LED” |
+| 条件 | 实际 LED 引脚、有效电平、供电与时钟 |
+| 证据 | OpenOCD `verify`、串口日志、万用表或逻辑分析仪截图 |
+| 结论 | 成功、失败现象与下一步排查 |
+
+教材中的 MCU 事实可以直接复用；任何“板载 LED、按键、CH340 接哪一路 UART、Flash 的 CS”都是**板卡事实**，必须先在 [板卡资源约定](./board-zet6-profile.md) 中按自己的实物确认。文中外接默认引脚只是可复现实验的起点，不是所有 ZET6 板必然相同的原理图。
 
 ## 阅读路线
 
