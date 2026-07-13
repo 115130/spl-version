@@ -1,6 +1,8 @@
-# 第 0 章 · 开发环境搭建（SPL版）
+# 第 0 章 · 开发环境搭建（ZET6 SPL版）
 
 > **本章产出**：Linux 下完整的 STM32 开发环境就绪——GCC + SPL + Makefile + OpenOCD + 第一个 SPL 工程（LED 闪烁）
+>
+> **硬件前置**：本书统一使用 STM32F103ZET6。若你还不熟悉供电、GND、ST-Link 和 UART 接线，请先完成 [第 0.5 章](./00.5-hardware-basics.md)。
 >
 > **预计时间**：一个下午
 
@@ -109,7 +111,7 @@ STM32F10x_StdPeriph_Lib_V3.5.0/
 │   │   ├── CoreSupport/       ← core_cm3.c/h (ARM 内核支持)
 │   │   └── DeviceSupport/ST/STM32F10x/
 │   │       ├── startup/       ← 启动文件（汇编）
-│   │       │   ├── startup_stm32f10x_md.s  ← F103C8 用这个（Medium Density）
+│   │       │   ├── startup_stm32f10x_hd.s  ← ZET6 使用的启动文件（High Density）
 │   │       │   └── ...
 │   │       ├── stm32f10x.h   ← 寄存器地址定义
 │   │       └── system_stm32f10x.c  ← 系统时钟初始化
@@ -123,7 +125,7 @@ STM32F10x_StdPeriph_Lib_V3.5.0/
 
 | 文件 | 作用 |
 |------|------|
-| `startup_stm32f10x_md.s` | 启动代码（中断向量表 + Reset_Handler） |
+| `startup_stm32f10x_hd.s` | 启动代码（中断向量表 + Reset_Handler） |
 | `system_stm32f10x.c` | 系统时钟初始化 `SystemInit()` |
 | `core_cm3.c` | ARM Cortex-M3 内核访问函数 |
 | `stm32f10x_rcc.c` | 时钟控制 |
@@ -143,7 +145,7 @@ STM32F10x_StdPeriph_Lib_V3.5.0/
 ├── stm32f10x_conf.h
 ├── stm32f10x_it.c          ← 中断服务函数（可留空）
 ├── lib/                    ← 从 SPL 包拷贝过来的文件
-│   ├── startup_stm32f10x_md.s
+│   ├── startup_stm32f10x_hd.s
 │   ├── system_stm32f10x.c
 │   ├── core_cm3.c
 │   ├── stm32f10x_rcc.c
@@ -357,12 +359,12 @@ SIZE    = arm-none-eabi-size
 MCU     = cortex-m3
 FPU     =
 FLOAT   = -msoft-float
-CHIP    = STM32F103VE          # ← 改成你的芯片型号（普中玄武 = VE/ZET6）
+BOARD   = STM32F103ZET6        # 本书唯一目标板
 
 # 编译选项
 CFLAGS  = -mcpu=$(MCU) -mthumb $(FLOAT)
 CFLAGS += -O0 -g3 -Wall -fmessage-length=0
-CFLAGS += -D$(CHIP) -DSTM32F10X_HD  # ← HD = High Density（512KB Flash）
+CFLAGS += -DSTM32F10X_HD        # ZET6 属于 High Density（512KB Flash）
 CFLAGS += -I./inc
 
 LDFLAGS = -T link.ld -mcpu=$(MCU) -mthumb $(FLOAT)
@@ -419,7 +421,7 @@ clean:
 ```ld
 MEMORY
 {
-    FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 64K
+    FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 512K
     SRAM  (rwx): ORIGIN = 0x20000000, LENGTH = 20K
 }
 
@@ -454,16 +456,14 @@ SECTIONS
 }
 ```
 
-> ⚠️ **芯片型号差异**：上面的 Makefile 是基于 **普中玄武 F103ZET6**（HD, High Density, 512KB Flash / 64KB SRAM）编写的。如果你用其他型号，需要改 3 处：
+> **本书固定配置：STM32F103ZET6**
 >
-> | 你的芯片 | 密度 | 启动文件 | 编译宏 | Flash/SRAM |
-> |---------|------|---------|--------|-----------|
-> | **STM32F103ZET6（普中玄武，推荐）** | **HD** | **`startup_stm32f10x_hd.s`** | **`-DSTM32F10X_HD`** | **512K / 64K** |
-> | STM32F103ZE (野火板) | HD | `startup_stm32f10x_hd.s` | `-DSTM32F10X_HD` | 512K / 64K |
-> | STM32F103C8（蓝色小板） | MD | `startup_stm32f10x_md.s` | `-DSTM32F10X_MD` | 64K / 20K |
-> | STM32F103VG | HD | `startup_stm32f10x_hd.s` | `-DSTM32F10X_HD` | 1024K / 96K |
+> - 启动文件：startup_stm32f10x_hd.s
+> - SPL 宏：-DSTM32F10X_HD
+> - 链接脚本：Flash 512KB、SRAM 64KB
+> - 本书所有引脚、内存容量和工程说明均以此为准。
 >
-> 普中玄武 VET6 和野火 ZET6 都只需确认 Makefile 里的 `_HD`、链接脚本里的 `512K`/`64K`、以及使用 `startup_stm32f10x_hd.s` 即可。启动文件在 SPL 包的 `CMSIS/CM3/DeviceSupport/ST/STM32F10x/startup/arm/` 目录下。
+> 不要混用其他开发板教程中的启动文件、密度宏或链接脚本；它们不是本书的支持路径。
 
 ### `stm32f10x_conf.h`（精简版）
 
