@@ -222,7 +222,61 @@ void App_AssertFailed(const char *expr, const char *file, int line)
 
 练习：为第 24 章的帧解析器添加长度断言和错误码；分别测试“长度非法”和“CRC 错误”为什么应走不同路径。
 
-## 28.12 本章要点
+## 28.12 把 HardFault 变成可读取的现场，而不是一次重启
+
+下面的 GCC/Cortex-M3 骨架把异常栈帧和状态寄存器保存到静态对象；它不在 Fault handler 里打印、申请内存或等待 UART。这样即使日志系统已经损坏，仍能用 GDB 查看第一份证据。
+
+~~~c
+typedef struct {
+    uint32_t r0, r1, r2, r3, r12, lr, pc, xpsr;
+    uint32_t cfsr, hfsr, mmfar, bfar;
+} FaultSnapshot;
+
+static volatile FaultSnapshot g_fault;
+
+void HardFault_C(uint32_t *stack)
+{
+    g_fault.r0   = stack[0];
+    g_fault.r1   = stack[1];
+    g_fault.r2   = stack[2];
+    g_fault.r3   = stack[3];
+    g_fault.r12  = stack[4];
+    g_fault.lr   = stack[5];
+    g_fault.pc   = stack[6];
+    g_fault.xpsr = stack[7];
+    g_fault.cfsr = SCB->CFSR;
+    g_fault.hfsr = SCB->HFSR;
+    g_fault.mmfar = SCB->MMFAR;
+    g_fault.bfar  = SCB->BFAR;
+
+    for (;;) { /* 用 GDB halt 后检查 g_fault；不要在此处 printf */ }
+}
+
+__attribute__((naked)) void HardFault_Handler(void)
+{
+    __asm volatile(
+        "tst lr, #4\n"
+        "ite eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "b HardFault_C\n");
+}
+~~~
+
+这段代码依赖 GCC 的 `naked` 属性和 Cortex-M 异常栈帧，其他工具链必须按其 ABI 调整。向量表中也必须只有一个 `HardFault_Handler`。调试时按顺序执行：
+
+1. `monitor halt`，读取 `g_fault.pc`、`g_fault.lr`、`g_fault.cfsr`；
+2. 用 `arm-none-eabi-addr2line -e build/app.elf -f -C <pc>` 回到源码；
+3. 再结合 CFSR 的具体标志、任务栈高水位和最近一条结构化日志判断根因；
+4. 把最小复现输入变成回归用例，而不是只在这次 Fault 后加一个延时。
+
+### OpenOCD 与优化级别也要写进证据
+
+`interface/stlink.cfg` 与 `target/stm32f1x.cfg` 是常见起点，不保证适用于每个 ST-Link 克隆、SWD 接线或复位电路。连接不上时先确认接口驱动、SWD 传输、目标供电和板卡的复位方式，再改配置；不要把一条成功命令当作所有板卡的通用答案。
+
+学习阶段可用 `-O0 -g3` 观察最直观的执行路径；日常调试更应练习 `-Og -g3`，并接受优化后局部变量可能被消除、单步顺序可能与源码不完全一致。发布构建必须保留对应的 ELF、map 和 build ID，才能让现场地址有回溯目标。
+
+## 28.13 本章要点
 
 - 可调试的工程必须保留 ELF、符号和可读日志；
 - OpenOCD 连接硬件，GDB 连接程序，两者缺一不可；

@@ -226,7 +226,62 @@ typedef struct {
 
 练习：模拟把 `EnvSample` 加一个字段的版本升级。写出旧固件、旧日志、PC 网关和新固件各自如何识别或拒绝不兼容数据。
 
-## 30.11 本章要点
+## 30.11 用发布清单、内存地图和分层 CI 收束工程边界
+
+“可以烧录”不是发布物。每个版本都应有一个可机器检查、可人工复查的 manifest：
+
+~~~text
+firmware:
+  version: v…
+  target: STM32F103ZET6 / STM32F10X_HD
+  git_commit: …
+  toolchain: arm-none-eabi-gcc …
+  app.bin.sha256: …
+  app.elf.sha256: …
+memory:
+  flash_used: … / 512KB
+  sram_used: … / 64KB
+validation:
+  docs_check: pass/fail
+  host_protocol_tests: pass/fail
+  build: pass/fail
+  hardware_matrix: <board / adapter / sensor / result>
+known_limits:
+  - …
+~~~
+
+### Bootloader 的地址必须由分区和链接脚本共同决定
+
+教学代码中的 `app_addr` 不能被写死成网上常见的某个地址。先选定并记录 bootloader 长度、擦除页边界和应用起始地址；然后让三处始终一致：
+
+1. bootloader 的镜像检查与 `SCB->VTOR`；
+2. 应用链接脚本的 `FLASH ORIGIN`；
+3. 应用向量表、烧录/升级工具和发布 manifest。
+
+示意关系如下，不给出一个假装适用于所有工程的固定偏移：
+
+~~~text
+0x08000000 ─ Bootloader（项目定义的长度）
+             ─ 应用起始地址 = 0x08000000 + bootloader_length
+             ─ Application Flash（链接脚本 ORIGIN 与 VTOR 一致）
+0x08080000 ─ ZET6 Flash 末尾
+~~~
+
+应用镜像还应带版本、长度、CRC/签名、兼容的硬件版本和升级前后配置迁移策略。教学章节只解释跳转顺序，不把它宣传为生产 OTA 实现。
+
+### CI 先自动验证能验证的，硬件保留人工证据
+
+| 层 | 自动化检查 | 不能替代 |
+|---|---|---|
+| 文档 | Markdown 链接、代码围栏、章节导航 | 接线是否真实正确 |
+| 主机逻辑 | 帧解析、CRC、状态机、配置迁移回放 | 外设时序/供电/射频 |
+| 构建 | 固定工具链下生成 ELF/BIN/MAP、size 阈值 | 实际板卡烧录与调试 |
+| 发布 | manifest、SHA-256、无 Secret 扫描 | 断电、低功耗、长期运行 |
+| 硬件矩阵 | 人工记录板型、模块固件、接线、日志/测量 | 不能由 CI 伪造为“已验证” |
+
+配置迁移要保存旧版本的回放样本，并测试升级失败/断电后的恢复策略。这样第 30 章的“产品化”才是一个可执行的发布流程，而不是一份愿望清单。
+
+## 30.12 本章要点
 
 - 产品化的核心是可重复构建、可观测、可恢复和可验证；
 - 目录与依赖方向决定项目后期是否还能维护；

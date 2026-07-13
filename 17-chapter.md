@@ -274,7 +274,59 @@ ERROR\r\n
 
 最后一组必须产生一次溢出计数，并且后续 `OK` 仍能重新识别。这样的字节级测试比“模块偶尔回了 OK”更能证明解析器可靠。
 
-## 17.10 本章要点
+## 17.10 同一 UART 上的两类数据：AT 行与长度型 Payload
+
+`OK`、`ERROR` 和 `>` 可以按行处理；常见模块的 `+IPD,<length>:` 一类上报却表示“后面紧跟 N 个原始字节”。两者不能共用一个“读到换行就结束”的解析器。不同 AT 固件的前缀、连接 ID 和命令集可能不同，以下把 `+IPD` 仅作为**常见模式**，实际格式必须以模块手册为准。
+
+推荐把 UART 接收结果拆成两种事件：
+
+~~~c
+typedef enum {
+    AT_EVENT_LINE,       /* "OK"、"ERROR"、厂商文本响应 */
+    AT_EVENT_PAYLOAD,    /* 已收满且长度明确的原始 TCP/UDP 字节 */
+    AT_EVENT_OVERFLOW,
+    AT_EVENT_RESYNC
+} AtEventType;
+
+typedef struct {
+    AtEventType type;
+    const uint8_t *data;
+    uint16_t length;
+} AtEvent;
+~~~
+
+解析器至少有三个状态：
+
+~~~text
+TEXT
+  ├─ 普通 CRLF 行 → AT_EVENT_LINE
+  └─ 识别到长度型前缀 → READ_LENGTH
+READ_LENGTH
+  ├─ 数字合法且不超过缓冲区 → READ_PAYLOAD
+  └─ 非法/超长 → 丢弃到可识别边界，计数并重新同步
+READ_PAYLOAD
+  └─ 恰好收满 N 字节 → AT_EVENT_PAYLOAD → TEXT
+~~~
+
+这条边界解决一个关键问题：Payload 可以包含 `\r\n`、`OK`、零字节甚至看起来像 AT 命令的文本；它们在收满 N 字节前都只是数据。不要用 `strstr()` 或字符串 API 处理二进制 Payload。
+
+### 请求、非请求消息与模块复位
+
+AT 控制任务同一时刻只保留一条“正在等待的命令事务”：命令文本、预期响应、截止 tick 和失败处理。`WIFI DISCONNECT`、`ready`、入站 Payload 等非请求事件必须另路分发，不能被当前事务误认成 `OK`。
+
+建议为解析器统计 `line_overflow`、`payload_oversize`、`payload_timeout`、`module_reset` 和 `unsolicited_event`。测试时把下面序列按 1 字节、随机切分和整段三种方式喂入，结果应一致：
+
+~~~text
+AT\r\nOK\r\n
++IPD,5:HELLO
++IPD,7:A\r\nOK\0B
+ready\r\n
+<声明 512 字节但只到 10 字节后超时>
+~~~
+
+最后一例必须丢弃半包、增加超时计数，并让下一条 `AT\r\nOK\r\n` 重新可识别。
+
+## 17.11 本章要点
 
 - STM32 负责控制和数据，AT 模块负责无线与协议栈；
 - WiFi 更适合联网，BLE 更适合近距离低功耗连接；

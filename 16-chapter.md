@@ -6,13 +6,13 @@
 >
 > **硬件建议**：先只用 LED + UART 跑通任务，再逐个接入传感器、OLED、SD 卡或无线模块。
 
-> 用 FreeRTOS 搭建一个四任务传感器采集系统：SensorTask → Queue → DisplayTask + LogTask，外加按键 ISR → 信号量 → ButtonTask。完整的 SPL 版项目代码，可直接编译运行。
+> 用 FreeRTOS 搭建一个四任务传感器采集系统：SensorTask → Queue → DisplayTask + LogTask，外加按键 ISR → 信号量 → ButtonTask。本章给出教学级的四任务骨架，用来说明任务契约、数据流和失败边界。仓库尚未附带第三方 SPL/FreeRTOS 源码、板卡专属驱动与完整构建文件；不要把本章片段当成“复制后即可编译”的成品工程。
 
 ---
 
 ## 16.1 四任务架构
 
-## 16.2 完整代码
+## 16.2 教学级实现骨架
 
 ```
 SensorTask(prio 3, 256w)  ──Queue──→ DisplayTask(prio 2, 256w)
@@ -25,7 +25,7 @@ Button ISR ──Sem──→ ButtonTask(prio 4, 128w)
                     处理按键
 ```
 
-### 完整代码
+### 任务与接口骨架
 
 ```c
 #include "FreeRTOS.h"
@@ -266,7 +266,48 @@ typedef struct {
 - [ ] 串口能显示栈高水位和关键错误计数；
 - [ ] 单个模块失败不会让全部任务永久阻塞。
 
-## 16.7 本章练习与要点
+## 16.7 把教学骨架落成可构建工程：先缩小，再扩展
+
+本节代码刻意把 OLED、SD、I2C、按键等接口留成教学占位。真正工程应先实现一个**只有 LED + UART 的四任务最小版本**，再按文件和里程碑增加外设。推荐的目录不是一份巨大的 `main.c`：
+
+~~~text
+16-rtos-pipeline-zet6/
+├── README.md                 # 板型、接线、状态：仅骨架/已编译/已烧录
+├── Makefile + link.ld
+├── platform/                 # 启动文件、SystemClock、SPL 与 FreeRTOS port
+├── app/
+│   ├── app_types.h           # EnvSample、状态码、容量常量
+│   ├── task_sensor.c         # 第一阶段可用模拟值
+│   ├── task_log.c            # UART 日志；后续才接 SD
+│   ├── task_display.c        # 第一阶段 LED/串口；后续才接 OLED
+│   └── task_health.c         # 堆、栈、队列与错误计数
+└── drivers/                  # 每个真实外设独立在前置章节验收
+~~~
+
+每一阶段的“可运行”含义也应不同：
+
+| 阶段 | 允许依赖 | 最小证据 | 不能声称什么 |
+|---|---|---|---|
+| A | FreeRTOS + LED + UART | 四任务心跳、Queue 收发、栈高水位 | 传感器/OLED/SD 已经可用 |
+| B | 加一种已单独验证的传感器 | 60 秒稳定样本与超时计数 | 多外设长期稳定 |
+| C | 加显示或存储其一 | 断开该设备后其他任务继续 | 全系统硬件已验证 |
+| D | 加网络 | 断线退避且采样序号不断 | 已适合真实部署 |
+
+### 任务契约必须能落到容量预算
+
+在 ZET6 的 64KB SRAM 内，先写预算再调大常量。下表是记录模板，不是默认数值：
+
+| 对象 | 数量/长度 | 单项字节数 | 预计 RAM | 满/错时行为 |
+|---|---:|---:|---:|---|
+| Task 栈 | … | … words | … | 高水位低于阈值即报警 |
+| `sensor_queue` | … | `sizeof(EnvSample)` | … | 丢新/覆盖/阻塞必须明确 |
+| `log_queue` | … | `sizeof(EnvSample)` | … | 记录丢失，不拖住采样 |
+| UART/RingBuffer | … | 1 | … | 统计溢出并重同步 |
+| FreeRTOS heap | 1 | `configTOTAL_HEAP_SIZE` | … | 分配失败 hook |
+
+完成 A 阶段后，才有资格把 README 标为“已编译”；完成与本书 ZET6 接线一致的板卡实验后，才标为“已烧录”。这两个状态都不应由本章文字替读者宣称。
+
+## 16.8 本章练习与要点
 
 练习：
 

@@ -210,45 +210,69 @@ typedef struct {
 
 ~~~c
 typedef enum {
+    DOOR_BOOT_CHECK,    /* 上电后先等物理锁定反馈，不凭内存猜状态 */
     DOOR_SAFE_LOCKED,
     DOOR_AUTH_PENDING,
-    DOOR_ACTUATING,
-    DOOR_VERIFYING,
+    DOOR_UNLOCKING,
+    DOOR_UNLOCKED,
+    DOOR_LOCKING,
     DOOR_FAULT
 } DoorState;
 
 typedef enum {
     EVT_UNLOCK_REQUEST,
+    EVT_LOCK_REQUEST,
     EVT_AUTH_OK,
     EVT_AUTH_FAIL,
-    EVT_ACTUATOR_DONE,
+    EVT_UNLOCK_CONFIRMED,
+    EVT_LOCK_CONFIRMED,
+    EVT_AUTOLOCK_TIMEOUT,
     EVT_TIMEOUT,
-    EVT_RESET
+    EVT_LOCAL_RECOVER
 } DoorEvent;
 
-/* 教学伪代码：动作由单独的执行器任务完成；
-   状态机只决定“是否允许请求”和“何时超时”。 */
+/* 教学伪代码：状态机只决定“下一状态”。
+   进入 UNLOCKING/LOCKING 时由独立执行器任务启动受限动作；
+   只有物理反馈才能产生 *_CONFIRMED。 */
 DoorState Door_Next(DoorState s, DoorEvent e)
 {
     switch (s) {
+    case DOOR_BOOT_CHECK:
+        if (e == EVT_LOCK_CONFIRMED) return DOOR_SAFE_LOCKED;
+        if (e == EVT_TIMEOUT)        return DOOR_FAULT;
+        return s;
+
     case DOOR_SAFE_LOCKED:
         return e == EVT_UNLOCK_REQUEST ? DOOR_AUTH_PENDING : s;
+
     case DOOR_AUTH_PENDING:
-        if (e == EVT_AUTH_OK)   return DOOR_ACTUATING;
+        if (e == EVT_AUTH_OK) return DOOR_UNLOCKING;
         if (e == EVT_AUTH_FAIL || e == EVT_TIMEOUT) return DOOR_SAFE_LOCKED;
         return s;
-    case DOOR_ACTUATING:
-        if (e == EVT_ACTUATOR_DONE) return DOOR_VERIFYING;
-        if (e == EVT_TIMEOUT)       return DOOR_FAULT;
+
+    case DOOR_UNLOCKING:
+        if (e == EVT_UNLOCK_CONFIRMED) return DOOR_UNLOCKED;
+        if (e == EVT_TIMEOUT)          return DOOR_FAULT;
         return s;
-    case DOOR_VERIFYING:
-        return e == EVT_RESET ? DOOR_SAFE_LOCKED : s;
+
+    case DOOR_UNLOCKED:
+        if (e == EVT_LOCK_REQUEST || e == EVT_AUTOLOCK_TIMEOUT)
+            return DOOR_LOCKING;
+        return s; /* 重复开锁请求没有副作用 */
+
+    case DOOR_LOCKING:
+        if (e == EVT_LOCK_CONFIRMED) return DOOR_SAFE_LOCKED;
+        if (e == EVT_TIMEOUT)        return DOOR_FAULT;
+        return s;
+
     case DOOR_FAULT:
-        return e == EVT_RESET ? DOOR_SAFE_LOCKED : s;
+        return e == EVT_LOCAL_RECOVER ? DOOR_BOOT_CHECK : s;
     }
     return DOOR_FAULT;
 }
 ~~~
+
+初始状态应为 `DOOR_BOOT_CHECK`，不是直接假定“已经锁好”。若掉电发生在动作中、物理反馈缺失或超时，系统应进入 `DOOR_FAULT` 并要求本地受控恢复；无线字符串不能把故障直接清成“已锁”。
 
 真实产品还需要物理反馈、权限模型、审计、异常断电策略和合规审查；本章不把这个骨架宣传为安全门锁实现。
 
@@ -262,7 +286,7 @@ DoorState Door_Next(DoorState s, DoorEvent e)
 | 认证 → 动作 | 认证结果未过期，动作任务可用 |
 | 动作 → 验证 | 执行器反馈或受控时间窗口，不是简单 delay |
 | 任意 → FAULT | 具体超时/反馈/供电错误码 |
-| FAULT → 安全锁定 | 明确的本地恢复/受控复位，不是无线字符串 |
+| FAULT → BOOT_CHECK → 安全锁定 | 本地恢复后必须获得锁定物理反馈，不是无线字符串 |
 
 练习：用一张状态迁移日志驱动 LED 模拟器：不发送任何 BLE 字节，只手工喂 `DoorEvent`，验证所有非法事件都不会离开安全锁定状态。
 

@@ -6,7 +6,7 @@
 >
 > **通过标准**：不是“所有功能都亮”，而是每个里程碑都有一份可复现接线、日志和错误计数。
 
-> **本章产出**：一个完整的多传感器温度记录仪——NTC + DS18B20 + DHT11 三路采集，SRAM 缓存，满 256 包通过 WiFi 发到电脑上的 C 网关程序
+> **本章产出**：一个分层的多传感器温度记录仪教材项目——NTC + DS18B20 + DHT11 三路采集，SRAM 缓存，满 256 包通过 WiFi 发到电脑上的 C 网关程序
 >
 > **用到前面的知识**：ADC（Ch9）、UART（Ch8）、FreeRTOS 多任务（Ch14-16）、AT 指令（Ch17）
 
@@ -51,7 +51,7 @@
 | DHT11（带小 PCB 板，接座子） | 数据 | **PB1** | 单总线 |
 | DX-WF24 | UART TX/RX | **PA2/PA3** (USART2) | 115200, 8N1 |
 
-DS18B20 是裸露 TO-92 封装元件，直接插在板载 4 针座子上；DHT11 自带一块小 PCB 板，接在座子上即可。板载接口已自带 4.7kΩ 上拉，无需额外元件。
+DS18B20 与 DHT11 模块的插座排列、上拉电阻和供电方式取决于你手上的开发板或扩展板。先看丝印、原理图或用万用表确认；若数据线没有被模块/板卡可靠上拉，需按器件手册加入合适的上拉电阻。不要把某块板的“自带 4.7kΩ”当作 ZET6 的通用事实。
 
 ## 18.3 二进制有线协议
 
@@ -108,22 +108,21 @@ int packet_verify(const TempPacket *pkt);
 ```c
 #include "protocol.h"
 
-/* CRC8 表 (Dallas 1-Wire, 多项式 0x31) */
-static const uint8_t crc8_table[256] = {
-    0x00,0x5E,0xBC,0xE2,0x61,0x3F,0xDD,0x83,
-    0xC2,0x9C,0x7E,0x20,0xA3,0xFD,0x1F,0x41,
-    0x9D,0xC3,0x21,0x7F,0xFC,0xA2,0x40,0x1E,
-    0x5F,0x01,0xE3,0xBD,0x3E,0x60,0x82,0xDC,
-    0x23,0x7D,0x9F,0xC1,0x42,0x1C,0xFE,0xA0,
-    0xE1,0xBF,0x5D,0x03,0x80,0xDE,0x3C,0x62,
-    0xBE,0xE0,0x02,0x5C,0xDF,0x81,0x63,0x3D,
-    0x7C,0x22,0xC0,0x9E,0x1D,0x43,0xA1,0xFF,
-};
-
-uint8_t crc8_compute(const uint8_t *data, int len) {
+/* Dallas/Maxim CRC-8：正常多项式 0x31，按最低位优先时使用 0x8C。
+   这里故意采用位运算而非不完整的查表，便于读者逐步验证。 */
+uint8_t crc8_compute(const uint8_t *data, int len)
+{
     uint8_t crc = 0;
-    for (int i = 0; i < len; i++)
-        crc = crc8_table[crc ^ data[i]];
+
+    for (int i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            if (crc & 0x01)
+                crc = (uint8_t)((crc >> 1) ^ 0x8C);
+            else
+                crc >>= 1;
+        }
+    }
     return crc;
 }
 
@@ -170,21 +169,28 @@ void packet_fill(TempPacket *pkt, uint32_t seq,
 #define PKG_SIZE      15
 #define DEFAULT_PORT  8888
 
-/* ===== CRC8 ===== */
+/* ===== CRC-8/MAXIM (Dallas 1-Wire) =====
+ * 与 MCU 的 crc8_compute 使用相同的反射算法：normal poly 0x31，
+ * reflected poly 0x8C，init=0。PC/MCU 必须对同一输入得到同一结果。 */
 static uint8_t crc8_table[256];
+
 static void crc8_init(void) {
-    for (int i = 0; i < 256; i++) {
-        uint8_t crc = i;
-        for (int j = 0; j < 8; j++) {
-            if (crc & 0x80) crc = (crc << 1) ^ 0x31;
-            else            crc = (crc << 1);
+    for (int i = 0; i < 256; ++i) {
+        uint8_t crc = (uint8_t)i;
+        for (int bit = 0; bit < 8; ++bit) {
+            if (crc & 0x01)
+                crc = (uint8_t)((crc >> 1) ^ 0x8C);
+            else
+                crc >>= 1;
         }
         crc8_table[i] = crc;
     }
 }
+
 static uint8_t crc8_calc(const uint8_t *d, int len) {
     uint8_t crc = 0;
-    for (int i = 0; i < len; i++) crc = crc8_table[crc ^ d[i]];
+    for (int i = 0; i < len; ++i)
+        crc = crc8_table[crc ^ d[i]];
     return crc;
 }
 
@@ -278,15 +284,68 @@ int main(int argc, char **argv) {
         inet_ntop(AF_INET, &cli.sin_addr, ip, sizeof(ip));
         printf("\n\033[1m[连接] %s:%d\033[0m\n", ip, ntohs(cli.sin_port));
 
-        uint8_t buf[PKG_SIZE];
-        int pos = 0;
+        /* TCP 是字节流：一次 read 可能得到半帧、多帧或噪声后的字节。
+           此处按 magic + 固定长度 + CRC 重同步，而不是每 15 字节硬切。 */
+        typedef struct {
+            uint8_t frame[PKG_SIZE];
+            size_t used;
+            uint32_t bad_frame;
+        } PacketParser;
+
+        PacketParser parser = {0};
+        uint8_t buf[128];
 
         while (running) {
-            int n = read(fd, buf+pos, PKG_SIZE-pos);
+            ssize_t n = read(fd, buf, sizeof(buf));
             if (n <= 0) break;
-            pos += n;
-            if (pos >= PKG_SIZE) { handle_packet(buf); pos = 0; }
+
+            for (ssize_t k = 0; k < n; ++k) {
+                uint8_t ch = buf[k];
+
+                if (parser.used == 0) {
+                    if (ch == 0xA5) parser.frame[parser.used++] = ch;
+                    continue;
+                }
+                if (parser.used == 1) {
+                    if (ch == 0xA5) parser.frame[parser.used++] = ch;
+                    else parser.used = 0;
+                    continue;
+                }
+
+                parser.frame[parser.used++] = ch;
+                if (parser.used != PKG_SIZE) continue;
+
+                if (handle_packet(parser.frame) == 0) {
+                    parser.used = 0;
+                    continue;
+                }
+
+                /* CRC 错后，在已收字节中寻找最后一个 A5 A5；
+                   保留其后的候选数据，下一字节继续重同步。 */
+                parser.bad_frame++;
+                size_t restart = PKG_SIZE;
+                for (size_t i = 1; i + 1 < PKG_SIZE; ++i) {
+                    if (parser.frame[i] == 0xA5 &&
+                        parser.frame[i + 1] == 0xA5) {
+                        restart = i;
+                    }
+                }
+                if (restart < PKG_SIZE) {
+                    memmove(parser.frame, parser.frame + restart,
+                            PKG_SIZE - restart);
+                    parser.used = PKG_SIZE - restart;
+                } else if (parser.frame[PKG_SIZE - 1] == 0xA5) {
+                    parser.frame[0] = 0xA5;
+                    parser.used = 1;
+                } else {
+                    parser.used = 0;
+                }
+            }
         }
+
+        if (parser.bad_frame)
+            fprintf(stderr, "本连接丢弃 %u 个错误帧\n",
+                    (unsigned)parser.bad_frame);
         printf("\033[31m[断开] %s:%d\033[0m\n", ip, ntohs(cli.sin_port));
         close(fd);
     }
@@ -589,7 +648,7 @@ uint16_t RingBuf_Count(const RingBuffer *rb) {
 
 ## 18.7 WiFi AT 封装
 
-AT 指令的底层 UART 收发（`UART2_Init`、`AT_SendCmd`、`AT_WaitResponse`）在本章 §18.8 `main.c` 中完整实现。这里只做上层封装。
+AT 指令的底层 UART 收发（`UART2_Init`、`AT_SendCmd`、`AT_WaitResponse`）在第 18.8 节的 `main.c` 教学骨架中展示；这里仅讨论上层封装。实际工程仍须按所选模块与构建环境验证。
 
 `sensors/wifi.h`：
 
@@ -965,6 +1024,43 @@ typedef struct {
 3. 让 RingBuffer 容量很小，确认溢出计数可见；
 4. 选择一种错误状态，让 PC 网关显示“数据无效”而不是把它当成真实温度。
 
+
+## 18.13 让“项目代码多”仍然可验证：协议、驱动与网关各留一份证据
+
+本章中的传感器、WiFi 和 PC 网关片段用于讲解结构；它们不代替某块具体 ZET6 板、某个模块固件和某个编译器上的验证。把下面四类证据放进你的实验记录，才可以说某一层已通过。
+
+| 层 | 需要固定的契约 | 最小验证 |
+|---|---|---|
+| 二进制包 | `TempPacket` 总长、字段字节序、CRC 覆盖范围、版本号 | MCU 与 PC 对同一组字节算出相同 CRC；打印 `sizeof(TempPacket)` |
+| 传感器 | 供电、电平、上拉、采样/转换超时、量程 | 与万用表/已知温度趋势对照；断线或 NACK 时返回状态而非假值 |
+| RingBuffer | 最大积压、溢出策略、生产者/消费者所有权 | 故意让发送慢于采样，记录溢出数与序号缺口 |
+| PC 网关 | `read()` 分段、重连、写文件失败、字节序 | 同一帧按 1 字节、随机块、连续块送入，输出完全一致 |
+
+### 固定长度包也要防编译器与字节序
+
+`#pragma pack` 可以让示例易读，但协议不能只依赖“这台编译器恰好这样布局”。在构建时加入大小检查，并把端序作为协议文字的一部分：
+
+~~~c
+/* C11 可用时；旧工具链可用 typedef 数组大小检查替代。 */
+_Static_assert(sizeof(TempPacket) == PKG_SIZE,
+               "TempPacket layout changed");
+
+/* 本章约定：多字节字段在线路上为 little-endian。
+   PC 网关不要直接把网络字节强转为本机 struct 后使用。 */
+~~~
+
+对于温度等有符号值，还应记录单位（例如毫摄氏度）、无效状态和量程。这样 PC 端不会把一次超时的 `0` 错当成 0°C。
+
+### 传感器与网关的回归输入
+
+在没有硬件时，先用可保存的输入证明纯逻辑；有硬件时，再记录接线和测量条件：
+
+1. 用一个公开的 `TempPacket` 字节数组同时喂 MCU 验证函数和 PC 网关；
+2. 用一组正常值、CRC 错值、长度错值、序号跳变和半包作为回归集；
+3. 分别模拟 NTC 开路、DS18B20 超时、DHT11 校验失败，确认产生不同 `SampleStatus`；
+4. 让 PC 网关在一个连接中处理多帧，在中途断开后仍能正确关闭/重连，而不是假定一次 `read()` 恰好为 15 字节。
+
+只有把“示例结构”与“已验证的板卡组合”分开记录，读者才不会因代码看起来完整而跳过最重要的硬件验证。
 ---
 
 > **下一章**：[第 19 章 · 温度记录仪 BLE 版](./19-chapter.md)

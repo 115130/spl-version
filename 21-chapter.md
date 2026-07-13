@@ -302,7 +302,44 @@ bool Mqtt_BuildPublish(uint8_t *out, size_t cap,
 
 这是把“协议偶尔能连上”升级为“解析器可重复验证”的关键步骤。
 
-## 21.11 本章要点
+## 21.11 为 MQTT 明确“已实现的子集”与接收状态机
+
+本章的入门发送器只适合一个很小的 MQTT 3.1.1 子集：短 Client ID、Clean Session、QoS 0 遥测、显式等待 CONNACK。把这条边界写出来，比给读者一个看似万能的组包函数更重要。
+
+| 功能 | 本章最小实现 | 后续实现前必须补的状态 |
+|---|---|---|
+| CONNECT | 无用户名/密码、无遗嘱、Clean Session | 平台认证字段、遗嘱、会话恢复 |
+| PUBLISH | QoS 0、长度受限 | QoS 1 的 packet id、PUBACK、重传与 DUP 标志 |
+| 收包 | CONNACK / PINGRESP 等少量控制包 | 完整固定头、Remaining Length、多帧连续输入 |
+| Keep Alive | 空闲时发送 PINGREQ，等待 PINGRESP | `last_tx/last_rx`、超时关闭与重连 |
+| TLS | 不在这个裸 TCP 入门例程中保证 | 模块 TLS、SNI、证书、时间和内存评估 |
+
+### Remaining Length 必须按字节流解析
+
+MQTT 的固定头后是可变长 Remaining Length。接收端不能假定一个 UART 回调里有完整报文，也不能只支持一个字节后就悄悄解析错误。一个受限解析器至少维护：
+
+~~~text
+FIXED_HEADER
+  → REMAINING_LENGTH（最多 4 字节；乘数 1、128、16384、2097152）
+  → BODY（累计到声明长度）
+  → 产生一条 MQTT 事件，再回到 FIXED_HEADER
+~~~
+
+每一步都检查：Remaining Length 是否超过你的接收上限、编码是否超过 4 字节、Body 是否超时、同一缓冲区里是否紧跟下一帧。这个解析器应通过“1 字节一喂、两帧粘连、超长长度、半包超时”的回放测试。
+
+### QoS 1 不是给 QoS 0 加一个数字
+
+控制命令若需要 QoS 1，最小状态机是：
+
+~~~text
+IDLE → 分配 packet_id → 发送 PUBLISH(QoS1) → WAIT_PUBACK
+  ├─ 收到匹配 packet_id 的 PUBACK → DONE
+  └─ 超时/断线 → 按策略重连并决定是否带 DUP 重发
+~~~
+
+`packet_id`、业务 `seq` 和执行结果是三件事。即使 Broker 已回 PUBACK，设备也不能因此假定“远端执行器已经完成动作”；控制协议仍需自己的 ACK、超时和幂等设计。
+
+## 21.12 本章要点
 
 - MQTT 运行在 TCP 之上，SPL 的工作重点仍是 UART 和 AT 发送；
 - Broker 负责转发，Topic 负责组织数据，Payload 才是实际内容；

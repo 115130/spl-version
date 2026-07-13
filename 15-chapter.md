@@ -34,19 +34,25 @@ FreeRTOS-Kernel/
 │   ├── queue.h
 │   └── semphr.h
 └── portable/
-    └── GCC/ARM_CM3/     # ← Cortex-M3 移植层！
-        ├── port.c
-        ├── portmacro.h
-        └── portasm.c
+    ├── GCC/ARM_CM3/     # ← Cortex-M3 的 GCC 移植层
+    │   ├── port.c
+    │   └── portmacro.h
+    └── MemMang/
+        └── heap_4.c     # ← 五选一的堆实现之一
 ```
 
 ### Step 2：拷贝到工程
 
 ```bash
-mkdir ~/stm32/your-project/freertos
-cp -r FreeRTOS-Kernel/*.c ~/stm32/your-project/freertos/
-cp -r FreeRTOS-Kernel/include ~/stm32/your-project/freertos/
-cp -r FreeRTOS-Kernel/portable/GCC/ARM_CM3/* ~/stm32/your-project/freertos/
+mkdir -p ~/stm32/your-project/freertos/include
+cp FreeRTOS-Kernel/{tasks.c,queue.c,list.c,timers.c} \
+   ~/stm32/your-project/freertos/
+cp -r FreeRTOS-Kernel/include/* \
+   ~/stm32/your-project/freertos/include/
+cp FreeRTOS-Kernel/portable/GCC/ARM_CM3/{port.c,portmacro.h} \
+   ~/stm32/your-project/freertos/
+cp FreeRTOS-Kernel/portable/MemMang/heap_4.c \
+   ~/stm32/your-project/freertos/
 ```
 
 ### Step 3：写 `FreeRTOSConfig.h`
@@ -69,9 +75,21 @@ cp -r FreeRTOS-Kernel/portable/GCC/ARM_CM3/* ~/stm32/your-project/freertos/
 #define configCHECK_FOR_STACK_OVERFLOW  2
 #define configUSE_TIMERS                1
 
-// Cortex-M3 中断优先级（高 4 位有效）
-#define configKERNEL_INTERRUPT_PRIORITY   (15 << 4)
-#define configMAX_SYSCALL_INTERRUPT_PRIORITY (5 << 4)
+/* Cortex-M3 的实现位数来自 CMSIS；不要把 4、15、5 的“左移结果”
+   直接抄进别的芯片。ZET6 的常见配置为 4 个实现优先级位，但仍以
+   工程实际的 __NVIC_PRIO_BITS 为准。 */
+#define configPRIO_BITS                              __NVIC_PRIO_BITS
+#define configLIBRARY_LOWEST_INTERRUPT_PRIORITY     15
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 5
+
+#define configKERNEL_INTERRUPT_PRIORITY \
+    (configLIBRARY_LOWEST_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY \
+    (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
+
+#if (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY == 0)
+# error "FromISR API 的优先级边界不能是 0"
+#endif
 #endif
 ```
 
@@ -387,7 +405,41 @@ void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
 
 练习：把第 8 章 UART 接收 ISR 改为“ISR 只通知 + 任务解析”；用 UART 证明快速连续输入时既不丢失统计，也不会在 ISR 中执行耗时逻辑。
 
-## 15.13 本章要点
+## 15.13 ZET6 移植的最小清单：先证明“只有一套内核”
+
+“能编译”并不足以说明 FreeRTOS 已正确接管 Cortex-M3。开始编译前，把下面这份清单写进项目 README；每一项都能在文件树、启动文件或日志中检查。
+
+| 类别 | 必须明确的选择 | 常见事故 |
+|---|---|---|
+| 内核源码 | `tasks.c`、`queue.c`、`list.c`，按需加入 `timers.c` | 漏编译 `list.c`，或把内核源码复制了两份 |
+| 移植层 | 只使用 `portable/GCC/ARM_CM3` 的 `port.c/portmacro.h` | 误用 M4F/MPU port，或自己再编译一套 PendSV 汇编 |
+| 堆实现 | 只编译一个 `heap_1.c`…`heap_5.c`；入门示例选 `heap_4.c` 并写明原因 | 同时链接两个 heap，或声明 `configTOTAL_HEAP_SIZE` 却没编译 heap |
+| 向量表 | SVC、PendSV、SysTick 分别映射到选定 port 的 handler | 旧裸机 SysTick 和 port handler 同名/重复 |
+| 中断优先级 | `__NVIC_PRIO_BITS`、库优先级和移位后的 FreeRTOS 优先级同时可读 | 把“数值越小优先级越高”看反 |
+| 可观测性 | `configASSERT`、malloc failed hook、stack overflow hook、栈高水位 | 只在 HardFault 后猜测原因 |
+
+### 一份不含魔数的优先级约定
+
+上面配置把 **库级优先级** 与 **写入 NVIC 寄存器的值** 分开。以 `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY = 5` 为例：
+
+- 逻辑优先级 `0–4` 更高；这些 ISR **不得**调用任何 FreeRTOS API（包括 `...FromISR()`）。
+- 逻辑优先级 `5–15` 可以调用 `...FromISR()` API，但 ISR 仍应只搬运事件、给通知或入队。
+- 内核 SysTick/PendSV 通常处在最低逻辑优先级；实际值由选用的 port 和 `FreeRTOSConfig.h` 共同决定。
+
+不要只修改 `NVIC_InitTypeDef` 的数字就认为已经安全。给每个 ISR 写一行注释：它是否调用 RTOS API、对应的库级优先级、为什么这个优先级合适。
+
+### Handler 映射只选一种方式
+
+不同启动文件和 FreeRTOS 版本的符号命名可能不同。项目可以在启动文件中把 `SVC_Handler`、`PendSV_Handler`、`SysTick_Handler` 映射到 port 提供的 `vPortSVCHandler`、`xPortPendSVHandler`、`xPortSysTickHandler`，也可以由 C 文件提供同名包装函数；**两种方式二选一**。提交前用 map 文件确认三个 handler 最终各只解析到一个地址。
+
+最小验收顺序：
+
+1. 只创建两个会 `vTaskDelay()` 的任务，连续运行 10 分钟；
+2. 打印 `xPortGetFreeHeapSize()` 和每个任务的高水位；
+3. 再让一个允许的 ISR 用 `xSemaphoreGiveFromISR()` 通知任务；
+4. 人为把该 ISR 调到不允许的优先级，确认 `configASSERT` 或审查规则能阻止错误进入产品代码。
+
+## 15.14 本章要点
 
 - FreeRTOS 移植首先是向量、中断优先级、时钟和内存的系统工程；
 - Task/Queue/Semaphore/Mutex 的区别来自数据与所有权，不来自名字；

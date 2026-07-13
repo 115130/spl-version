@@ -240,7 +240,54 @@ network=... reconnect=... last_error=...
 
 练习：给一个来源加入 1 秒的突发 200 字节，同时让网络消费者暂停 2 秒。解释每层分别积压了什么、哪一层丢弃了什么、错误计数为什么能定位责任。
 
-## 24.12 本章要点
+## 24.12 一个受限的二进制帧解析器：边界、重同步与并发所有权
+
+下面不是某个真实设备的协议，而是一份可用于单元测试的**教学帧契约**。先约束输入，才有资格把字节交给上层：
+
+~~~text
+A5 | 5A | type | length | payload[length] | crc8
+              0…32 字节
+~~~
+
+解析器状态只保留当前候选帧，不直接碰 Queue：
+
+~~~c
+typedef enum {
+    FIND_A5, FIND_5A, READ_TYPE, READ_LENGTH, READ_PAYLOAD, READ_CRC
+} FrameState;
+
+typedef struct {
+    FrameState state;
+    uint8_t type;
+    uint8_t length;
+    uint8_t used;
+    uint8_t payload[32];
+    uint32_t last_byte_tick;
+    uint32_t bad_length, bad_crc, timeout;
+} FrameParser;
+~~~
+
+处理规则应写成测试，而不是藏在一个巨大的 `if` 中：
+
+1. `length > sizeof(payload)`：增加 `bad_length`，立即回到 `FIND_A5`；
+2. 收到合法 CRC：只产生一次完整事件，随后回到 `FIND_A5`；
+3. CRC 错：增加 `bad_crc`，扫描后续字节重新找帧头；
+4. 任一半帧超过规定 tick：增加 `timeout`，放弃候选帧；
+5. 每次交付前复制数据或转成值类型 `GatewayEvent`，不把解析器内部数组指针交给 Queue。
+
+### RingBuffer 的单生产者/单消费者约束
+
+`USART ISR` 作为唯一生产者、`ParserTask` 作为唯一消费者时，可以让 ISR 只推进 `head`，任务只推进 `tail`。索引应为对齐的无符号整数，缓冲区大小固定；ISR 满时只加丢弃计数。这个约定**只适用于单生产者/单消费者**：
+
+- 第二个 ISR、DMA 回调或任务也要写入同一 RingBuffer 时，必须重新设计所有权并用临界区/同步原语保护；
+- 任务读取统计值时，要接受它是一个瞬时快照，而不是“精确事务日志”；
+- 不要把 `volatile` 当成多生产者线程安全的替代品。
+
+### 计算容量时写出单位
+
+例如 UART 115200、8N1 的理论接收约为每秒 11520 字节。若解析任务最坏会被其他工作阻塞 50ms，光是这段时间就可能积压约 576 字节；再加上模块突发、处理抖动和可接受丢包策略，才能决定 RingBuffer 是 512、1024 还是需要降速/流控。这个算式比“先给 64 字节试试”更接近工程设计。
+
+## 24.13 本章要点
 
 - 网关的价值是协议适配和统一数据模型，而不是简单转发；
 - ISR 只搬运字节，解析必须放在任务上下文；

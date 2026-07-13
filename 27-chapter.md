@@ -27,11 +27,14 @@ typedef enum {
 } EventType;
 
 typedef struct {
+    uint16_t    schema_version; /* 统一事件格式的版本 */
     EventSource source;
     EventType   type;
     uint32_t    device_id;
-    int32_t     value;
     uint32_t    seq;
+    uint32_t    mono_tick;      /* 排序/超时用单调时间，不冒充真实 UTC */
+    int32_t     value;          /* 必须在 type 文档中规定单位，例如 centi-°C */
+    uint16_t    flags;          /* 有效、估算、CRC 错、离线等状态 */
 } GatewayEvent;
 ~~~
 
@@ -205,7 +208,7 @@ typedef struct {
 RuleDecision Rules_Evaluate(const GatewayEvent *e)
 {
     RuleDecision d = {0};
-    if (e->type == EVT_TEMPERATURE && e->payload[0] > 30)
+    if (e->type == EVT_TEMPERATURE && e->value > 3000)
         d.fan_should_run = true;  /* 教学示例：真实值需按格式解析 */
     return d;
 }
@@ -223,7 +226,35 @@ RuleDecision Rules_Evaluate(const GatewayEvent *e)
 
 练习：录制 20 条 GatewayEvent，在 PC/固件测试函数中回放；同一份事件序列应得到同一组 RuleDecision 和统计。
 
-## 27.11 本章要点
+## 27.11 统一事件要有版本、单位、容量和回放边界
+
+`GatewayEvent` 不是“随便塞几个 payload 字节”的容器。每个 `type` 都应在一张表里规定 value 的单位、有效范围和 flags 的含义；否则一台适配器传“30”，另一台传“3000”时，规则引擎会在看似正常的条件下做错事。
+
+| type | `value` 的约定示例 | 必须保留的 flags |
+|---|---|---|
+| `EVT_TEMPERATURE` | 摄氏度 × 100，3000 = 30.00°C | 有效/传感器错/数据过期 |
+| `EVT_HUMIDITY` | %RH × 100 | 有效/范围错 |
+| `EVT_DOOR_STATE` | 枚举值，不把字符串塞入数值 | 物理反馈可信度 |
+| `EVT_COMMAND` | 不用 `value` 表示全部命令；使用关联 ID + 参数结构 | 接受/拒绝/超时/完成 |
+
+### 注册表与配置恢复
+
+设备注册不只存 `device_id`。一个可恢复的登记项至少包括：适配器类型、地址/服务标识、配置版本、最后成功版本、默认安全策略和 CRC。Flash 中的配置必须有版本、长度和校验；无法识别时进入“未注册/只观察”的安全状态，而不是把旧字节强转成新结构体。
+
+### 先算 RAM，再决定支持多少设备
+
+假设网关最多同时跟踪 `N` 台设备、每台保留一个状态项 `S` 字节、事件队列深度 `Q`、事件大小 `E`，最小 RAM 预算至少包含：
+
+~~~text
+device_registry = N × S
+event_queue     = Q × E
+rx_buffers      = 每个适配器的 RingBuffer 之和
+task_stacks + FreeRTOS heap + 日志格式化缓冲
+~~~
+
+写出最大 N、Q、E 后，再选择“遥测覆盖、审计限速、控制不静默丢失”的策略。最后将录制的正常帧、CRC 错帧、断线、突发和重复 seq 保存成回放集；PC 测试与固件测试应对同一输入给出相同的事件计数和规则结果。
+
+## 27.12 本章要点
 
 - 多协议网关的核心是统一事件模型；
 - 适配器之间通过 Queue 交接，而不是相互直接调用；

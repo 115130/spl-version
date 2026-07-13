@@ -287,7 +287,37 @@ if (n < 0 || (size_t)n >= sizeof(request)) {
 
 练习：把服务端 body 的温度字段依次改成缺失、字符串、负数和超长 JSON，记录固件的状态码、解析错误和内存行为。
 
-## 23.12 本章要点
+## 23.12 先冻结一个 HTTP 子集，解析器才有可验证的边界
+
+HTTP 很大；第一轮 ZET6 实验只支持一个明确子集，比声称“支持 HTTP”安全得多。下面是推荐的教学契约：
+
+| 项目 | 第一轮支持 | 明确不支持/需另写状态机 |
+|---|---|---|
+| 方法 | `GET`；需要时再单独加入小 Body 的 `POST` | 复杂上传、流式请求 |
+| 协议 | HTTP/1.1，显式 `Connection: close` | 持久连接复用、HTTP/2 |
+| 响应边界 | `Content-Length`；或连接关闭作为最后边界 | Chunked 编码、无限流 |
+| 头部/Body 上限 | 编译期常量，超出即拒绝并计数 | 按服务器输入无限扩容 |
+| 重定向/压缩 | 直接报告“不支持” | 自动跳转、gzip 解压 |
+| JSON | 完整 Body 到齐后解析 | 半包、超长、类型不符时继续使用旧数据 |
+
+这样 `HTTP 任务` 的状态机就能写得很小且可回放：
+
+~~~text
+IDLE → BUILD_REQUEST → TCP_CONNECT → SEND
+  → READ_HEADERS → CHECK_STATUS_AND_LENGTH → READ_BODY
+  → PARSE_JSON → DELIVER_CONFIG → CLOSE → IDLE
+                       └─ 任意超时/超长/格式错 → CLOSE + ERROR + 退避
+~~~
+
+只有在 `Content-Length` 已验证且所有 Body 字节到齐时，才允许调用 `cJSON_Parse`。若选择依赖连接关闭作为边界，就必须给总响应长度和等待时间上限，避免一台异常服务永远占住任务。
+
+### 内存与 HTTPS 的明确取舍
+
+cJSON 的分配来源、解析最大尺寸和错误释放策略都应写在项目配置中。若使用动态内存，测试连续错误 JSON 是否导致 heap 持续下降；若改用自定义 allocator，`cJSON_InitHooks` 的初始化时机和线程安全也要说明。
+
+公网服务通常要求 HTTPS。选择路线前依次确认：AT 模块是否真支持目标 TLS 版本、域名/SNI、证书存储与校验；系统时间从何而来；握手时 RAM/供电是否足够。任意一项未验证时，只把实验限定在受控的局域网 HTTP 服务，不要通过“浏览器可以访问”来推断 MCU 的连接安全。
+
+## 23.13 本章要点
 
 - HTTP 请求先组装，再根据真实长度发送 AT+CIPSEND；
 - TCP/UART 收包不保证一次收到完整 HTTP 响应；
