@@ -173,7 +173,56 @@ HardFault 后不要先重启。暂停在异常处，收集：
 2. 故意让一个缓冲区长度过小，在调试副本中练习用 PC/地址定位；
 3. 把 UART 日志改为 `[tick][module][level][code]` 格式，避免只输出“error”。
 
-## 28.11 本章要点
+## 28.11 断言、错误码与“最后一份证据”
+
+日志不能覆盖所有时序错误，因此调试构建应把不变量变成可停住、可定位的事件：
+
+~~~c
+typedef enum {
+    APP_ERR_NONE = 0,
+    APP_ERR_QUEUE_FULL,
+    APP_ERR_I2C_TIMEOUT,
+    APP_ERR_DMA_OVERFLOW,
+    APP_ERR_PROTOCOL
+} AppError;
+
+void App_AssertFailed(const char *expr, const char *file, int line)
+{
+    printf("[assert] expr=%s file=%s line=%d\r\n", expr, file, line);
+    /* 调试构建：记录后停住，连接 GDB 查看上下文。
+       量产策略必须由产品安全需求决定，不能简单无限循环。 */
+    for (;;);
+}
+
+#define APP_ASSERT(x) do {     if (!(x)) App_AssertFailed(#x, __FILE__, __LINE__); } while (0)
+~~~
+
+断言适合检查“绝不应发生”的条件，例如 Queue 句柄非空、帧长度不超过 buffer、状态机不存在非法迁移。外设超时、网络断线则是正常故障路径，应返回错误码并由状态机恢复，而不是触发断言。
+
+### 调试记录模板
+
+每次真正解决一个问题时，留下可复用记录：
+
+~~~text
+现象：
+最小复现步骤：
+硬件/固件/工具链版本：
+假设：
+观察证据（日志/波形/寄存器/GDB）：
+根因：
+修复：
+回归测试：
+~~~
+
+| 证据强度 | 例子 |
+|---|---|
+| 弱 | “多加了几个 printf 后好了” |
+| 中 | 读到一个错误码，但未能定位前因 |
+| 强 | 可复现输入 + GDB/波形 + 修复后的回归用例 |
+
+练习：为第 24 章的帧解析器添加长度断言和错误码；分别测试“长度非法”和“CRC 错误”为什么应走不同路径。
+
+## 28.12 本章要点
 
 - 可调试的工程必须保留 ELF、符号和可读日志；
 - OpenOCD 连接硬件，GDB 连接程序，两者缺一不可；
