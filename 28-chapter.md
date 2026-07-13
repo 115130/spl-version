@@ -130,7 +130,50 @@ arm-none-eabi-addr2line -e build/app.elf -f -C 0x08000234
 3. 让 UART 缓冲区故意变小，观察 overflow 计数；
 4. 把一个难复现的问题写成“现象—假设—验证—结论”的调试记录。
 
-## 28.10 本章要点
+## 28.10 一次可重复的 OpenOCD + GDB 调试会话
+
+不要只记住“开两个终端”。把每次调试写成可复制的命令和证据：
+
+~~~bash
+# 终端 A：按你的 ST-Link 和板卡连接方式调整配置文件
+openocd -f interface/stlink.cfg -f target/stm32f1x.cfg
+
+# 终端 B：必须加载带调试符号的 ELF，而不是 .bin
+arm-none-eabi-gdb build/app.elf
+~~~
+
+~~~gdb
+target extended-remote :3333
+monitor reset halt
+break main
+continue
+info threads
+backtrace
+print SystemCoreClock
+x/16wx 0x20000000
+~~~
+
+真正的项目应把这些命令写进 `docs/debug.md` 或 Makefile 目标，并记录 OpenOCD、工具链和板卡版本。GDB 无法从裸 `.bin` 恢复函数名，因此调试构建必须保留 `.elf` 和 map 文件。
+
+### HardFault 的第一份证据
+
+HardFault 后不要先重启。暂停在异常处，收集：
+
+1. 当前 PC/LR、`backtrace` 和出错函数；
+2. 相关任务的栈高水位与 heap；
+3. 最近一条 UART 结构化日志；
+4. 是否刚发生 ISR、DMA、队列或指针生命周期切换；
+5. 对应地址的 `addr2line -e build/app.elf <address>` 结果。
+
+若栈已经损坏，回溯可能不完整；这正是为什么第 15–16 章要求提前启用栈检查和错误计数。
+
+### 调试练习
+
+1. 在 SensorTask 入口、Queue 发送后、消费者入口各设一个断点，画出真实执行顺序；
+2. 故意让一个缓冲区长度过小，在调试副本中练习用 PC/地址定位；
+3. 把 UART 日志改为 `[tick][module][level][code]` 格式，避免只输出“error”。
+
+## 28.11 本章要点
 
 - 可调试的工程必须保留 ELF、符号和可读日志；
 - OpenOCD 连接硬件，GDB 连接程序，两者缺一不可；
