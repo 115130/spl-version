@@ -267,25 +267,28 @@ typedef struct {
     uint32_t bad_frame_count;
 } TempReassembler;
 
-/* 每来一小段字节就调用一次；返回 true 表示产出一帧。 */
-bool TempReassembler_Feed(TempReassembler *r,
+typedef void (*TempPacketSink)(const TempPacket *packet, void *ctx);
+
+/* 每来一小段字节就调用一次。一次 data 里可能有 0、1 或多帧；
+   因此通过回调逐帧交付，绝不能在第一帧时提前 return 丢掉剩余字节。 */
+void TempReassembler_Feed(TempReassembler *r,
                           const uint8_t *data, size_t n,
-                          TempPacket *out)
+                          TempPacketSink sink, void *ctx)
 {
     while (n--) {
+        TempPacket packet;
+
         r->buf[r->used++] = *data++;
+        if (r->used != TEMP_PACKET_SIZE) continue;
 
-        if (r->used == TEMP_PACKET_SIZE) {
-            memcpy(out, r->buf, TEMP_PACKET_SIZE);
-            r->used = 0;
+        memcpy(&packet, r->buf, sizeof(packet));
+        r->used = 0;
 
-            if (TempPacket_IsValid(out)) return true;
+        if (TempPacket_IsValid(&packet))
+            sink(&packet, ctx);
+        else
             r->bad_frame_count++;
-            /* 固定长度教学协议可以直接丢弃本帧；
-               可变长度协议需要回到 magic/length 状态机。 */
-        }
     }
-    return false;
 }
 ~~~
 
@@ -321,7 +324,34 @@ INIT → WIFI_JOIN → TCP_OPEN → ONLINE
 | 重连风暴 | 无退避、多个任务同时重连、旧连接未清理 |
 | 断网拖慢采样 | 采样路径直接等待 AT/TCP，而不是异步交给网络任务 |
 
-## 20.10 本章要点
+## 20.10 发送所有权、半包和 TCP 关闭
+
+接收端要重组，发送端同样需要边界。任何交给网络任务的 buffer 都必须在发送完成前保持有效：
+
+| 做法 | 为什么危险/安全 |
+|---|---|
+| 把局部数组地址放进 Queue | 函数返回后地址仍在，但内容已不可靠 |
+| 复用同一全局 TX buffer | 上一条 AT/TCP 发送未完成时会被下一条覆盖 |
+| Queue 传递完整小结构体 | 简单、安全，但占更多 RAM |
+| 固定缓冲池 + 所有权状态 | 适合较大消息，但必须有申请/释放/超时规则 |
+
+TCP 连接关闭也不是“下一次写失败再说”。设备应区分：
+
+~~~text
+ONLINE → SEND_PENDING → ONLINE
+ONLINE → PEER_CLOSED / AT_ERROR → BACKOFF
+ONLINE → KEEPALIVE_TIMEOUT → BACKOFF
+~~~
+
+每次进入 BACKOFF 都清理未完成事务、记录失败原因和最后一个 seq；重连后按照业务语义决定哪些消息需要重发。遥测可以丢旧保新，命令确认必须幂等。
+
+### 练习
+
+1. 修改 PC 网关，使一次 `read()` 合并两帧，再把一帧拆成三个 `write()`；重组结果应完全相同；
+2. 让设备每秒入队一帧、网络任务每三秒取一帧，说明队列满时保留哪个数据；
+3. 服务器主动关闭连接，记录设备从检测到错误到下一次成功发送的状态时间线。
+
+## 20.11 本章要点
 
 - AT 模块帮你实现了 TCP/IP 协议栈——三次握手、重传、打包全在固件里
 - TCP 保证可靠传输，适合温度记录数据
