@@ -135,6 +135,8 @@ PWM 频率 = 定时器时钟 / (PSC+1) / (ARR+1)：
 | 音频输出 | 44kHz+ | 人耳范围之外 |
 
 ### SPL PWM 呼吸灯示例
+
+```c
 void TIM3_PWM_Init(void) {
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);  // TIM3_CH3 = PB0
