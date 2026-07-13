@@ -1,127 +1,125 @@
-# 第 19 章 · 温度记录仪 BLE 版
+# 第 19 章 · 温度记录仪 BLE 版（SPL版）
 
-> **本章产出**：用同一个 STM32 工程、同一块 DX-WF24，把第 18 章的 WiFi 发送换成 BLE 发送
+> **本章产出**：把第 18 章的温度记录仪从“连接路由器后上报”改为“由手机近距离读取”；理解 BLE 的广播、连接、特征值和通知在 AT 模块项目中的位置。
 >
-> **变化**：只改 `WiFiTxTask` → `BLETxTask`，传感器/协议/缓冲区代码**一字不改**
+> **前置知识**：第 17 章无线与 AT 模块、第 18 章温度记录仪。
+>
+> **用在哪**：手机调试、低功耗传感器、近距离配置与控制。
 
 ---
 
-## 19.1 BLE 版本 vs WiFi 版本
+## 19.1 BLE 不是把 WiFi 命令换个名字
 
-| | WiFi 版（第 18 章） | BLE 版（本章） |
-|---|---|---|
-| **通信方式** | TCP (AT+CIPSTART/CIPSEND) | BLE GATT (AT+BLEINIT/BLEGATTSEND) |
-| **接收端** | PC 上的 C 网关 (gateway.c) | 手机 App（nRF Connect / LightBlue） |
-| **需要 WiFi 路由器** | ✅ | ❌（手机直连） |
-| **功耗** | 高 | 低 |
-| **传感器代码** | 不变 | 不变 |
-| **协议格式** | 不变（15 字节二进制包） | 不变 |
+第 18 章的 WiFi 路径是：
 
-## 19.2 唯一需要改的：通信初始化
+~~~text
+STM32 → AT 模块 → 路由器 → TCP 网关
+~~~
 
-```c
-/* WiFi 版（Ch18）*/
-UART2_Init(115200);
-WiFi_Init();                          /* AT + CWMODE + CWJAP + CIPSTART */
+BLE 的典型路径是：
 
-/* BLE 版（本章）*/
-UART2_Init(115200);
-BLE_Init();                           /* AT + BLEINIT + BLEGATTSSRV + BLEADVSTART */
-```
+~~~text
+STM32 → AT 模块 → 手机
+~~~
 
-### BLE_Init 函数
+WiFi 更像设备主动连接服务器；BLE 常常先广播，让手机发现后再连接。因此，连接状态、数据方向和功耗策略都不同。
 
-```c
-uint8_t BLE_Init(void) {
-    vTaskDelay(pdMS_TO_TICKS(1500));
+## 19.2 认识 BLE 的四个对象
 
-    // 关 WiFi（如之前开过）
-    AT_ClearRxBuf(); AT_SendCmd("AT+CWMODE=0");
-    AT_WaitResponse("OK", 2000);
+| 名词 | 先这样理解 |
+|---|---|
+| 广播 Advertising | 设备周期性喊“我在这里” |
+| 连接 Connection | 手机选择一个设备后建立会话 |
+| Service | 一组相关功能，例如环境监测 |
+| Characteristic | 可读、可写、可通知的数据项 |
 
-    // BLE GATT Server 初始化
-    AT_ClearRxBuf(); AT_SendCmd("AT+BLEINIT=2");
-    if (!AT_WaitResponse("OK", 3000)) return 0;
+例如可设计：
 
-    // 创建服务 + 特征值
-    AT_ClearRxBuf(); AT_SendCmd("AT+BLEGATTSSRV=1");
-    AT_WaitResponse("OK", 2000);
-    AT_ClearRxBuf(); AT_SendCmd("AT+BLEGATTSCHAR=1,0xFFE1,0x12,20");
-    AT_WaitResponse("OK", 2000);
+~~~text
+Environmental Service
+  ├─ Temperature Characteristic：Notify
+  ├─ Humidity Characteristic：Notify
+  └─ Command Characteristic：Write
+~~~
 
-    // 广播
-    AT_ClearRxBuf(); AT_SendCmd("AT+BLEADVNAME=\"TempLogger\"");
-    AT_WaitResponse("OK", 2000);
-    AT_ClearRxBuf(); AT_SendCmd("AT+BLEADVSTART");
-    AT_WaitResponse("OK", 3000);
+若使用 AT 模块，Service 与 Characteristic 可能由模块固件预定义，也可能通过 AT 命令配置。必须以模块手册为准，不能把一个模块的命令照搬到另一个模块。
 
-    printf("BLE 已广播，用手机 App 搜索 TempLogger\r\n");
-    return 1;
-}
-```
+## 19.3 数据仍然需要协议
 
-## 19.3 BLE 发送
+BLE Notify 也不是“天然完整的一条业务消息”。为温度记录仪定义最小帧：
 
-BLE 发送不像 WiFi 那样直接发二进制字节——大多数 BLE AT 固件要求数据转成 16 进制字符串：
+~~~text
+SOF | type | seq | payload_len | payload | CRC
+~~~
 
-```c
-void BLE_SendPacket(const TempPacket *pkt) {
-    char hex[32];
-    // 将 15 字节的二进制包转为 30 字符的十六进制字符串
-    for (int i = 0; i < 15; i++)
-        sprintf(hex + i*2, "%02X", ((uint8_t*)pkt)[i]);
+其中：
 
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "AT+BLEGATTSEND=1,%s", hex);
-    AT_ClearRxBuf(); AT_SendCmd(cmd);
-    AT_WaitResponse("OK", 3000);
-}
-```
+- seq 用于识别重复通知；
+- payload 可以是定点温度、湿度和电池电压；
+- CRC 能帮助区分链路问题与解析错误。
 
-## 19.4 BLETxTask
+不要直接把 printf 文本当作长期协议；调试文本可变，二进制帧才适合程序稳定解析。
 
-```c
-void BLETxTask(void *pv) {
-    UART2_Init(115200);
-    BLE_Init();
+## 19.4 一个清晰的 BLE 状态机
 
-    while (1) {
-        if (RingBuf_Count(&tx_ring) >= 256) {
-            TempPacket batch[256];
-            int n = 0;
-            while (n < 256 && RingBuf_Pop(&tx_ring, &batch[n]) == 0)
-                n++;
-            for (int i = 0; i < n; i++) {
-                BLE_SendPacket(&batch[i]);
-                vTaskDelay(pdMS_TO_TICKS(200));
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-```
+~~~text
+INIT → ADVERTISING → CONNECTED → NOTIFYING
+             ↑             |          |
+             └── disconnect/error ────┘
+~~~
 
-## 19.5 PC 端用什么收
+每个状态都应通过模块的明确响应切换。手机断开后，模块应回到广播；STM32 不应该因为手机离开而停止采样或记录数据。
 
-PC 如果没有 BLE 硬件，可以用手机 App 收数据。Chrome 83+ 也支持 Web Bluetooth API：
+## 19.5 任务划分
 
-```javascript
-// 浏览器控制台即可
-const device = await navigator.bluetooth.requestDevice({
-    filters: [{ name: 'TempLogger' }]
-});
-const server = await device.gatt.connect();
-const service = await server.getPrimaryService(0xFFE0);
-const char = await service.getCharacteristic(0xFFE1);
-char.addEventListener('characteristicvaluechanged', e => {
-    const pkt = parse_temppacket(e.target.value);
-    console.log(`温度: ${pkt.ntc/100}°C`);
-});
-char.startNotifications();
-```
+~~~text
+Task_Sensor
+  → Queue_LatestSample
+  → Task_BLETx
 
-> 完整代码和 WiFi 版共用 `sensors/`、`ringbuf.c`、`protocol.c`。唯一区别是 `main.c` 中把 `WiFiTxTask` 换成 `BLETxTask`。
+Task_BLE_Rx
+  → 解析写入命令
+  → Queue_Command
+
+Task_BLETx
+  → 仅在 CONNECTED 时发送 Notify
+~~~
+
+BLETxTask 应有发送频率限制。例如温度每秒更新一次已经足够；高频发送只会增加功耗、增加手机处理压力，也更难排查丢包。
+
+## 19.6 用手机验证，而不是猜
+
+推荐的验证顺序：
+
+1. 手机能发现设备广播名称；
+2. 连接成功后能看到 Service 与 Characteristic；
+3. 订阅 Notify 后每秒收到一条温度数据；
+4. 写入一条测试命令，STM32 在串口打印并返回状态；
+5. 关闭手机蓝牙，设备重新进入广播而不死机。
+
+记录手机应用、模块固件版本、广播间隔和连接参数；BLE 问题高度依赖这些条件。
+
+## 19.7 安全和功耗边界
+
+教学项目中可以用简单测试命令理解流程，但不要把它变成真实门锁或生产控制协议：
+
+- 不能因为收到字符串 OPEN 就执行危险动作；
+- 控制命令应有身份、序号、确认和超时；
+- 广播间隔越短，越容易被发现，但越耗电；
+- 真正的配对、绑定和加密能力由模块与手机系统共同决定。
+
+第 26 章会把这些原则放进一个门锁状态机中。
+
+## 19.8 本章要点
+
+- BLE 面向近距离手机连接，WiFi 面向路由器和互联网；
+- 广播、连接、Service、Characteristic 是 BLE 的基本组织方式；
+- Notify 传递的仍是字节流，业务协议需要长度、序号与校验；
+- 手机断开不应影响传感器采样和本地记录；
+- BLE 控制命令需要状态机和安全边界。
 
 ---
 
-> **下一章**：[第 20 章 · TCP/IP 协议栈浅析](./20-chapter.md)
+[上一章：第 18 章 · 温度记录仪 WiFi 版](./18-chapter.md)
+
+[下一章：第 20 章 · TCP/IP 协议栈与温度记录仪](./20-chapter.md)
