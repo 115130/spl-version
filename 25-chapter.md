@@ -194,7 +194,54 @@ typedef struct {
 
 练习：实现一个 HealthTask，每 10 秒打印任务栈余量、采样序号、队列满计数、存储错误和网络重连次数。它是你后面排查“项目偶尔死掉”时最有价值的证据。
 
-## 25.10 本章要点
+## 25.10 启动顺序与最小主程序骨架
+
+综合工程要把“板级初始化成功”与“某项业务成功”分开。推荐启动顺序：
+
+~~~c
+int main(void)
+{
+    SystemClock_Config();     /* 已在第 5 章独立验证 */
+    Board_SafeOutputs();      /* 默认让执行器/CS 处于安全状态 */
+    UART_DebugInit();         /* 先建立观察口 */
+    HealthCounters_Init();
+
+    SensorBus_Init();         /* 每个驱动返回明确成功/失败 */
+    Storage_Init();
+    Radio_Init();
+
+    sample_q = xQueueCreate(8, sizeof(EnvSample));
+    latest_q = xQueueCreate(1, sizeof(EnvSample));
+    if (sample_q == NULL || latest_q == NULL)
+        App_Fatal("queue-init");
+
+    xTaskCreate(SensorTask,  "sensor",  STACK_SENSOR,  NULL, PRIO_SENSOR,  NULL);
+    xTaskCreate(DisplayTask, "display", STACK_DISPLAY, NULL, PRIO_DISPLAY, NULL);
+    xTaskCreate(LogTask,     "log",     STACK_LOG,     NULL, PRIO_LOG,     NULL);
+    xTaskCreate(NetworkTask, "net",     STACK_NETWORK, NULL, PRIO_NETWORK, NULL);
+    xTaskCreate(HealthTask,  "health",  STACK_HEALTH,  NULL, PRIO_HEALTH,  NULL);
+
+    vTaskStartScheduler();
+    for (;;); /* 只有调度器无法启动时才会走到这里 */
+}
+~~~
+
+骨架中的函数名不是现成库。它们的意义是让每一步都有名字、返回值和日志。不要在 `main()` 中默默初始化 20 个设备，然后在第一个错误上继续运行。
+
+### 硬件联调表
+
+| 接口 | 最小验证 | 不通过时先回退 |
+|---|---|---|
+| ADC 传感器 | UART 打印原始值 + 万用表趋势 | 第 9 章 |
+| I2C OLED/传感器 | 单设备 ACK、固定显示 | 第 10 章 |
+| SPI 存储 | 写入/读回固定记录 | 第 11/13 章 |
+| USART WiFi | `AT` → `OK`、错误计数 | 第 17 章 |
+| MQTT/HTTP | PC 教学 Broker/服务回包 | 第 21/23 章 |
+| FreeRTOS | 栈高水位、Queue 满计数 | 第 15/16 章 |
+
+练习：为每个 `*_Init()` 规定一个错误码和一条脱敏 UART 日志。冷启动失败时，你应该能从第一条错误直接知道回退到哪一章。
+
+## 25.11 本章要点
 
 - 综合项目靠里程碑推进，而不是一次性拼接所有模块；
 - 采样数据要有统一结构，任务之间使用 Queue 交接；
