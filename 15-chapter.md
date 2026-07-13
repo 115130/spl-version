@@ -1,5 +1,11 @@
 # 第 15 章 · FreeRTOS 核心 API 与手动移植（SPL版）
 
+> **本章产出**：把 FreeRTOS 正确放入 ZET6 SPL 工程，建立 Task、Queue、Semaphore、Mutex 与 ISR 的最小可验证闭环。
+>
+> **前置知识**：第 14 章的调度概念；第 5、6、8 章的 SysTick、中断和 UART。
+>
+> **通过标准**：两个任务、一个 Queue 和一个 ISR 通知能稳定运行，并能报告堆、栈和错误原因。
+
 > FreeRTOS 的 Task、Queue、Semaphore、Mutex 是纯软件概念，API 和 SPL/HAL 无关。本章包含 API 参考 + 手动移植步骤。
 
 ---
@@ -316,6 +322,78 @@ int main(void) {
 ```
 
 > **为什么能工作**：Cortex-M3 进入 PendSV 时硬件自动压栈 r0~r3/r12/LR/PC/xPSR，`BX LR` 返回时自动弹出。你只需要保存/恢复 r4~r11（编译器约定「被调用者保存」的寄存器）。FreeRTOS 的 `port.c` 做的也是这件事，只是多了优先级查找、临界区保护、中断屏蔽。
+
+## 15.10 从“能编译”到“移植正确”的检查表
+
+手工移植最容易出现“工程能链接、上电就没有输出”。请按层检查，而不是同时修改所有宏：
+
+| 层 | 必须确认的事实 | 可观察证据 |
+|---|---|---|
+| 内核文件 | kernel、heap 实现和 Cortex-M3 GCC port 都被编译 | Makefile 编译日志含对应 `.c` |
+| 配置 | CPU 时钟、tick、堆、优先级和断言策略一致 | UART 启动日志打印关键宏 |
+| 启动向量 | SVC、PendSV、SysTick 已指向 FreeRTOS port | 启动调度器后两个任务都运行 |
+| 中断边界 | 只有合法优先级的 ISR 调用 `...FromISR` API | 连续外部中断不导致 HardFault |
+| 内存 | 每个任务有栈预算，内核堆有余量 | 高水位与剩余堆可输出 |
+
+调试构建建议启用两个 hook，而不是把内存失败静默吞掉：
+
+~~~c
+void vApplicationMallocFailedHook(void)
+{
+    taskDISABLE_INTERRUPTS();
+    /* 可在这里点亮错误 LED；调试时停住以便 GDB 查看。 */
+    for (;;);
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
+{
+    (void)task; (void)name;
+    taskDISABLE_INTERRUPTS();
+    for (;;);
+}
+~~~
+
+这段代码的目标是**暴露问题**，不是线上恢复策略。正式项目应记录错误并进入明确的安全状态。
+
+## 15.11 Queue、Semaphore、Mutex：按“所有权”选择
+
+| 需要交接的东西 | 首选 | 典型误用 |
+|---|---|---|
+| 一份完整传感器数据 | Queue | 传递指向即将失效的局部变量指针 |
+| “有新字节/按键来了”事件 | 二值信号量或任务通知 | 在 ISR 中解析整帧 |
+| 计数资源或多个事件 | 计数信号量 | 用全局计数器无保护自增 |
+| 一条共享 I2C/SPI 总线 | Mutex | 用 Mutex 保护本该排队的数据 |
+| 最新状态而非历史队列 | 长度 1 的覆盖队列或原子快照 | 无限堆积过期 UI 数据 |
+
+每一次发送都要回答：谁创建数据、谁拥有它、谁释放它、满了怎么办、超时后怎么办。这个问题比 API 名字更关键。
+
+## 15.12 分阶段实验、排错与练习
+
+按以下顺序构建，不要一次加所有 API：
+
+1. 创建两个只会打印日志并 `vTaskDelay` 的任务；
+2. 加入一个整数 Queue，生产者每秒发送，消费者打印；
+3. 加入按键 ISR，只使用 `xSemaphoreGiveFromISR` 或任务通知；
+4. 加入一个共享 I2C/SPI 接口，明确 Mutex 的持有时间；
+5. 打印 `xPortGetFreeHeapSize()` 与每个任务的 `uxTaskGetStackHighWaterMark()`。
+
+| 现象 | 优先检查 |
+|---|---|
+| `xTaskCreate` 失败 | 总堆太小、任务栈请求过大、heap 实现/链接遗漏 |
+| Queue 永远收不到 | 句柄生命周期、发送者是否真的运行、等待时间单位 |
+| ISR 一触发就 HardFault | 调用了非 FromISR API、优先级不符合配置、yield 逻辑不完整 |
+| 栈余量越来越小 | 大数组/printf/递归放在任务栈，或存在越界写 |
+| Mutex 让系统看似死锁 | 持锁后做网络/延时，或锁顺序不一致 |
+
+练习：把第 8 章 UART 接收 ISR 改为“ISR 只通知 + 任务解析”；用 UART 证明快速连续输入时既不丢失统计，也不会在 ISR 中执行耗时逻辑。
+
+## 15.13 本章要点
+
+- FreeRTOS 移植首先是向量、中断优先级、时钟和内存的系统工程；
+- Task/Queue/Semaphore/Mutex 的区别来自数据与所有权，不来自名字；
+- 先建立两个任务和一条日志，再逐步接入队列、中断和总线；
+- 堆、栈高水位和错误 hook 是最早应加入的可观测性；
+- 任何 ISR 到任务的通路都必须使用 FromISR API 并遵守优先级边界。
 
 ---
 
