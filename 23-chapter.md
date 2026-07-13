@@ -5,6 +5,8 @@
 > **前置知识**：第 20 章 TCP，以及第 22 章的配置管理。
 >
 > **用在哪**：REST API、天气查询、设备配置拉取、调试云端接口。
+>
+> **实验环境**：先用同一局域网内的教学 HTTP 服务；公网接口、DNS、HTTPS、证书和 Chunked 编码属于下一层复杂度，不能被“浏览器能打开”掩盖。
 
 ---
 
@@ -158,7 +160,75 @@ Task_ConfigFetch
 
 因此，先用本地 HTTP 服务理解协议，再根据模块文档评估 HTTPS。不能因为电脑浏览器能访问，就假定小型 AT 模块也能直接访问。
 
-## 23.10 本章要点
+## 23.10 用状态机接收 HTTP：头与 Body 可以被拆开
+
+HTTP 响应的 `\r\n\r\n` 分隔符、状态行和 Content-Length 都可能跨多个 TCP/UART 片段到达。第一版解析器应只支持自己能明确验证的子集：`HTTP/1.1` + `Content-Length`；若检测到 `Transfer-Encoding: chunked`，记录并拒绝，而不是假装 body 已完整。
+
+~~~c
+typedef enum {
+    HTTP_RX_HEADERS,
+    HTTP_RX_BODY,
+    HTTP_RX_DONE,
+    HTTP_RX_ERROR
+} HttpRxState;
+
+typedef struct {
+    HttpRxState state;
+    char headers[512];
+    size_t header_len;
+    size_t content_length;
+    size_t body_len;
+    char body[1024];
+} HttpResponse;
+
+/* 每收到一段字节就追加；找到 \r\n\r\n 后解析状态码和 Content-Length。
+   任何缓冲区不足、长度缺失或不支持的编码都进入 HTTP_RX_ERROR。 */
+~~~
+
+实现时注意四条边界：
+
+1. 所有追加都先检查缓冲区上限；
+2. `Content-Length` 只在完整头部后解析；
+3. body 可能有二进制 `\0`，不要只用 `strstr` 处理所有内容；
+4. 只有 `body_len == content_length` 时才把数据交给 JSON 层。
+
+### cJSON 的最小安全用法
+
+~~~c
+cJSON *root = cJSON_ParseWithLength(resp.body, resp.body_len);
+if (root == NULL) {
+    /* 记录解析失败和前若干字节，不打印敏感完整响应 */
+    return false;
+}
+
+cJSON *temperature = cJSON_GetObjectItemCaseSensitive(root, "temperature");
+if (!cJSON_IsNumber(temperature)) {
+    cJSON_Delete(root);
+    return false;
+}
+
+double value = temperature->valuedouble;
+cJSON_Delete(root);  /* 释放整棵树；不要保留其内部指针 */
+~~~
+
+必须同时检查“HTTP 成功”和“业务字段有效”。`200 OK` 也可能返回错误 JSON、旧配置或不是你期望的 Content-Type。
+
+### 本地 HTTP 实验
+
+1. 先让 PC 服务返回一个很短、固定 Content-Length 的 JSON；
+2. 在服务端故意把响应分两次写出，验证 STM32 不会半包解析；
+3. 改一个字段的类型（数字改字符串），确认 cJSON 校验会拒绝；
+4. 改为 Chunked 响应，确认第一版解析器明确报“不支持”，而不是读错。
+
+| 现象 | 优先检查 |
+|---|---|
+| 请求发不出去 | AT 发送长度、Host、连接状态、CRLF |
+| 状态行不完整 | TCP/UART 分段处理、接收缓存、超时 |
+| JSON 偶发失败 | body 未收全、Content-Length、缓冲区截断 |
+| 堆逐渐下降 | 忘记 `cJSON_Delete`、反复分配、错误路径没有释放 |
+| 公网可用本地失败 | DNS/TLS/证书与纯 HTTP 是不同问题 |
+
+## 23.11 本章要点
 
 - HTTP 请求先组装，再根据真实长度发送 AT+CIPSEND；
 - TCP/UART 收包不保证一次收到完整 HTTP 响应；
