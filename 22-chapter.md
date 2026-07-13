@@ -5,6 +5,8 @@
 > **前置知识**：第 21 章 MQTT。
 >
 > **用在哪**：任何需要把设备接入公有云或自建平台的项目。
+>
+> **实验边界**：本章先用公开演示 Secret 和离线测试向量验证“字节是否一致”；真实平台的字段、编码、签名算法和 TLS 能力必须以该平台官方文档为准。
 
 ---
 
@@ -145,7 +147,72 @@ wifi_credentials.h
 
 真实 Secret 只存在于本地配置或安全烧录流程中；测试向量必须使用公开的演示密钥。
 
-## 22.10 本章要点
+## 22.10 签名测试向量：先验证输入，再验证 HMAC
+
+平台接入失败时，最常见的不是“算法坏了”，而是参与签名的字节与平台规定不同。为每个平台建立一份**公开测试向量**：
+
+~~~text
+平台/协议版本：
+客户端 ID：
+设备名：
+时间戳：
+nonce：
+规范化后的待签名字符串（逐字节）：
+演示 Secret（不可用于真实设备）：
+期望 HMAC（十六进制大小写说明）：
+实际 HMAC：
+~~~
+
+在 PC 端用标准库先得到可信答案。例如下面的 Python 片段只针对演示 Secret，不接触真实密钥：
+
+~~~python
+import hmac, hashlib
+
+message = b"clientId=zet6-lab&timestamp=1700000000"
+secret  = b"demo-secret-not-for-production"
+print(hmac.new(secret, message, hashlib.sha256).hexdigest())
+~~~
+
+STM32 侧不要为了这一个项目手写 SHA-256/HMAC。选择经过审查的库或由模块/平台提供的安全能力；你要验证的是**输入字节、算法、输出编码和密钥生命周期**。
+
+### 配置接口与密钥边界
+
+~~~c
+typedef struct {
+    const char *product_id;
+    const char *device_id;
+    const uint8_t *secret;
+    size_t secret_len;
+} CloudCredentials;
+
+/* 真正的定义放在未提交的 device_config.h；
+   仓库只提交 device_config.example.h。 */
+~~~
+
+启动日志只能打印 product/device 标识和签名结果长度，绝不能打印 Secret、完整 Authorization 或含密钥的 AT 命令。
+
+### 上云前的离线验收
+
+| 检查 | 通过标准 |
+|---|---|
+| 规范化字符串 | PC 与 MCU 的长度、十六进制转储完全一致 |
+| HMAC | 对同一演示输入得到相同输出 |
+| 编码 | Base64/Hex 大小写、换行和 URL 编码符合平台规则 |
+| 时间 | 时间戳来源、时区和有效期明确 |
+| 重放 | nonce/序号或平台机制能拒绝旧请求 |
+| 版本库 | `git status` 中没有真实 Secret 或生成配置 |
+
+练习：故意只改待签名字符串中的一个 `&` 或大小写，比较两个 HMAC；你会直观看到“看起来一样的参数”为什么会导致平台拒绝。
+
+## 22.11 平台接入失败时的排错顺序
+
+1. 使用公开测试向量确认 MCU 与 PC 的 HMAC 一致；
+2. 按官方文档逐字节比较 canonical string，不要先更换 Secret；
+3. 检查时间戳、Client ID、设备名、协议版本；
+4. 查看 Broker/HTTP 返回码和平台日志；
+5. 最后才检查 TLS、证书、模块能力和网络。
+
+## 22.12 本章要点
 
 - 云平台接入的本质是“身份 + 权限 + 数据模型”；
 - 三元组中 Secret 是最敏感的信息；
