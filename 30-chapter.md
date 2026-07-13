@@ -62,7 +62,7 @@ clean:
 |---|---|
 | 固件版本 | v0.3.0 |
 | Git 提交 | 8 位短 SHA |
-| 目标板 | STM32F103VET6 |
+| 目标板 | STM32F103ZET6 |
 | 编译器 | arm-none-eabi-gcc 版本 |
 | 配置模板版本 | config-v2 |
 
