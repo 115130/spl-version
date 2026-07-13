@@ -254,7 +254,55 @@ payload: {"seq":17,"t":2534}
 
 练习：先实现 QoS 0 的一发一收；随后让 Broker 重启，记录第一次失败、退避、重新 CONNACK 和恢复发布的时间线。
 
-## 21.10 本章要点
+## 21.10 QoS 0 PUBLISH 组包与 broker 回放测试
+
+首个实验的发布可以保持 QoS 0、无 retain，但 Topic 和 payload 都必须计入 Remaining Length：
+
+~~~c
+bool Mqtt_BuildPublish(uint8_t *out, size_t cap,
+                       const char *topic,
+                       const uint8_t *payload, size_t payload_len,
+                       size_t *out_len)
+{
+    size_t topic_len = strlen(topic);
+    size_t remaining = 2 + topic_len + payload_len;
+    size_t p = 0;
+
+    if (topic_len > 0xffff) return false;
+    if (!put_u8(out, cap, &p, 0x30)) return false;  /* PUBLISH, QoS 0 */
+    if (!put_remaining_length(out, cap, &p, remaining)) return false;
+    if (!put_utf8(out, cap, &p, topic)) return false;
+    if (p + payload_len > cap) return false;
+    memcpy(out + p, payload, payload_len);
+    p += payload_len;
+    *out_len = p;
+    return true;
+}
+~~~
+
+这个函数不包含 QoS 1 的 packet identifier、retain 或认证。先把它测对，再逐项增加：
+
+| 版本 | 新增内容 | 新的验证点 |
+|---|---|---|
+| V0 | CONNECT + QoS 0 PUBLISH | CONNACK、订阅端 payload |
+| V1 | PINGREQ/PINGRESP | 空闲连接不会超时 |
+| V2 | QoS 1 | PUBACK、重复消息的 seq 处理 |
+| V3 | retain/LWT | 新订阅者与异常断线状态 |
+| V4 | 平台认证/TLS | 以官方文档和模块能力为准 |
+
+### 字节级回放测试
+
+保存一次已知正确的 CONNECT、CONNACK、PUBLISH 和 PINGRESP 十六进制序列。无需连接网络也能用它们测试：
+
+- Remaining Length 变长编码；
+- CONNACK 返回码；
+- PINGRESP 超时；
+- 多个 MQTT 包粘在同一 TCP 片段；
+- 一个 MQTT 包被拆进多个 TCP 片段。
+
+这是把“协议偶尔能连上”升级为“解析器可重复验证”的关键步骤。
+
+## 21.11 本章要点
 
 - MQTT 运行在 TCP 之上，SPL 的工作重点仍是 UART 和 AT 发送；
 - Broker 负责转发，Topic 负责组织数据，Payload 才是实际内容；
