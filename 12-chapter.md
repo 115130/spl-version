@@ -284,7 +284,7 @@ int main(void) {
 
 ### SDIO DMA 配置
 
-STM32F103 VET6/ZET6（你的板子）有 **DMA2**，SDIO 固定接 **DMA2 通道 4**：
+STM32F103ZET6（本书目标板）有 **DMA2**，SDIO 固定接 **DMA2 通道 4**：
 
 ```c
 // 512 字节的扇区 buffer
