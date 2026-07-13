@@ -228,7 +228,66 @@ cJSON_Delete(root);  /* 释放整棵树；不要保留其内部指针 */
 | 堆逐渐下降 | 忘记 `cJSON_Delete`、反复分配、错误路径没有释放 |
 | 公网可用本地失败 | DNS/TLS/证书与纯 HTTP 是不同问题 |
 
-## 23.11 本章要点
+## 23.11 用一个故意分段的教学服务验证解析器
+
+浏览器通常替你处理了分段、连接和 TLS；为了证明 STM32 解析器真的正确，使用一个故意把响应拆开的最小服务。它仅供局域网教学：
+
+~~~python
+# split_http_server.py
+import socket, time
+
+body = b'{"temperature":2534,"unit":"centi"}'
+head = (b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"Connection: close\r\n\r\n")
+
+with socket.socket() as s:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 8080))
+    s.listen(1)
+    conn, addr = s.accept()
+    with conn:
+        conn.recv(1024)       # 教学示例：忽略请求内容
+        conn.sendall(head[:23])
+        time.sleep(0.2)
+        conn.sendall(head[23:] + body[:7])
+        time.sleep(0.2)
+        conn.sendall(body[7:])
+~~~
+
+设备端必须在每个分段后保持 `HTTP_RX_HEADERS` 或 `HTTP_RX_BODY`，直到条件满足；如果只在 `read()` 后直接调用 cJSON，这个服务会稳定暴露 bug。
+
+### 请求构造也要检查边界
+
+~~~c
+int n = snprintf(request, sizeof(request),
+    "GET /config HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "Connection: close\r\n\r\n", host);
+
+if (n < 0 || (size_t)n >= sizeof(request)) {
+    /* Host 或路径太长；不要把截断请求发出去。 */
+    return false;
+}
+~~~
+
+长度检查、CRLF、Host 和 AT 发送字节数都属于同一个端到端契约。HTTP 请求文本“看起来像对的”不等于 TCP 实际发出的长度正确。
+
+### 回归用例
+
+| 用例 | 期望 |
+|---|---|
+| 头部分三段 | 不解析 JSON，直到头完整 |
+| Body 分五段 | 只在收满 Content-Length 后交给 cJSON |
+| Content-Length 大于缓冲区 | 明确报错，不越界 |
+| 返回 404 + JSON | 记录状态码，业务层不当成功 |
+| Chunked | 第一版明确拒绝或走专门实现 |
+| 字段类型变化 | `cJSON_IsNumber/String` 拒绝不匹配字段 |
+
+练习：把服务端 body 的温度字段依次改成缺失、字符串、负数和超长 JSON，记录固件的状态码、解析错误和内存行为。
+
+## 23.12 本章要点
 
 - HTTP 请求先组装，再根据真实长度发送 AT+CIPSEND；
 - TCP/UART 收包不保证一次收到完整 HTTP 响应；
