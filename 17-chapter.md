@@ -215,7 +215,66 @@ void At_PollTimeout(AtTransaction *t)
 
 练习：把第 8 章的 `stats` 命令扩展为输出 AT 成功、错误、超时、重试和 RX 溢出计数。
 
-## 17.9 本章要点
+## 17.9 把 UART 字节可靠地变成 AT 行和数据事件
+
+AT 模块通常会混合三类输出：
+
+| 输出类型 | 例子 | 应如何处理 |
+|---|---|---|
+| 命令响应 | `OK`、`ERROR`、版本文本 | 交给当前事务匹配 |
+| 异步事件 | 连接/断开、WiFi 状态变化 | 更新无线状态机 |
+| 透传/接收数据 | 模块手册规定的长度前缀或数据提示 | 按长度收取，交给网络协议层 |
+
+不要用“收到换行就一定是一条完整业务消息”的假设处理第三类。先把 UART 字节做成稳定的文本行，长度数据则按模块手册的前缀走另一条解析路径：
+
+~~~c
+typedef struct {
+    char line[128];
+    size_t used;
+    uint32_t line_overflow;
+} AtLineReader;
+
+/* 返回 true 时，out 指向以 \0 结尾的一行；
+   调用者必须在下次 Push 前消费或复制它。 */
+bool AtLineReader_Push(AtLineReader *r, uint8_t ch, const char **out)
+{
+    if (ch == '\r') return false;
+
+    if (ch == '\n') {
+        if (r->used == 0) return false;  /* 忽略空行 */
+        r->line[r->used] = '\0';
+        r->used = 0;
+        *out = r->line;
+        return true;
+    }
+
+    if (r->used + 1 >= sizeof(r->line)) {
+        r->used = 0;                     /* 丢弃过长半行，重新同步 */
+        r->line_overflow++;
+        return false;
+    }
+
+    r->line[r->used++] = (char)ch;
+    return false;
+}
+~~~
+
+这个函数只处理行，不负责理解 `+IPD` 或厂商私有数据格式。后者必须有“长度已知时收 N 字节”的状态，并与业务 TCP/MQTT/HTTP 解析分层。
+
+### AT 行处理的测试
+
+向 `AtLineReader_Push` 逐字节喂入下列序列，并检查结果：
+
+~~~text
+AT\r\nOK\r\n
+ERROR\r\n
+<127 个字符的一行>\r\n
+<超过 127 个字符的一行>\r\nOK\r\n
+~~~
+
+最后一组必须产生一次溢出计数，并且后续 `OK` 仍能重新识别。这样的字节级测试比“模块偶尔回了 OK”更能证明解析器可靠。
+
+## 17.10 本章要点
 
 - STM32 负责控制和数据，AT 模块负责无线与协议栈；
 - WiFi 更适合联网，BLE 更适合近距离低功耗连接；
