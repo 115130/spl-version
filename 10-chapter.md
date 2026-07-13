@@ -41,6 +41,133 @@ ACK：第 9 个 SCL 脉冲，从机拉低 SDA 表示「收到」
 
 常见 I2C 设备地址：SSD1306 OLED = 0x3C，AT24C02 EEPROM = 0x50。
 
+---
+
+### 10.1.5 I²C 外设的有限状态机
+
+新手写 I²C 代码最困惑的就是——"为什么地址要左移一位？" 和 "`I2C_CheckEvent` 到底在等什么？"
+
+#### ① 地址左移一位的真相
+
+I²C 总线上传输的 **7 位地址**是裸地址，不包含 R/W 位。STM32 的 I²C 外设要求你把地址**左移 1 位**，最低位填 R/W：
+
+```
+I²C 设备地址 = 0x3C（7 位）
+
+    7 位地址        R/W
+┌──┬──┬──┬──┬──┬──┬──┬──┐
+│ 0│ 1│ 1│ 1│ 1│ 0│ 0│ 0│      ← 0x3C << 1 = 0x78（写）
+└──┴──┴──┴──┴──┴──┴──┴──┘
+└──┬──┬──┬──┬──┬──┬──┘  ↑
+   裸的 7 位地址         最后 1 位 = R/W
+
+    0x78 = 写（R/W=0）
+    0x79 = 读（R/W=1）
+```
+
+所以代码里写的：
+
+```c
+I2C_Send7bitAddress(I2C1, 0x3C << 1, I2C_Direction_Transmitter);
+//                     ↑
+//                 左移一位，填入 R/W 位
+```
+
+不是 STM32 故意设计得别扭——是因为 I²C 协议在线上传输的就是 8 位（7 位地址 + 1 位 R/W），STM32 外设只是如实反映了协议定义。
+
+#### ② SPL I²C 的事件序列（有限状态机）
+
+STM32 的 I²C 外设内部是一个**有限状态机**——它不会一次性帮你完成"发起始→发地址→发数据→收应答→发停止"这一整串操作。它每完成一步，就设一个事件标志等你检查。**你的代码必须逐个等这些事件，告诉外设"继续下一步"**。
+
+以一个写操作为例，状态机跑过的状态：
+
+```
+主机写一字节到 I²C 从机的完整状态序列：
+
+CPU 写 CR1_START=1
+    │
+    ▼
+┌─────────────────────────────────┐
+│ SB（Start Bit）= 1              │ ← 起始条件已发出
+│ I2C_EVENT_MASTER_MODE_SELECT    │
+│           ↓ CPU 读 SR1 清 SB    │
+├─────────────────────────────────┤
+│ ADDR（Address Sent）= 1         │ ← 地址+R/W 已发出，收到 ACK
+│ I2C_EVENT_MASTER_TRANSMITTER    │
+│    _MODE_SELECTED               │
+│           ↓ CPU 读 SR1+SR2 清   │
+├─────────────────────────────────┤
+│ TXE（Data Register Empty）= 1   │ ← TDR 空，CPU 可以写数据
+│ I2C_EVENT_MASTER_BYTE_TRANSMITT │
+│    ING                          │
+│           ↓ CPU 写 DR           │
+├─────────────────────────────────┤
+│ BTF（Byte Transfer Finished）   │ ← 一字节已发出，收到 ACK
+│ I2C_EVENT_MASTER_BYTE_TRANSMITT │
+│    ED                           │
+│           ↓ CPU 写下一字节       │
+├─────────────────────────────────┤
+│ 重复或 CPU 写 STOP=1            │
+│           ↓                     │
+└─────────────────────────────────┘
+```
+
+所以 SPL 的 I²C 代码看起来像是在反复检查标志：
+
+```c
+void I2C_WriteByte(uint8_t dev_addr, uint8_t reg, uint8_t data) {
+    I2C_GenerateSTART(I2C1, ENABLE);                        // 发起始
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECTED));  // 等 SB
+
+    I2C_Send7bitAddress(I2C1, dev_addr << 1, I2C_Direction_Transmitter);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));  // 等 ADDR
+
+    I2C_SendData(I2C1, reg);                                // 写寄存器地址
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));  // 等 BTF
+
+    I2C_SendData(I2C1, data);                               // 写数据
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));  // 等 BTF
+
+    I2C_GenerateSTOP(I2C1, ENABLE);                         // 发停止
+}
+```
+
+**每一个 `while` 都是在等 I²C 外设状态机走到下一步。** 你不等它，下一步的动作会失效，或者上一个动作还没完成就被覆盖了。
+
+#### ③ 什么是时钟拉伸
+
+I²C 从机有一个"刹车"机制——如果从机来不及处理收到的数据，会主动把 SCL **拉低**，强制主机等待：
+
+```
+正常情况下 SCL 由主机驱动：
+主机 ──┬──┬──┬──┬──┬──┬──┬──  （主机控制 SCL 高低）
+       │  │  │  │  │  │  │
+
+从机来不及处理时，从机拉低 SCL：
+主机 ──┬──┬──┬──┬──┬─────────
+       │  │  │  │  │  ← 从机把 SCL 拉低不放
+       └──┴──┴──┴──┘
+                      └── 从机处理完了释放 SCL → 继续
+```
+
+STM32 的 I²C 外设**自动处理时钟拉伸**——硬件检测到 SCL 被拉低，就自动等待。你的代码不需要管这件事。但知道它的存在有助于你理解"为什么 I²C 上传一字节的时间不固定"。
+
+#### ④ 错误场景：NACK
+
+如果从机没收到数据（或根本不存这个地址），它会不发 ACK，即 SDA 在第 9 个 SCL 脉冲时继续保持高电平。STM32 外设此时会置 `AF`（Acknowledge Failure）标志：
+
+```c
+if (I2C_GetFlagStatus(I2C1, I2C_FLAG_AF) == SET) {
+    // 从机没有响应！
+    printf("I²C 设备无应答（地址 0x%02X）\r\n", dev_addr);
+    I2C_ClearFlag(I2C1, I2C_FLAG_AF);
+}
+```
+
+如果总线上根本没接那个设备、或者地址不对、或者接线断了，`I2C_CheckEvent` 就会一直等不到 ADDR 事件——程序卡死。所以工业代码里要么加超时，要么加 NACK 检测。
+
+---
+
 ## 10.2 SPL I2C 初始化（SSD1306 OLED）
 
 ```c
