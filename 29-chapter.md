@@ -41,10 +41,10 @@ WiFi 的 UART RX 并不自动等于可靠唤醒源。确认模块、引脚、EXT
 
 ## 29.4 一个明确的 Stop 恢复接口
 
-第 5 章应把 72 MHz 时钟配置封装为一个明确函数，例如 Clock_Init72MHz。不要在 SPL 章节中调用没有定义的 SystemClock_Config。
+第 5 章已经定义了 72 MHz 的 SystemClock_Config。低功耗章节应复用这个明确的时钟初始化函数，而不是再引入一个没有定义的新名字。
 
 ~~~c
-void Clock_Init72MHz(void);       /* 来自你的时钟驱动 */
+void SystemClock_Config(void);  /* 第 5 章的 72MHz 时钟配置 */
 void Periph_ResumeAfterStop(void); /* 重新配置依赖时钟的外设 */
 
 void EnterStopMode(void)
@@ -57,7 +57,7 @@ void EnterStopMode(void)
     PWR_EnterSTOPMode(PWR_Regulator_LowPower, PWR_STOPEntry_WFI);
 
     /* 从中断唤醒后，系统通常回到低速时钟 */
-    Clock_Init72MHz();
+    SystemClock_Config();
     Periph_ResumeAfterStop();
 }
 ~~~
