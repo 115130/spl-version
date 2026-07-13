@@ -204,7 +204,69 @@ typedef struct {
 
 练习：先把 `UNLOCK_REQUEST` 映射为 LED 闪烁，完成上表所有测试后，才考虑在受控桌面环境替换为低风险执行器。
 
-## 26.10 本章要点
+## 26.10 安全状态迁移必须可以逐步审查
+
+把状态机写成显式的“事件 + 当前状态 → 下一个状态”，不要把动作散落在 BLE 回调里：
+
+~~~c
+typedef enum {
+    DOOR_SAFE_LOCKED,
+    DOOR_AUTH_PENDING,
+    DOOR_ACTUATING,
+    DOOR_VERIFYING,
+    DOOR_FAULT
+} DoorState;
+
+typedef enum {
+    EVT_UNLOCK_REQUEST,
+    EVT_AUTH_OK,
+    EVT_AUTH_FAIL,
+    EVT_ACTUATOR_DONE,
+    EVT_TIMEOUT,
+    EVT_RESET
+} DoorEvent;
+
+/* 教学伪代码：动作由单独的执行器任务完成；
+   状态机只决定“是否允许请求”和“何时超时”。 */
+DoorState Door_Next(DoorState s, DoorEvent e)
+{
+    switch (s) {
+    case DOOR_SAFE_LOCKED:
+        return e == EVT_UNLOCK_REQUEST ? DOOR_AUTH_PENDING : s;
+    case DOOR_AUTH_PENDING:
+        if (e == EVT_AUTH_OK)   return DOOR_ACTUATING;
+        if (e == EVT_AUTH_FAIL || e == EVT_TIMEOUT) return DOOR_SAFE_LOCKED;
+        return s;
+    case DOOR_ACTUATING:
+        if (e == EVT_ACTUATOR_DONE) return DOOR_VERIFYING;
+        if (e == EVT_TIMEOUT)       return DOOR_FAULT;
+        return s;
+    case DOOR_VERIFYING:
+        return e == EVT_RESET ? DOOR_SAFE_LOCKED : s;
+    case DOOR_FAULT:
+        return e == EVT_RESET ? DOOR_SAFE_LOCKED : s;
+    }
+    return DOOR_FAULT;
+}
+~~~
+
+真实产品还需要物理反馈、权限模型、审计、异常断电策略和合规审查；本章不把这个骨架宣传为安全门锁实现。
+
+### 事件追踪与超时
+
+每次状态迁移都记录：旧状态、事件、请求 seq、新状态、tick、失败码。这样才能复盘“为什么没开”“为什么重复动作”“为什么进入 FAULT”。
+
+| 迁移 | 需要的证据 |
+|---|---|
+| 请求 → 认证 | 帧长度/CRC/seq 合法，且来源连接状态有效 |
+| 认证 → 动作 | 认证结果未过期，动作任务可用 |
+| 动作 → 验证 | 执行器反馈或受控时间窗口，不是简单 delay |
+| 任意 → FAULT | 具体超时/反馈/供电错误码 |
+| FAULT → 安全锁定 | 明确的本地恢复/受控复位，不是无线字符串 |
+
+练习：用一张状态迁移日志驱动 LED 模拟器：不发送任何 BLE 字节，只手工喂 `DoorEvent`，验证所有非法事件都不会离开安全锁定状态。
+
+## 26.11 本章要点
 
 - 锁的核心是状态机和安全边界，不是 PWM；
 - 传输层收到的数据绝不能直接变成执行动作；
