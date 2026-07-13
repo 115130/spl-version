@@ -75,7 +75,7 @@ SPL 给你底气，HAL 给你效率。两样都学了，你才是完整的嵌入
 - 1 块 DX-WF24 WiFi/BLE 模块（或 ESP8266 AT 兼容模块）
 - 1 块 HC-05 蓝牙模块
 - 传感器：DHT22、BH1750、SSD1306 OLED 屏
-- 详见附录 C
+- 硬件基线、接线和工具见 [附录 A](./appendix-a-zet6-reference.md) 与 [附录 C](./appendix-c-tools-and-measurement.md)
 
 ### 软件（全部免费，Linux 原生）
 
