@@ -1,5 +1,11 @@
 # 第 20 章 · TCP/IP 协议栈与温度记录仪
 
+> **前置知识**：第 8 章 UART、第 17 章 AT 模块、第 18 章的二进制温度包。
+>
+> **实验环境**：ZET6 + 可工作的 WiFi AT 模块 + 同一网络中的 PC；先用局域网地址和明文教学 TCP 服务，不把公网 HTTPS 问题混进本章。
+>
+> **通过标准**：设备能断线后退避重连，PC 网关能从任意分段的 `read()` 结果恢复完整业务帧。
+
 > **本章产出**：从温度记录仪项目出发，理解 TCP/IP 各层在代码中的对应关系、AT 模块内部发生了什么、网关 socket 编程的原理
 >
 > **用在哪**：项目⑤⑥⑦——MQTT、HTTP、网关的通信基础
@@ -250,7 +256,72 @@ TCP 保证字节按顺序到达，但不会替你保留 TempPacket、JSON 或 HT
 
 把 read 返回值当成“收到了一条消息”，是网络编程中最常见的初学错误。
 
-## 20.9 本章要点
+## 20.9 用重组器处理 TCP 字节流
+
+假设第 18 章的 `TempPacket` 是固定长度帧。PC 的 `read()` 可能一次返回 1 字节、15 字节或 30 字节，因此接收端必须把“读到的字节”与“完整数据包”分开：
+
+~~~c
+typedef struct {
+    uint8_t buf[TEMP_PACKET_SIZE];
+    size_t used;
+    uint32_t bad_frame_count;
+} TempReassembler;
+
+/* 每来一小段字节就调用一次；返回 true 表示产出一帧。 */
+bool TempReassembler_Feed(TempReassembler *r,
+                          const uint8_t *data, size_t n,
+                          TempPacket *out)
+{
+    while (n--) {
+        r->buf[r->used++] = *data++;
+
+        if (r->used == TEMP_PACKET_SIZE) {
+            memcpy(out, r->buf, TEMP_PACKET_SIZE);
+            r->used = 0;
+
+            if (TempPacket_IsValid(out)) return true;
+            r->bad_frame_count++;
+            /* 固定长度教学协议可以直接丢弃本帧；
+               可变长度协议需要回到 magic/length 状态机。 */
+        }
+    }
+    return false;
+}
+~~~
+
+这段代码的重点不是固定长度本身，而是接口：**任何网络层回调只喂字节；只有验证通过后才向业务层交付 Packet。**
+
+### 连接状态机和退避
+
+AT 模块会把 TCP 细节藏在固件里，但应用仍要管理自己的连接状态：
+
+~~~text
+INIT → WIFI_JOIN → TCP_OPEN → ONLINE
+               ↑                 │
+               └── BACKOFF ← ERROR/TIMEOUT
+~~~
+
+- 每个状态有超时；
+- 每次失败记录原因和次数；
+- 退避时间逐步增加并设置上限；
+- ONLINE 只在连接已确认、发送路径可用时成立；
+- 采样任务不等待连接；它只把数据交给缓冲区或 Queue。
+
+### 局域网实验与排错
+
+1. 在 PC 启动一个只收固定长度 TempPacket 的教学服务器；
+2. 让设备每秒发一帧，PC 故意把读取缓冲区改小；
+3. 断开 WiFi 或停止服务器，观察设备进入退避而不是忙等；
+4. 重启服务器，确认设备能恢复并报告重连次数。
+
+| 现象 | 优先检查 |
+|---|---|
+| TCP “已连接”但 PC 没有完整包 | UART/AT 外层接收、`+IPD` 解析、业务帧边界 |
+| PC 偶发 CRC 错 | 把多次 read 当成一帧、发送缓冲区复用、字节序 |
+| 重连风暴 | 无退避、多个任务同时重连、旧连接未清理 |
+| 断网拖慢采样 | 采样路径直接等待 AT/TCP，而不是异步交给网络任务 |
+
+## 20.10 本章要点
 
 - AT 模块帮你实现了 TCP/IP 协议栈——三次握手、重传、打包全在固件里
 - TCP 保证可靠传输，适合温度记录数据
