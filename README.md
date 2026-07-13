@@ -85,7 +85,17 @@ PART 8 · 工程实践（调试/低功耗/产品化）
 | STM32F103ZET6 开发板 | 本书唯一硬件基线（HD，512KB Flash / 64KB SRAM） |
 | ST-Link v2 | 调试烧录器 |
 | SPL 库文件 | `STM32F10x_StdPeriph_Lib_V3.5.0.zip`（ST 官网下载） |
-| 硬件套件 | 和 HAL 版一样（详见上级目录附录 C） |
+| 硬件套件 | 见 [附录 A · ZET6、供电与接线速查](./appendix-a-zet6-reference.md) |
+
+---
+
+## 📎 附录与实验支持
+
+- [附录 A · STM32F103ZET6、供电与接线速查](./appendix-a-zet6-reference.md)
+- [附录 B · 怎样读数据手册、参考手册与 SPL 头文件](./appendix-b-reference-manual-guide.md)
+- [附录 C · 调试工具与最小测量方法](./appendix-c-tools-and-measurement.md)
+- [附录 D · 全书逐章实验验收路线](./appendix-d-lab-validation.md)
+- [教材示例工程约定](./examples/README.md)
 
 ---
 
