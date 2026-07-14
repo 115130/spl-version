@@ -55,6 +55,22 @@ picocom -b 115200 /dev/ttyUSB0   # 按实际设备名替换
 
 先用轮询发送验证电平、时钟、端口和终端；轮询函数必须有超时，不能在异常线路上永久卡死。
 
+### 波特率从哪来
+
+USART 的波特率由 PCLK 分频得到，SPL 内部使用的公式是：
+
+```text
+USARTDIV = PCLK / (16 × 目标波特率)
+```
+
+对于 USART1（PCLK2 = 72MHz）配 115200：
+
+```text
+USARTDIV = 72 000 000 / (16 × 115 200) ≈ 39.0625
+```
+
+`USART_Init()` 根据 USARTDIV 算出分频系数写入寄存器。若改时钟后不重新初始化，波特率会偏移。USART2/3 使用 PCLK1，同一波特率下 USARTDIV 不同，不能直接把 USART1 的配置复制给 USART2。
+
 ```c
 #include <stdbool.h>
 #include "stm32f10x_gpio.h"

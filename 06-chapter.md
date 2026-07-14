@@ -53,6 +53,8 @@ NVIC_Init(&nvic);
 
 EXTI 有 0–15 共 16 条线。每条线一次只能选 A–G 中一个同号引脚：例如 EXTI0 可以来自 PA0 或 PB0，但不能同时来自两者。选择由 AFIO 配置，触发边沿和 pending 由 EXTI 配置。
 
+> **AFIO 是什么？** AFIO（Alternate Function IO，复用功能 IO）是 STM32F1 上的一个辅助模块，负责两件事：一是**把 GPIO 引脚连接到 EXTI 线**（即这里的 `GPIO_EXTILineConfig`），二是**重映射外设的默认引脚**（例如把 USART1 从 PA9/PA10 移到 PB6/PB7）。如果要使用 EXTI、重映射或调试 IO 配置，都必须先打开 AFIO 时钟。这就是代码中 `RCC_APB2PeriphClockCmd(..., RCC_APB2Periph_AFIO, ENABLE)` 的原因。
+
 本章采用**外接**默认实验：PA0 通过按键接 GND，MCU 开内部上拉；松开为高、按下为低，所以选择下降沿。它不是板载按键的断言，实际接线先写进 [板卡资源约定](./board-zet6-profile.md)。
 
 ```c
