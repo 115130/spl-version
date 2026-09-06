@@ -1,142 +1,82 @@
-# 第 17 章 · 无线通信基础与 AT 模块（SPL版）
+# 第 17 章 · 无线通信基础与 AT 模块（SPL 版）
 
-> **本章产出**：理解 WiFi、BLE、无线模块和 STM32 各自负责什么；能安全接入 AT 模块，并设计一个不会把主程序卡死的 AT 命令流程。
->
-> **用在哪**：第 18 章 WiFi 温度记录仪、第 19 章 BLE 温度记录仪，以及后续 MQTT、HTTP、网关项目。
->
-> **前置知识**：第 8 章 UART、第 16 章 FreeRTOS。
+这一章把外部 WiFi / BLE AT 模块接到 STM32。重点不是记某一家的 AT 命令，而是建立一条可靠路径：UART 收字节，解析文本行和长度型数据，管理当前命令事务，再把连接、断线和 Payload 交给无线任务处理。
 
----
+具体命令名、默认波特率、启动提示和数据前缀都要看手上模块的 AT 手册。本章只固定 STM32 这一侧的接收、超时和状态管理方式。
 
-## 17.1 MCU 不会自动“懂 WiFi”
+## 17.1 STM32 和无线模块各做什么
 
-STM32F103ZET6 擅长实时控制、GPIO、ADC、定时器和串口；它本身没有 WiFi 或 BLE 射频。无线功能由外部模块完成。
+STM32F103ZET6 本身没有 WiFi 或 BLE 射频。常见 AT 模块内部带无线芯片和厂商固件，STM32 通过 UART 控制它。
 
-~~~text
-传感器 → STM32（采样、控制、协议）
-              ↕ UART
-        WiFi/BLE AT 模块（联网、射频、TCP/BLE 协议）
-              ↕ 无线
-          路由器 / 手机 / 网关
-~~~
+```text
+传感器 / 按键
+      ↓
+STM32F103
+采样、控制、业务状态
+      ↕ UART
+WiFi / BLE 模块
+射频、连接和厂商 AT 协议
+      ↕
+路由器 / 手机 / 网关
+```
 
-因此，本书的重点不是让 STM32 实现完整 WiFi 协议栈，而是让它可靠地控制一个 AT 模块。
+模块内部到底承担到哪一层，取决于产品。有的 AT 固件只提供 WiFi 和 socket，有的还能处理 TLS、MQTT 或 BLE GATT。STM32 侧不要假定所有模块具有同一套能力。
 
-## 17.2 WiFi、BLE 和“是否联网”是三件事
+WiFi 和 BLE 的选择也要按实际链路决定。需要接入局域网、TCP、MQTT 或 HTTP 时通常使用 WiFi；需要手机近距离连接、广播或低频控制时常见 BLE。功耗、带宽和连接距离都与具体芯片、发射功率和工作方式有关，不用一张固定优劣表替代模块数据手册。
 
-| 特性 | WiFi | BLE |
-|---|---|---|
-| 典型对象 | 路由器、局域网、互联网 | 手机、近距离设备 |
-| 带宽 | 较高 | 较低 |
-| 功耗 | 较高 | 较低 |
-| 适合 | MQTT、HTTP、连续上报 | 手机直连、低频控制 |
-| 常见交互 | TCP/UDP socket | 广播、连接、Service/Characteristic |
+## 17.2 先确认供电和 UART
 
-选择依据不是“哪个更先进”，而是设备需要去哪里、多久发一次数据、靠电池还是外部供电。
+本章示例使用 USART2：
 
-## 17.3 AT 模块的本质
+```text
+PA2 / USART2_TX ───→ 模块 RX
+PA3 / USART2_RX ←─── 模块 TX
+GND             ───── GND
+```
 
-AT 模块把复杂的无线协议收进固件。STM32 只需经 UART 发文本命令或原始字节：
+接线前确认模块供电电压和 UART 逻辑电平。模块标注“5 V 供电”不代表 UART TX 一定输出 5 V，也不代表一定是 3.3 V；以模块原理图或数据手册为准。
 
-~~~text
-STM32                       无线模块
-  |--- AT\r\n ------------->|  探测模块
-  |<-- OK\r\n --------------|
-  |--- AT+CWJAP=... ------->|  加入 WiFi
-  |<-- WIFI CONNECTED ------|
-  |--- AT+CIPSTART=... ---->|  建 TCP
-  |<-- CONNECT -------------|
-~~~
+无线发送时电流会随芯片和射频状态变化，电源必须覆盖模块规定的峰值需求。如果模块在发射、关联 AP 或建立连接时反复复位，先测电源轨和复位脚，再检查 AT 文本。
 
-AT 命令有两个常见陷阱：
+第一次实验只做三件事：上电后记录模块启动输出，发送最简单的探测命令，读取版本信息。UART 这一层稳定以后再开始配网。
 
-- 模块返回的内容是字节流，OK、ERROR、+IPD 可能被拆成多次 UART 接收；
-- 某些命令会等待数秒，不能放在按键扫描、显示刷新或 ISR 中。
+## 17.3 AT 接口本质上还是字节流
 
-## 17.4 接线和供电先于命令
+STM32 发出：
 
-最小 UART 连接：
+```text
+AT\r\n
+```
 
-~~~text
-ZET6 USART2 TX (PA2) ───→ 模块 RX
-ZET6 USART2 RX (PA3) ←─── 模块 TX
-ZET6 GND             ───── 模块 GND
-~~~
+模块可能回：
 
-还必须确认：
+```text
+OK\r\n
+```
 
-1. 模块 TX/RX 是 3.3V 逻辑；
-2. 模块的供电电压和峰值电流满足说明书要求；
-3. WiFi 发射瞬间的电流通常高于 MCU GPIO 可提供的能力；
-4. 模块的天线区域不要被金属、杜邦线束或人体长期遮挡。
+但 UART 驱动实际收到的是一串字节。一次 DMA、一次中断或一次任务读取不保证正好对应一整行，下面几种切分都可能出现：
 
-如果“发 AT 后偶尔复位”，先怀疑供电，而不是先怀疑字符串拼错。
+```text
+"O" + "K\r\n"
+"OK\r" + "\n"
+"OK\r\nWIFI DISCONNECT\r\n"
+```
 
-## 17.5 用状态机管理 AT，而不是到处 delay
+无线模块还可能主动上报连接变化、复位提示和网络数据。因此接收路径需要先解决字节边界，再判断这些内容属于当前命令响应、异步事件还是网络 Payload。
 
-不推荐：
+## 17.4 命令要有明确事务边界
 
-~~~c
-AT_SendCmd("AT+CWJAP=\"ssid\",\"password\"");
-Delay_ms(10000);                 /* 期间系统无法做别的事 */
-AT_SendCmd("AT+CIPSTART=...");
-~~~
+不要依赖“发完命令固定等几秒”推进流程。网络环境、模块状态和错误路径都会改变响应时间。
 
-更好的模型：
+一次 AT 事务至少保存：当前状态、预期结果、截止时间和错误统计。
 
-~~~text
-IDLE → JOINING_WIFI → OPENING_TCP → CONNECTED
-  ↑          |               |           |
-  └──── timeout/error ───────┴───────────┘
-~~~
+```c
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include "FreeRTOS.h"
+#include "task.h"
 
-每个状态都应有：
-
-- 进入时发送什么；
-- 等待哪个响应；
-- 最大等待多久；
-- 超时后去哪里；
-- 日志写什么。
-
-在 FreeRTOS 中，把它放入独立的 Task_WiFi 或 Task_Radio；采样和显示任务不应该等待它。
-
-## 17.6 最小 AT 驱动接口
-
-后续章节可以统一使用以下概念接口：
-
-~~~c
-void AT_SendCmd(const char *cmd);
-bool AT_WaitResponse(const char *token, uint32_t timeout_ms);
-int  AT_SendRaw(const uint8_t *data, uint16_t len);
-void AT_ProcessRxByte(uint8_t ch);  /* UART 接收任务调用 */
-~~~
-
-函数名可以不同，但职责不要混淆：发送命令、等待状态、发送原始数据、处理接收字节应当各自独立。
-
-## 17.7 第一次无线实验
-
-在接入传感器前，先完成四步：
-
-1. 串口发送 AT，收到 OK；
-2. 读取模块版本；
-3. 连接路由器，串口记录成功或错误原因；
-4. 断电重启模块，确认状态机能回到可连接状态。
-
-只有这四步稳定后，才进入第 18 章的传感器与网关项目。
-
-## 17.8 把 AT 命令写成“可超时的事务”
-
-最常见的失败方式是：
-
-~~~c
-USART_SendString("AT+JOIN=...\r\n");
-Delay_ms(5000);          // 假定五秒后一切都成功
-USART_SendString("AT+OPEN=...\r\n");
-~~~
-
-它在网络慢、模块重启、路由器拒绝或 UART 丢字节时都会失效。把一次命令显式建模为事务：
-
-~~~c
 typedef enum {
     AT_IDLE,
     AT_WAITING,
@@ -147,143 +87,177 @@ typedef enum {
 
 typedef struct {
     AtState state;
-    const char *expect;       // 例如 "OK" 或模块手册规定的成功行
-    uint32_t deadline_tick;
+    const char *expect;
+    TickType_t deadline;
     uint32_t tx_count;
+    uint32_t error_count;
     uint32_t timeout_count;
 } AtTransaction;
+```
 
-/* UART ISR 只把字节放入环形缓冲区；
-   RadioTask 从缓冲区取出完整行，再调用 At_OnLine。 */
-bool At_Begin(AtTransaction *t, const char *cmd,
-              const char *expect, uint32_t timeout_ms)
+开始事务：
+
+```c
+static bool At_Begin(AtTransaction *t,
+                     const char *cmd,
+                     const char *expect,
+                     TickType_t timeout)
 {
-    if (t->state == AT_WAITING) return false;
+    if (t == NULL || cmd == NULL || expect == NULL)
+        return false;
 
-    Uart_Write(cmd);          // 这里复用第 8 章的非阻塞发送接口
-    Uart_Write("\r\n");
+    if (t->state == AT_WAITING)
+        return false;
+
+    if (!RadioUart_WriteLine(cmd))
+        return false;
+
     t->expect = expect;
-    t->deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    t->deadline = xTaskGetTickCount() + timeout;
     t->state = AT_WAITING;
-    t->tx_count++;
+    ++t->tx_count;
     return true;
 }
+```
 
-void At_OnLine(AtTransaction *t, const char *line)
-{
-    if (t->state != AT_WAITING) return;
-    if (strstr(line, t->expect) != NULL) t->state = AT_OK;
-    else if (strstr(line, "ERROR") != NULL ||
-             strstr(line, "FAIL")  != NULL) t->state = AT_ERROR;
-}
+收到完整文本行后再更新当前事务：
 
-void At_PollTimeout(AtTransaction *t)
+```c
+static void At_OnLine(AtTransaction *t, const char *line)
 {
-    if (t->state == AT_WAITING &&
-        (int32_t)(xTaskGetTickCount() - t->deadline_tick) >= 0) {
-        t->state = AT_TIMEOUT;
-        t->timeout_count++;
+    if (t == NULL || line == NULL || t->state != AT_WAITING)
+        return;
+
+    if (strcmp(line, t->expect) == 0) {
+        t->state = AT_OK;
+        return;
+    }
+
+    if (strcmp(line, "ERROR") == 0 || strcmp(line, "FAIL") == 0) {
+        ++t->error_count;
+        t->state = AT_ERROR;
     }
 }
-~~~
+```
 
-示例只展示事务边界；具体成功文本、连接流程、`+IPD` 格式和配置命令必须按你手上模块的 AT 手册填写。不要把 ESP8266 的命令直接当作所有 WiFi/BLE 模块的协议。
+这里用完整行比较，避免等待 `OK` 时把某个更长文本里的两个字符误判成成功。具体模块如果成功响应不是独立的 `OK` 行，就按它的协议定义更明确的匹配规则。
 
-### 一次命令的验收日志
+超时检查：
 
-对每次事务输出统一日志，而不是只打印原始 AT 文本：
+```c
+static void At_PollTimeout(AtTransaction *t)
+{
+    if (t == NULL || t->state != AT_WAITING)
+        return;
 
-~~~text
-[radio] tx=AT
-[radio] rx=OK
-[radio] state=OK elapsed=12ms
-[radio] tx=JOIN ...
-[radio] state=TIMEOUT elapsed=8000ms retry_in=2000ms
-~~~
+    if ((int32_t)(xTaskGetTickCount() - t->deadline) >= 0) {
+        ++t->timeout_count;
+        t->state = AT_TIMEOUT;
+    }
+}
+```
 
-这样才能区分“命令没有发出”“模块没有回”“回了错误”“超时后没有重试”。
+超时值属于每条命令的策略。简单的 `AT` 探测和加入 WiFi 的等待时间通常不会相同，应该按模块手册和实际测试分别设置。
 
-### 无线模块的故障预算
+## 17.5 RadioTask 管理连接状态
 
-| 故障 | 任务的正确反应 |
-|---|---|
-| 单条 AT 超时 | 记录、停止等待、按限速策略重试 |
-| 模块回 ERROR | 保留错误行；不要继续假装已连接 |
-| 模块突然重启 | 回到 BOOT/AT 探测状态，重新建立网络 |
-| 路由器断网 | 本地采样继续；网络任务进入退避 |
-| UART 缓冲区溢出 | 记录丢失，丢弃半帧并重新同步 |
+AT 事务只表示“一条命令有没有完成”，网络连接还需要更高一层状态机。例如 WiFi 模块可以维护：
 
-练习：把第 8 章的 `stats` 命令扩展为输出 AT 成功、错误、超时、重试和 RX 溢出计数。
+```text
+BOOT
+  ↓
+PROBING
+  ↓
+JOINING_AP
+  ↓
+OPENING_SOCKET
+  ↓
+ONLINE
+```
 
-## 17.9 把 UART 字节可靠地变成 AT 行和数据事件
+任一阶段发生超时、`ERROR`、模块复位或异步断线事件，都要进入明确的恢复路径。不要在某条命令失败后继续执行下一条并保留“已连接”状态。
 
-AT 模块通常会混合三类输出：
+在 FreeRTOS 中，这套状态机放进独立的 `RadioTask`。SensorTask 继续采样，DisplayTask 继续显示；网络断线只影响无线任务和需要联网的数据队列。
 
-| 输出类型 | 例子 | 应如何处理 |
-|---|---|---|
-| 命令响应 | `OK`、`ERROR`、版本文本 | 交给当前事务匹配 |
-| 异步事件 | 连接/断开、WiFi 状态变化 | 更新无线状态机 |
-| 透传/接收数据 | 模块手册规定的长度前缀或数据提示 | 按长度收取，交给网络协议层 |
+重试也要限速。连续失败时可以逐步增加等待时间，例如 1 s、2 s、4 s，再限制到某个最大值。具体退避参数由产品需求决定，重点是避免断网时用紧循环持续发 AT、刷日志和占用 CPU。
 
-不要用“收到换行就一定是一条完整业务消息”的假设处理第三类。先把 UART 字节做成稳定的文本行，长度数据则按模块手册的前缀走另一条解析路径：
+## 17.6 文本行解析器
 
-~~~c
+很多 AT 响应以 CRLF 结束，可以先把普通文本字节整理成完整行。
+
+```c
+#include <stddef.h>
+
 typedef struct {
     char line[128];
     size_t used;
+    bool discard_until_eol;
     uint32_t line_overflow;
 } AtLineReader;
 
-/* 返回 true 时，out 指向以 \0 结尾的一行；
-   调用者必须在下次 Push 前消费或复制它。 */
-bool AtLineReader_Push(AtLineReader *r, uint8_t ch, const char **out)
+static bool AtLineReader_Push(AtLineReader *r,
+                              uint8_t ch,
+                              const char **out)
 {
-    if (ch == '\r') return false;
+    if (r == NULL || out == NULL)
+        return false;
+
+    if (ch == '\r')
+        return false;
 
     if (ch == '\n') {
-        if (r->used == 0) return false;  /* 忽略空行 */
+        if (r->discard_until_eol) {
+            r->discard_until_eol = false;
+            r->used = 0U;
+            return false;
+        }
+
+        if (r->used == 0U)
+            return false;
+
         r->line[r->used] = '\0';
-        r->used = 0;
         *out = r->line;
+        r->used = 0U;
         return true;
     }
 
-    if (r->used + 1 >= sizeof(r->line)) {
-        r->used = 0;                     /* 丢弃过长半行，重新同步 */
-        r->line_overflow++;
+    if (r->discard_until_eol)
+        return false;
+
+    if (r->used + 1U >= sizeof r->line) {
+        ++r->line_overflow;
+        r->used = 0U;
+        r->discard_until_eol = true;
         return false;
     }
 
     r->line[r->used++] = (char)ch;
     return false;
 }
-~~~
+```
 
-这个函数只处理行，不负责理解 `+IPD` 或厂商私有数据格式。后者必须有“长度已知时收 N 字节”的状态，并与业务 TCP/MQTT/HTTP 解析分层。
+过长行出现后，解析器会一直丢到下一个换行符，再开始收新行。这样不会把超长行的后半段误认成一条独立 AT 响应。
 
-### AT 行处理的测试
+可以先在 PC 侧给这个函数做字节级测试：正常 `OK\r\n`、空行、127 字节边界、超长行后紧跟一个正常 `OK\r\n`。最后一种情况必须只增加一次 overflow，并正确恢复后续行。
 
-向 `AtLineReader_Push` 逐字节喂入下列序列，并检查结果：
+## 17.7 文本行和网络 Payload 要分开
 
-~~~text
-AT\r\nOK\r\n
-ERROR\r\n
-<127 个字符的一行>\r\n
-<超过 127 个字符的一行>\r\nOK\r\n
-~~~
+有些模块会用类似下面的格式上报网络数据：
 
-最后一组必须产生一次溢出计数，并且后续 `OK` 仍能重新识别。这样的字节级测试比“模块偶尔回了 OK”更能证明解析器可靠。
+```text
++IPD,5:HELLO
+```
 
-## 17.10 同一 UART 上的两类数据：AT 行与长度型 Payload
+这里的 `HELLO` 是长度为 5 的 Payload。实际前缀、连接 ID 和格式由模块 AT 固件定义，这里只用它说明解析边界。
 
-`OK`、`ERROR` 和 `>` 可以按行处理；常见模块的 `+IPD,<length>:` 一类上报却表示“后面紧跟 N 个原始字节”。两者不能共用一个“读到换行就结束”的解析器。不同 AT 固件的前缀、连接 ID 和命令集可能不同，以下把 `+IPD` 仅作为**常见模式**，实际格式必须以模块手册为准。
+Payload 可能包含 `\r\n`、`OK`、零字节和任意二进制内容。进入 Payload 状态后，必须按声明长度接收固定字节数，不能继续用行解析器或 `strstr()` 判断内容。
 
-推荐把 UART 接收结果拆成两种事件：
+接收器可以定义这些事件：
 
-~~~c
+```c
 typedef enum {
-    AT_EVENT_LINE,       /* "OK"、"ERROR"、厂商文本响应 */
-    AT_EVENT_PAYLOAD,    /* 已收满且长度明确的原始 TCP/UDP 字节 */
+    AT_EVENT_LINE,
+    AT_EVENT_PAYLOAD,
     AT_EVENT_OVERFLOW,
     AT_EVENT_RESYNC
 } AtEventType;
@@ -293,49 +267,89 @@ typedef struct {
     const uint8_t *data;
     uint16_t length;
 } AtEvent;
-~~~
+```
 
-解析器至少有三个状态：
+内部至少需要三个状态：
 
-~~~text
+```text
 TEXT
-  ├─ 普通 CRLF 行 → AT_EVENT_LINE
-  └─ 识别到长度型前缀 → READ_LENGTH
+  ├── 普通 CRLF 行 → AT_EVENT_LINE
+  └── 长度型前缀 → READ_LENGTH
+
 READ_LENGTH
-  ├─ 数字合法且不超过缓冲区 → READ_PAYLOAD
-  └─ 非法/超长 → 丢弃到可识别边界，计数并重新同步
+  ├── 长度合法 → READ_PAYLOAD
+  └── 长度非法/过大 → 记录错误并重新同步
+
 READ_PAYLOAD
-  └─ 恰好收满 N 字节 → AT_EVENT_PAYLOAD → TEXT
-~~~
+  └── 收满 N 字节 → AT_EVENT_PAYLOAD → TEXT
+```
 
-这条边界解决一个关键问题：Payload 可以包含 `\r\n`、`OK`、零字节甚至看起来像 AT 命令的文本；它们在收满 N 字节前都只是数据。不要用 `strstr()` 或字符串 API 处理二进制 Payload。
+Payload 长度必须有上限。模块声明的长度超过本地缓冲能力时，可以丢弃指定字节数、关闭当前连接或重置解析器，具体策略要明确，并留下 `payload_oversize` 计数。
 
-### 请求、非请求消息与模块复位
+如果声明了 N 字节但只收到一部分，解析器也需要 Payload 超时。超时后丢弃半包并重新同步，不能无限停在 READ_PAYLOAD。
 
-AT 控制任务同一时刻只保留一条“正在等待的命令事务”：命令文本、预期响应、截止 tick 和失败处理。`WIFI DISCONNECT`、`ready`、入站 Payload 等非请求事件必须另路分发，不能被当前事务误认成 `OK`。
+## 17.8 异步事件不能归到当前命令里
 
-建议为解析器统计 `line_overflow`、`payload_oversize`、`payload_timeout`、`module_reset` 和 `unsolicited_event`。测试时把下面序列按 1 字节、随机切分和整段三种方式喂入，结果应一致：
+模块可能在等待某条命令时主动发送：
 
-~~~text
-AT\r\nOK\r\n
-+IPD,5:HELLO
-+IPD,7:A\r\nOK\0B
-ready\r\n
-<声明 512 字节但只到 10 字节后超时>
-~~~
+```text
+WIFI DISCONNECT
+ready
+CLOSED
+```
 
-最后一例必须丢弃半包、增加超时计数，并让下一条 `AT\r\nOK\r\n` 重新可识别。
+这些行不一定属于当前事务。解析完整行后，先分类：当前命令的响应交给 `AtTransaction`；连接变化、模块复位等交给 `RadioTask` 状态机；网络 Payload 交给后面的 TCP / MQTT / HTTP 层。
 
-## 17.11 本章要点
+模块出现 `ready` 一类启动提示时，应认为原先的连接和命令上下文已经失效，清理当前事务并重新探测模块。不要只增加一条日志，然后继续沿用旧的 ONLINE 状态。
 
-- STM32 负责控制和数据，AT 模块负责无线与协议栈；
-- WiFi 更适合联网，BLE 更适合近距离低功耗连接；
-- UART 是字节流，AT 响应需要状态机而不是固定延时；
-- 模块供电、GND、电平和峰值电流与代码同样重要；
-- 无线连接必须作为可失败、可超时、可重连的后台任务。
+建议至少记录这些统计：
 
----
+```c
+typedef struct {
+    uint32_t command_ok;
+    uint32_t command_error;
+    uint32_t command_timeout;
+    uint32_t line_overflow;
+    uint32_t payload_oversize;
+    uint32_t payload_timeout;
+    uint32_t module_reset;
+    uint32_t uart_overflow;
+} RadioStats;
+```
 
-[上一章：第 16 章 · FreeRTOS 实战](./16-chapter.md)
+这些计数能区分“UART 已经丢字节”“模块明确回错”“网络命令超时”和“模块自己重启”。
 
-[下一章：第 18 章 · 温度记录仪 WiFi 版](./18-chapter.md)
+## 17.9 第一次配网怎么验收
+
+先不要接传感器和 MQTT。按下面顺序验证无线模块：
+
+1. 上电后捕获完整启动日志，确认 UART 波特率和模块复位行为。
+2. 连续发送多次基础探测命令，确认每次都有明确成功、错误或超时结果。
+3. 读取版本信息并保存到调试日志，后续排查 AT 命令差异时知道当前固件版本。
+4. 加入一个已知可用的 AP，记录成功响应和实际连接事件。
+5. 关闭 AP 或输错密码，确认状态机会退出等待并进入限速重试。
+6. 模块重新上电，确认 `RadioTask` 能从 BOOT 重新走完整流程。
+
+如果模块支持 socket，再加一项：建立 TCP 连接后从 PC 发送包含 `\r\n` 和 `OK` 字样的 Payload，确认它仍被当作二进制数据交给上层，不会误触发 AT 事务。
+
+## 17.10 排错顺序
+
+完全没有响应时，先检查供电、共地、TX/RX、波特率和模块启动输出。能收到乱码时再检查双方帧格式和实际串口时钟。
+
+基础 `AT` 稳定但配网经常失败时，保留模块返回的完整错误行，检查 SSID、密码、频段、信号和固件命令集。不要把所有失败统一变成一个 `false`。
+
+运行一段时间后解析异常时，看 UART overflow、line overflow 和 payload timeout。底层已经丢字节时，上层状态机无法恢复原始数据，只能重新同步并报告本次消息丢失。
+
+## 17.11 练习
+
+1. 给 `AtLineReader_Push()` 写一组 PC 单元测试，覆盖正常行、空行、超长行和溢出后的重新同步。
+2. 实现一个最小 `+IPD,<len>:` 解析器，Payload 中放入 `OK\r\n`，验证它不会被命令事务消费。
+3. 给 `RadioTask` 增加模块复位事件。收到 `ready` 后取消当前事务，并重新进入 PROBING。
+4. 实现限速重试，连续五次配网失败时把每次实际等待间隔打印出来。
+5. 扩展第 8 章的 `STATUS` 命令，输出 `RadioStats` 中的错误、超时和溢出计数。
+
+完成这一章后，无线模块已经有一条明确的数据路径：UART 只负责字节，解析器负责行和 Payload 边界，AT 事务负责单条命令，RadioTask 负责连接状态。下一章再把温度数据接进这条链路。
+
+> **上一章**：[第 16 章 · FreeRTOS 实战](./16-chapter.md)
+>
+> **下一章**：[第 18 章 · 温度记录仪 WiFi 版](./18-chapter.md)
