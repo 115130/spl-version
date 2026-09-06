@@ -1,178 +1,16 @@
-# 第 24 章 · 网关架构与 UART 接收通路（SPL版）
+# 第 24 章 · 网关架构与 UART 接收通路（SPL 版）
 
-> **本章产出**：把“串口收到字节”变成可维护的网关数据通路；能区分 ISR、驱动层、协议层和应用层各自该做什么。
->
-> **前置知识**：第 8 章 UART、中断与环形缓冲区，以及第 21–23 章的网络协议。
->
-> **用在哪**：WiFi AT 模块、BLE 模块、RS485 设备和最终多协议网关。
+这一章把“UART 收到字节”整理成一条可维护的数据通路：ISR 只搬运字节，ParserTask 负责解帧，协议适配器生成统一事件，后面的规则、显示、存储和网络任务只处理事件。
 
----
+前面已经分别做过 AT、HTTP、MQTT 和自定义二进制帧。本章不再讲新的协议，重点是这些协议同时存在时，怎样避免它们把串口、缓冲区和任务关系搅在一起。
 
-## 24.1 网关不是“把数据原样转发”
+## 24.1 网关内部先统一数据模型
 
-一个网关至少做四件事：
+不同设备在线路上使用不同协议，但应用层没必要保留这些差异。例如 Modbus 温度、BLE 遥测和本地传感器最终都可以转成统一事件：
 
-1. 接收不同接口的数据；
-2. 检查协议是否合法；
-3. 转换为统一的内部数据模型；
-4. 决定上报、缓存、告警或下发控制。
+```c
+#define GATEWAY_PAYLOAD_MAX 32U
 
-例如，Modbus 温度寄存器、BLE 广播包和 WiFi JSON 不应在整个程序里到处出现。它们应该在各自的适配器中被转换成统一的 SensorEvent。
-
-~~~c
-typedef struct {
-    uint32_t seq;
-    int16_t  temperature_centi;
-    uint16_t humidity_centi;
-    uint8_t  source;
-} SensorEvent;
-~~~
-
-业务任务只处理 SensorEvent，不需要知道数据来自 UART、I2C 还是 BLE。
-
-## 24.2 四层结构
-
-~~~text
-硬件层        GPIO / USART / DMA / 中断
-驱动层        uart_at.c / rs485.c / ble_uart.c
-协议适配层    mqtt_adapter.c / modbus_adapter.c / json_adapter.c
-应用层        规则、告警、显示、上报、存储
-~~~
-
-层与层之间通过明确的函数接口或 FreeRTOS Queue 交互。这样替换 WiFi 模块时，不会牵连温度计算和 OLED 页面。
-
-## 24.3 中断只搬运字节，不解析协议
-
-UART 接收中断的职责应尽量小：读出硬件寄存器，把字节放进缓冲区，然后立刻返回。不要在 ISR 中做 JSON 解析、等待 AT 响应或访问网络。
-
-~~~c
-void USART2_IRQ_Init(void)
-{
-    NVIC_InitTypeDef nvic;
-
-    USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
-
-    nvic.NVIC_IRQChannel = USART2_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 2;
-    nvic.NVIC_IRQChannelSubPriority = 0;
-    nvic.NVIC_IRQChannelCmd = ENABLE;
-    NVIC_Init(&nvic);
-}
-
-void USART2_IRQHandler(void)
-{
-    if (USART_GetITStatus(USART2, USART_IT_RXNE) != RESET) {
-        uint8_t ch = (uint8_t)USART_ReceiveData(USART2);
-        RingBuffer_PutFromISR(&wifi_rx_ring, ch);
-    }
-}
-~~~
-
-RingBuffer_PutFromISR 必须是无阻塞的：缓冲区满了时只记录溢出计数，不能在 ISR 里等待空间。
-
-## 24.4 从字节流到一条消息
-
-驱动任务从环形缓冲区取字节，交给状态机。以 AT 响应为例：
-
-~~~text
-字节流 → 行缓冲区 → 识别 OK / ERROR / > / +IPD → 发送事件
-~~~
-
-对于自定义二进制协议，则可能是：
-
-~~~text
-寻找帧头 → 读取长度 → 累积 Payload → 校验 CRC → 产生 SensorEvent
-~~~
-
-关键原则：协议状态必须保存在任务或解析器对象中，不能依赖“这次 read 一定恰好读到一整帧”。
-
-## 24.5 Queue 是网关的边界
-
-一个典型的数据流：
-
-~~~text
-UART ISR
-  → RingBuffer
-  → Task_ProtocolParser
-  → Queue_SensorEvent
-  → Task_RuleEngine
-  → Queue_CloudPublish / Task_Display / Task_SDLog
-~~~
-
-这样可以分别观察“串口丢字节”“CRC 错误”“云端发送失败”属于哪一层，而不是只看到一个模糊的“设备没反应”。
-
-## 24.6 同一串口不要同时承担互斥角色
-
-有些 WiFi/BLE 二合一模块通过同一 UART 工作，但并不意味着程序可以同时把它当作两个独立设备。请先确认模块固件是否支持并发模式。
-
-如果不支持，选择其中一种设计：
-
-- 为 WiFi 和 BLE 各分配一个 UART；
-- 使用模块明确提供的多路复用协议；
-- 用状态机切换模式，并明确切换期间哪些服务不可用。
-
-把 AT 响应和 BLE 业务数据混在没有边界的同一缓冲区中，是后期最难排查的问题之一。
-
-## 24.7 可观测性
-
-每个适配器至少统计：
-
-| 指标 | 用来发现什么 |
-|---|---|
-| rx_bytes | 线路是否真的有数据 |
-| rx_overflow | 环形缓冲区是否太小 |
-| frame_crc_error | 接线、波特率或协议问题 |
-| reconnect_count | 网络稳定性 |
-| publish_fail_count | Broker 或认证问题 |
-
-定期通过调试串口输出这些统计，比只打印“连接失败”有用得多。
-
-## 24.8 本章练习
-
-1. 用 USART2 接收一行 AT 响应，并在任务中识别 OK；
-2. 故意降低任务优先级，观察环形缓冲区溢出计数；
-3. 把一个 Modbus 温度值转换成 SensorEvent；
-4. 给每个层级添加一条可开关的调试日志。
-
-## 24.9 队列容量、背压与故障隔离
-
-Queue 不是无限大的“消息中间件”。每个队列都应回答：
-
-1. 谁生产、谁消费；
-2. 平均生产速度和峰值速度是多少；
-3. 队列满时丢旧数据、丢新数据、覆盖最新值还是阻塞；
-4. 如何统计溢出；
-5. 一个适配器故障时是否会拖慢其他适配器。
-
-例如显示任务只需要最新温度时，可用长度为 1 的覆盖队列；日志任务则需要保留顺序，队列满时应记录丢失数量或写入本地错误状态。
-
-## 24.10 为网关写可重复的字节流测试
-
-网关最难的 bug 往往不在“完整帧一次到达”的情况。为每个协议适配器准备脱离硬件的输入序列：
-
-~~~c
-/* 伪代码：同一帧以不同切分方式喂给解析器，结果必须相同。 */
-FeedBytes(parser, frame, 1);               /* 1 + N-1 */
-FeedBytes(parser, frame + 1, frame_len-1);
-
-for (size_t i = 0; i < frame_len; ++i)     /* 每次 1 字节 */
-    FeedBytes(parser, frame + i, 1);
-
-FeedBytes(parser, noise, noise_len);       /* 噪声后重新同步 */
-FeedBytes(parser, bad_crc, bad_crc_len);   /* 错误帧不交给应用层 */
-~~~
-
-每个测试都检查：
-
-- 只产出一次合法 `GatewayEvent`；
-- 错误帧增加正确的错误计数；
-- 半帧超时后可以重新同步；
-- Queue 满时策略符合设计（丢新、丢旧、覆盖或限速）；
-- 一个适配器失败不让其他协议的事件停摆。
-
-### 事件与可观测性的最小契约
-
-~~~c
 typedef struct {
     uint32_t seq;
     uint32_t tick;
@@ -180,80 +18,124 @@ typedef struct {
     uint16_t type;
     uint16_t length;
     uint16_t error_flags;
-    uint8_t payload[32];
+    uint8_t payload[GATEWAY_PAYLOAD_MAX];
 } GatewayEvent;
-~~~
+```
 
-`GatewayEvent` 不需要一开始就承载所有业务字段，但至少应能回答：“哪台设备、何时、什么事件、数据是否可信、是否丢过包”。日志输出同样遵循这个结构，而不是散落的字符串。
+`source` 标识数据来自哪台设备或哪个适配器，`type` 表示温度、状态、命令等事件类型，`error_flags` 保存协议层已经确认的错误状态。业务任务只处理 `GatewayEvent`，不直接读取 UART RingBuffer，也不自己解析 Modbus 或 AT 文本。
 
-### 硬件到应用层的联调顺序
+如果某类数据有固定字段，也可以在适配器里转换成更具体的 `SensorEvent`。关键是协议字节只存在于适配器边界内，不让应用层到处依赖原始帧格式。
 
-1. UART ISR 只统计字节，确认波特率和溢出为零；
-2. RingBuffer 只输出十六进制，确认输入字节顺序；
-3. Parser 只输出有效/无效帧统计；
-4. Queue 只打印 `GatewayEvent` 的 seq/source/type；
-5. 最后才把事件交给 MQTT/HTTP/本地规则。
+## 24.2 UART 接收路径
 
-| 现象 | 优先检查 |
-|---|---|
-| 解析器偶发吞帧 | 字节切分、长度字段、重同步、超时 |
-| 队列满但没有统计 | 满队列策略没有显式处理 |
-| 同一帧被处理两次 | seq/状态机未在交付后复位 |
-| AT 数据与业务 UART 混在一起 | 端口职责不清、没有协议/任务边界 |
-| 一种设备异常拖慢全网关 | 适配器直接互调、缺少超时和故障隔离 |
+一条典型的数据流是：
 
-## 24.11 用速率和容量设计 Queue，而不是猜一个数字
+```text
+USART RXNE / DMA
+      ↓
+RingBuffer（字节）
+      ↓
+ParserTask（帧）
+      ↓
+协议适配器（事件）
+      ↓
+GatewayQueue
+      ↓
+RuleTask / NetworkTask / LogTask / DisplayTask
+```
 
-队列长度不是“越大越好”。先写出最坏情况下的输入、输出和可接受延迟：
+这四层处理的数据单位分别是字节、帧、事件和业务动作。问题也可以按层定位：RingBuffer overflow 是接收通路来不及消费；CRC error 是帧或物理链路问题；GatewayQueue full 是事件消费速度不足；MQTT publish failure 则属于网络层。
 
-~~~text
-生产速率：每秒 20 个事件，突发 100 个
-消费速率：正常每秒 30 个，网络异常时每秒 0 个
-允许等待：遥测最多 5 秒，控制命令最多 200ms
-策略：遥测可覆盖，控制必须 ACK/拒绝，日志要记录丢失
-~~~
+不要用一个“大接收数组”同时承担这几层职责。数组看起来省代码，但一旦出现半帧、多个来源和网络阻塞，就很难判断哪些字节属于谁。
 
-粗略容量至少应覆盖“最大突发 + 消费恢复前的净积压”。但 RAM 固定时，正确动作通常不是无限加大 Queue，而是**降低输入、合并事件、覆盖过期遥测或把错误显式报告给上层**。
+## 24.3 ISR 只搬运数据
 
-### 串口到 Queue 的参考边界
+USART2 接收中断可以保持很短：
 
-~~~text
-USART ISR
-  └─ RingBuffer（字节；固定大小；只做读写指针）
-       └─ ParserTask（帧；长度/CRC/超时）
-            └─ GatewayQueue（事件；有背压策略）
-                 └─ RuleTask / NetworkTask / LogTask
-~~~
+```c
+void USART2_IRQ_Init(void)
+{
+    NVIC_InitTypeDef nvic;
 
-四层的数据单位不同：字节、帧、事件、业务动作。把它们混成一个大数组，是网关后期最难排的错误来源。
+    USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
 
-### 压力测试记录
+    nvic.NVIC_IRQChannel = USART2_IRQn;
+    nvic.NVIC_IRQChannelPreemptionPriority = 2U;
+    nvic.NVIC_IRQChannelSubPriority = 0U;
+    nvic.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&nvic);
+}
 
-每次压力测试至少输出：
+void USART2_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART2, USART_IT_RXNE) != RESET) {
+        uint8_t byte = (uint8_t)USART_ReceiveData(USART2);
 
-~~~text
-source=modbus rx_bytes=... valid=... crc_err=... timeout=...
-source=ble    rx_bytes=... valid=... drop=...
-queue=gateway used_max=... full=... policy=drop_old
-network=... reconnect=... last_error=...
-~~~
+        if (!RingBuffer_PutFromISR(&wifi_rx_ring, byte))
+            ++wifi_rx_overflow;
+    }
+}
+```
 
-练习：给一个来源加入 1 秒的突发 200 字节，同时让网络消费者暂停 2 秒。解释每层分别积压了什么、哪一层丢弃了什么、错误计数为什么能定位责任。
+`RingBuffer_PutFromISR()` 不能等待空间。缓冲区满时记录丢弃并返回；JSON、CRC、AT 响应匹配和 Queue 操作都留给任务上下文。
 
-## 24.12 一个受限的二进制帧解析器：边界、重同步与并发所有权
+USART 错误位也需要按第 8 章的规则处理。生产代码应记录 ORE、FE、NE、PE 等接收错误，避免只统计“收到多少字节”，却不知道线路已经发生过硬件级错误。
 
-下面不是某个真实设备的协议，而是一份可用于单元测试的**教学帧契约**。先约束输入，才有资格把字节交给上层：
+如果后面把 RX 改成 DMA，ISR 的形式会变化，但分层不变：DMA 只负责把字节搬进内存，ParserTask 仍然承担协议边界和校验。
 
-~~~text
+## 24.4 RingBuffer 先明确所有权
+
+最简单可靠的模型是单生产者/单消费者：USART ISR 只推进 `head`，ParserTask 只推进 `tail`。这种情况下，代码可以很小，且每个索引只有一个写入者。
+
+```text
+USART2 ISR  ──唯一生产者──> RingBuffer ──唯一消费者──> ParserTask
+```
+
+这个约束一旦改变，设计就要一起改变。如果第二个 ISR、DMA 回调或其他任务也写同一个 RingBuffer，就需要临界区、同步原语或重新拆缓冲区；`volatile` 不能把多生产者结构变成线程安全。
+
+RingBuffer 满时的策略也要固定。本章对 UART 原始字节选择“丢新字节并计数”，因为覆盖旧字节会破坏当前正在解析的帧，而且上层必须知道字节流已经不完整。ParserTask 看到 overflow 计数变化后，可以放弃当前候选帧并重新同步。
+
+## 24.5 容量先按速率估算
+
+UART 115200、8N1 每个字节在线路上需要 10 bit，因此连续满速接收的理论上限约为：
+
+```text
+115200 / 10 = 11520 byte/s
+```
+
+如果 ParserTask 最坏有 50 ms 没有运行，仅这段时间就可能积压：
+
+```text
+11520 × 0.050 ≈ 576 byte
+```
+
+这还没有包含模块突发、调度抖动和处理余量。此时 64 或 128 字节 RingBuffer 显然不足；可以增大缓冲、减少任务阻塞、使用 DMA/流控，或者降低输入速率。
+
+这个估算只针对连续满速 UART。真实 AT 模块往往是突发输出，因此还要实际测量最大 burst。最终容量应由“最坏积压 + 允许余量”决定，再检查 SRAM 是否接受。
+
+## 24.6 ParserTask 按字节流维护状态
+
+ParserTask 从 RingBuffer 取字节，并把解析状态保存在对象里。AT 模块可以解析成文本行、长度型 Payload 和异步事件；自定义二进制协议则按帧头、长度和 CRC 前进。
+
+协议状态不能依赖“一次任务循环正好拿到一整帧”。同一帧可能被拆成几十次输入，多帧也可能已经连续排在 RingBuffer 中。
+
+本章用一个教学二进制帧说明：
+
+```text
 A5 | 5A | type | length | payload[length] | crc8
-              0…32 字节
-~~~
+              length = 0...32
+```
 
-解析器状态只保留当前候选帧，不直接碰 Queue：
+解析器状态：
 
-~~~c
+```c
 typedef enum {
-    FIND_A5, FIND_5A, READ_TYPE, READ_LENGTH, READ_PAYLOAD, READ_CRC
+    FIND_A5,
+    FIND_5A,
+    READ_TYPE,
+    READ_LENGTH,
+    READ_PAYLOAD,
+    READ_CRC
 } FrameState;
 
 typedef struct {
@@ -263,40 +145,153 @@ typedef struct {
     uint8_t used;
     uint8_t payload[32];
     uint32_t last_byte_tick;
-    uint32_t bad_length, bad_crc, timeout;
+
+    uint32_t bad_length;
+    uint32_t bad_crc;
+    uint32_t timeout;
 } FrameParser;
-~~~
+```
 
-处理规则应写成测试，而不是藏在一个巨大的 `if` 中：
+处理规则固定下来：
 
-1. `length > sizeof(payload)`：增加 `bad_length`，立即回到 `FIND_A5`；
-2. 收到合法 CRC：只产生一次完整事件，随后回到 `FIND_A5`；
-3. CRC 错：增加 `bad_crc`，扫描后续字节重新找帧头；
-4. 任一半帧超过规定 tick：增加 `timeout`，放弃候选帧；
-5. 每次交付前复制数据或转成值类型 `GatewayEvent`，不把解析器内部数组指针交给 Queue。
+- `length > sizeof(payload)`：增加 `bad_length`，放弃当前候选帧；
+- Payload 收满后读取 CRC，校验成功才交付一次事件；
+- CRC 错时增加 `bad_crc`，重新寻找帧头；
+- 半帧超过规定超时，增加 `timeout` 并复位状态；
+- 交付时复制到 `GatewayEvent`，不把 `parser->payload` 指针直接交给 Queue。
 
-### RingBuffer 的单生产者/单消费者约束
+最后一点关系到生命周期。ParserTask 收下一帧时会立刻改写内部数组，Queue 如果只保存这个数组地址，消费者读到的内容可能已经属于另一帧。
 
-`USART ISR` 作为唯一生产者、`ParserTask` 作为唯一消费者时，可以让 ISR 只推进 `head`，任务只推进 `tail`。索引应为对齐的无符号整数，缓冲区大小固定；ISR 满时只加丢弃计数。这个约定**只适用于单生产者/单消费者**：
+## 24.7 重同步要写进协议实现
 
-- 第二个 ISR、DMA 回调或任务也要写入同一 RingBuffer 时，必须重新设计所有权并用临界区/同步原语保护；
-- 任务读取统计值时，要接受它是一个瞬时快照，而不是“精确事务日志”；
-- 不要把 `volatile` 当成多生产者线程安全的替代品。
+解析器出错后不能假设下一个字节一定是新帧开头。以 `A5 5A` 为 magic 的协议，可以逐字节重新寻找候选帧头。
 
-### 计算容量时写出单位
+还要处理一个细节：在等待第二个 magic 字节时，如果又收到 `A5`，它可能已经是下一个帧头的第一个字节。状态机可以继续保持在 `FIND_5A`，而不是无条件退回 `FIND_A5`，这样能减少丢失合法起点的机会。
 
-例如 UART 115200、8N1 的理论接收约为每秒 11520 字节。若解析任务最坏会被其他工作阻塞 50ms，光是这段时间就可能积压约 576 字节；再加上模块突发、处理抖动和可接受丢包策略，才能决定 RingBuffer 是 512、1024 还是需要降速/流控。这个算式比“先给 64 字节试试”更接近工程设计。
+RingBuffer 发生 overflow 后，当前帧的完整性已经无法保证。ParserTask 应把它当成输入流损坏事件，增加统计并复位解析状态，而不是继续使用剩余的半帧。
 
-## 24.13 本章要点
+## 24.8 从帧转换成统一事件
 
-- 网关的价值是协议适配和统一数据模型，而不是简单转发；
-- ISR 只搬运字节，解析必须放在任务上下文；
-- UART 中断还需要配置 NVIC，只有 USART_ITConfig 不够；
-- RingBuffer、状态机、Queue 共同解决“字节流没有消息边界”的问题；
-- 可观测性是网关长期稳定运行的一部分。
+协议解析成功后，再做语义转换。例如某个温度帧：
 
----
+```c
+static bool Adapter_ToSensorEvent(const FrameParser *frame,
+                                  GatewayEvent *event)
+{
+    if (frame->type != 0x01U || frame->length != 4U)
+        return false;
 
-[上一章：第 23 章 · HTTP、响应解析与 cJSON](./23-chapter.md)
+    event->source = SOURCE_RS485_SENSOR_1;
+    event->type = EVENT_TEMPERATURE;
+    event->length = 4U;
+    event->error_flags = 0U;
+    memcpy(event->payload, frame->payload, 4U);
+    return true;
+}
+```
 
-[下一章：第 25 章 · 综合项目一：智能环境监测节点](./25-chapter.md)
+更完整的适配器还会检查设备地址、量程、状态位和单位，并把线路协议里的单位转换成项目统一单位。完成转换后，后面的 MQTT、显示和日志任务就不需要知道原始帧长什么样。
+
+如果协议包含设备自己的 sequence，可以保留到 `GatewayEvent.seq`；没有 sequence 时，也可以由网关为已验证事件生成本地递增序号，方便日志定位，但不要把它解释成远端设备的原始序号。
+
+## 24.9 GatewayQueue 需要背压策略
+
+Queue 满说明事件生产速度暂时超过了消费速度。每条 Queue 都要明确“满了怎么办”。
+
+实时显示通常只需要最新值，可以使用长度 1 的 overwrite Queue。历史日志需要保持顺序，可以选择丢新或丢旧并明确计数。控制命令如果不能接受静默丢弃，应在入口处拒绝并返回 busy/error，而不是塞进已经满的 Queue。
+
+例如普通遥测队列选择丢新事件：
+
+```c
+if (xQueueSend(gateway_queue, &event, 0U) != pdPASS)
+    ++gateway_queue_drop_new;
+```
+
+网络异常期间消费者可能长时间停止。如果项目要求保留数小时历史，RAM Queue 不适合承担这个任务，应把第 13 章的 SD/NOR 持久化日志接到数据流中。
+
+## 24.10 多种协议不能争用同一物理接口
+
+同一个 UART 只能有一个明确所有者。某些 WiFi/BLE 组合模块可以在固件内部复用功能，但 MCU 侧仍要按模块协议区分 AT 响应、异步事件和业务 Payload。
+
+如果 WiFi 和 BLE 是两个独立模块，优先给它们独立 UART。如果硬件资源不够，需要外部复用器或模式切换，就把“当前谁拥有 UART”写成状态机，并在切换前清理未完成事务。
+
+不要让两个 Task 同时直接操作同一个 USART 的 DR、RingBuffer 或 AT 状态机。第 17 章已经把 AT 模块收进单一通信任务，本章继续使用同样的所有权规则。
+
+## 24.11 可观测性按层记录
+
+每层至少保留与自己职责相关的计数：
+
+```c
+typedef struct {
+    uint32_t rx_bytes;
+    uint32_t uart_error;
+    uint32_t ring_overflow;
+    uint32_t valid_frames;
+    uint32_t bad_length;
+    uint32_t bad_crc;
+    uint32_t frame_timeout;
+    uint32_t event_drop;
+} GatewayStats;
+```
+
+网络任务另外记录 reconnect、publish failure、认证错误等指标，不要把它们混进 UART parser 统计。
+
+压力测试时可以输出：
+
+```text
+source=wifi rx=12450 uart_err=0 ring_drop=0 frame_ok=381 crc_err=0
+source=rs485 rx=8200 uart_err=0 ring_drop=14 frame_ok=196 crc_err=3
+queue=gateway full=7 drop_new=7
+network reconnect=2 publish_fail=5
+```
+
+这些数字能直接说明问题发生在哪一层。如果 `ring_drop` 已经增加，后面的 CRC 错很可能只是上游丢字节的结果；不要只盯着 CRC 算法。
+
+## 24.12 字节流测试脱离硬件运行
+
+每个 Parser 都应该有可重复的输入测试。同一个合法帧至少用几种切分方式喂入：
+
+```c
+FeedBytes(parser, frame, frame_len);          /* 一次全部 */
+
+for (size_t i = 0; i < frame_len; ++i)
+    FeedBytes(parser, frame + i, 1U);         /* 每次 1 字节 */
+
+FeedBytes(parser, frame, 3U);                 /* 任意切分 */
+FeedBytes(parser, frame + 3U, frame_len - 3U);
+```
+
+再加入噪声、错误 CRC、非法长度、半帧超时、两个连续帧和 `A5 A5 5A...` 这类重同步边界。不同切分方式最终产生的合法事件序列应该一致。
+
+还要单独测试 Queue 满。解析器是否正确与 Queue 是否能接收是两个问题；合法帧仍应计入 `valid_frames`，随后事件交付失败再增加 `event_drop`。
+
+## 24.13 联调顺序
+
+硬件联调按数据层次往上走：
+
+1. 只统计 USART 收到的字节和硬件错误，确认波特率、接线和电气层。
+2. 从 RingBuffer 输出有限的十六进制样本，确认没有丢字节和乱序。
+3. 打开 Parser，只看 valid / bad CRC / timeout 计数。
+4. 转成 `GatewayEvent`，打印 `seq/source/type/length`。
+5. 最后再连接 MQTT、HTTP、规则和存储任务。
+
+如果一种设备异常导致整个网关停住，优先检查协议适配器里是否存在无超时等待、共享锁是否持有过久，以及某个 Queue 是否使用了无限阻塞发送。
+
+## 24.14 本章完成标准
+
+完成下面这些测试后，UART 接收通路才算真正建立：
+
+- ISR 中没有协议解析和阻塞等待；
+- RingBuffer 有明确的单生产者/单消费者所有权；
+- 在目标波特率和最大 burst 下，缓冲容量经过计算和实测；
+- Parser 能处理任意字节切分、连续帧、错误帧和半帧超时；
+- RingBuffer overflow 后会放弃损坏的候选帧并重新同步；
+- Queue 满有固定策略和计数；
+- 一种协议或网络任务失败时，其他来源还能继续产生事件；
+- UART、Parser、Queue、网络四层统计可以分别查看。
+
+这条数据通路在后面的综合项目中继续复用。新接一种设备时，只增加对应的驱动和协议适配器，不重新发明 UART 接收框架。
+
+> **上一章**：[第 23 章 · HTTP、响应解析与 cJSON](./23-chapter.md)
+>
+> **下一章**：[第 25 章 · 综合项目一：智能环境监测节点](./25-chapter.md)
