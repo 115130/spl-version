@@ -1,77 +1,50 @@
-# 第 21 章 · MQTT：让设备持续发布数据（SPL版）
+# 第 21 章 · MQTT：让设备持续发布数据（SPL 版）
 
-> **本章产出**：理解 Broker、Client、Topic、QoS 的职责；能在已有的 WiFi AT + TCP 通道上完成一次 MQTT CONNECT 和 PUBLISH。
->
-> **前置知识**：第 18 章的 WiFi AT 封装，以及第 20 章的 TCP 连接。
->
-> **用在哪**：环境监测节点、云端数据上报、多协议网关。
->
-> **实验环境**：已验证的 WiFi AT + TCP 通道和一个你可控制的教学 Broker；第一轮使用局域网/测试账号，不把真实云端密钥写进固件。
->
-> **通过标准**：先收到正确的 CONNACK，再看到本地订阅端收到带递增序号的 PUBLISH；断开 Broker 后能退避重连。
+第 20 章已经把温度记录仪接到 TCP 服务端。本章在同一条 WiFi AT + TCP 通道上加入 MQTT 3.1.1，先完成 CONNECT、CONNACK、QoS 0 PUBLISH 和 Keep Alive，再讨论 QoS 1、retain 和遗嘱消息。
 
----
+第一轮实验使用自己能控制的教学 Broker 和测试账号。真实平台的认证、TLS、证书和时间同步留到后续章节处理。
 
-## 21.1 为什么不继续直接发 TCP 包
+## 21.1 MQTT 在现有链路里增加了什么
 
-第 20 章中，温度记录仪已经能通过 TCP 把 TempPacket 发给自己的 PC 网关。这种方式很适合学习协议和局域网调试，但它有一个限制：每个设备都必须知道服务器地址、端口和自定义包格式。
+直接使用 TCP 时，设备和 PC 网关共同约定第 18 章的二进制帧。MQTT 在 TCP 字节流上增加 Broker、Topic 和控制报文，让发布者与订阅者不需要直接建立彼此的连接。
 
-MQTT 把这件事拆开：
+本章只需要记住四个对象：
 
-| 角色 | 做什么 | 你可以把它想成 |
-|---|---|---|
-| Client | 发布或订阅消息的设备、程序 | 温度记录仪、手机、PC 程序 |
-| Broker | 接收消息并转发给订阅者 | 邮局 |
-| Topic | 消息的主题路径 | 邮件地址 |
-| Payload | 真正传递的数据 | 信件内容 |
+- **Client**：连接 Broker 的设备或程序；STM32 和 PC 订阅工具都属于 Client。
+- **Broker**：接受 Client 连接，并按 Topic 转发消息。
+- **Topic**：消息的主题名，例如 `lab/zet6-01/telemetry`。
+- **Payload**：Topic 下实际携带的字节，可以是文本、JSON 或二进制。
 
-设备只需要说“把这条消息发布到 sensors/room1/temperature”，Broker 决定把它转给哪些订阅者。这样，设备不必知道手机或网页在哪里。
+Broker 解决的是消息路由。设备仍然要处理 WiFi、TCP、MQTT 会话、缓存和重连；Broker 也不会自动保证一条业务命令只执行一次。
 
-## 21.2 第一套 Topic 设计
+## 21.2 先固定 Topic
 
-Topic 一旦被很多设备使用，就很难随意改名。先把结构设计清楚：
+本章使用下面几个 Topic：
 
-~~~text
-school-lab/
-  room-01/
-    temperature
-    humidity
-    status
-    command
-~~~
+```text
+lab/zet6-01/telemetry
+lab/zet6-01/status
+lab/zet6-01/command
+```
 
-建议把“遥测数据”和“控制命令”分开：
+`telemetry` 发布温湿度和 `seq`，`status` 发布在线状态和错误信息，`command` 留给后续控制实验。设备密钥、WiFi 密码等凭据不要放进 Topic 或普通遥测 Payload。
 
-| Topic | 方向 | 例子 |
-|---|---|---|
-| school-lab/room-01/temperature | 设备 → 云 | 24.6 |
-| school-lab/room-01/status | 设备 → 云 | online |
-| school-lab/room-01/command | 云 → 设备 | led=on |
+多个设备接入时，把设备标识放在 Topic 的固定层级，例如 `lab/<device-id>/telemetry`。Topic 是应用协议的一部分，手机、网关和云端都可能依赖它，改名时需要一起升级这些组件。
 
-不要把 WiFi 密码、设备密钥或调试日志直接放在 Topic 或 Payload 中。
+## 21.3 MQTT 字节通过第 20 章的 TCP 通道发送
 
-## 21.3 复用第 18 章的 AT + TCP 通道
+对 STM32 来说，MQTT 报文就是一段二进制数据。AT 命令和 MQTT 数据必须分开：先用 `AT+CIPSEND=<len>` 进入发送阶段，再原样发送 MQTT 字节，不能让命令发送函数自动追加 `\r\n`。
 
-MQTT 不是新的无线协议。对 STM32 来说，它只是“通过已建立的 TCP 连接发送另一种格式的字节流”。
-
-先确认下面三件事已经能工作：
-
-1. WiFi 模块能连上路由器；
-2. AT+CIPSTART 已经建立到 Broker 的 TCP 连接；
-3. 你能发送原始字节，并等待模块返回 SEND OK。
-
-下面的函数只展示发送层的职责。AT_SendCmd、AT_WaitResponse 和 UART 原始发送函数应来自第 18 章的 WiFi 驱动。
-
-~~~c
+```c
 static int TCP_SendRaw(const uint8_t *data, uint16_t len)
 {
     char cmd[32];
 
-    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u", (unsigned)len);
+    snprintf(cmd, sizeof cmd, "AT+CIPSEND=%u", (unsigned)len);
     AT_SendCmd(cmd);
-    if (!AT_WaitResponse(">", 5000)) {
+
+    if (!AT_WaitResponse(">", 5000U))
         return -1;
-    }
 
     for (uint16_t i = 0; i < len; ++i) {
         while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET) {
@@ -79,276 +52,296 @@ static int TCP_SendRaw(const uint8_t *data, uint16_t len)
         USART_SendData(USART2, data[i]);
     }
 
-    return AT_WaitResponse("SEND OK", 10000) ? 0 : -1;
+    return AT_WaitResponse("SEND OK", 10000U) ? 0 : -1;
 }
-~~~
+```
 
-这段代码的重点是：原始 MQTT 字节不能被 AT_SendCmd 自动追加回车换行。AT 命令和 MQTT 报文是两段不同的数据。
+这里的 5 s 和 10 s 都是实验超时策略，要按模块手册和实际网络环境调整。`SEND OK` 只表示模块接受并完成了它定义的发送流程，不能把它当成 Broker 已处理 MQTT 报文的证明。MQTT 层仍要等待 CONNACK、PUBACK 等对应协议事件。
 
-## 21.4 CONNECT：向 Broker 说“我来了”
+实际工程还应避免让多个任务同时调用这类 AT 发送函数。第 17、18 章已经把无线模块所有权集中到通信任务，本章继续沿用这个边界。
 
-一个 MQTT CONNECT 报文包含四类信息：
+## 21.4 CONNECT 和 CONNACK
 
-| 字段 | 用途 |
-|---|---|
-| 固定头 | 表示这是 CONNECT 报文 |
-| 协议名和版本 | 常见的是 MQTT 3.1.1 |
-| 连接标志 | 是否保留会话、是否有用户名密码等 |
-| Client ID | 此次连接的设备身份 |
+TCP 连接建立后，MQTT Client 首先发送 CONNECT。MQTT 3.1.1 的 CONNECT 包含协议名、协议级别、连接标志、Keep Alive，以及 Client ID 等 Payload 字段。
 
-学习阶段先使用短 Client ID 和短报文。MQTT 的 Remaining Length 使用可变长度编码；当报文小于 128 字节时，课堂示例只需一个字节，但正式驱动必须实现完整编码。
+本章第一版使用：
 
-连接流程如下：
+```text
+Protocol:      MQTT 3.1.1
+Clean Session: 1
+Username:      无
+Password:      无
+Will:          无
+Client ID:     zet6-01
+```
 
-~~~text
-STM32                  Broker
-  |---- CONNECT ------->|
-  |<--- CONNACK --------|
-  |---- PUBLISH ------->|
-~~~
+下面的辅助函数按 MQTT 的网络字节序写 16 位长度，并实现 Remaining Length 的可变长度编码：
 
-收到 CONNACK 前，不要开始发布业务数据。若 Broker 拒绝连接，应把返回码打印到调试串口，而不是盲目重试。
-
-## 21.5 PUBLISH：把温度变成一条消息
-
-发布一条 QoS 0 温度消息至少需要：
-
-1. 固定头：PUBLISH + QoS 0；
-2. Topic 长度和 Topic 字节；
-3. Payload，例如 24.6 或一个 JSON 对象。
-
-课堂上的第一个目标可以非常小：
-
-~~~text
-Topic:   school-lab/room-01/temperature
-Payload: 24.6
-QoS:     0
-~~~
-
-QoS 0 的含义是“尽力而为”。它适合频繁的温度采样，但不适合开锁、继电器断电等不能丢的控制命令。控制类消息至少要设计确认、超时和幂等性，不能只依赖一次 PUBLISH。
-
-## 21.6 断线与重连
-
-物联网设备一定会遇到断线：路由器重启、信号弱、Broker 升级、服务器证书过期都可能发生。把重连放进一个独立任务，而不是散落在每个传感器任务里。
-
-~~~text
-未连接 → 建立 TCP → CONNECT → 已连接
-   ↑                         |
-   └──── 超时/发送失败 ───────┘
-~~~
-
-建议的最小策略：
-
-- 连续失败时逐步拉长重试间隔，避免每毫秒刷 AT 命令；
-- 重新连接成功后先发布 status=online；
-- 每次发送失败都保留一条可读日志；
-- 业务数据是否缓存到 SD 卡，由项目需求决定。
-
-## 21.7 本章练习
-
-1. 用 PC 上的 MQTT 客户端订阅 school-lab/room-01/#；
-2. 让 STM32 每 10 秒发布一次温度；
-3. 断开路由器 30 秒，再恢复网络，观察设备是否能重连；
-4. 给每条上报数据加入 seq 字段，检查是否有重复或缺失。
-
-## 21.8 QoS、会话与遗嘱消息
-
-最小 PUBLISH 只是 MQTT 的起点。项目设计时还应知道：
-
-| 功能 | 作用 | 入门项目建议 |
-|---|---|---|
-| QoS 0 | 尽力发送，不确认 | 高频温度遥测可使用 |
-| QoS 1 | 至少送达一次，可能重复 | 重要告警需处理重复 |
-| retain | Broker 保留最后一条消息 | 可用于最后状态 |
-| Keep Alive | 定期证明连接仍活着 | 设定超时和重连 |
-| LWT 遗嘱 | 异常断线时由 Broker 发布离线状态 | 用于 status Topic |
-| 持久会话 | 重连后恢复订阅 | 根据 RAM/模块能力选择 |
-
-所有这些能力都依赖具体 Broker 和 AT 模块的 TCP 稳定性。先完成 QoS 0 + 明确重连，再逐步增加复杂性。
-
-## 21.9 最小 MQTT 3.1.1 报文：先能看懂，再交给 AT 发送
-
-MQTT 的 TCP 连接成功不等于 MQTT 连接成功。第一包必须是 CONNECT，Broker 返回成功 CONNACK 后才能 PUBLISH。下面是一个**只用于首个实验**的 CONNECT 组包器：它使用 Clean Session、无用户名密码，且缓冲区大小受限；生产环境还要按平台要求加入认证、TLS 与完整错误处理。
-
-~~~c
-static bool put_u8(uint8_t *b, size_t cap, size_t *p, uint8_t v)
+```c
+static bool put_u8(uint8_t *buf, size_t cap, size_t *pos, uint8_t value)
 {
-    if (*p >= cap) return false;
-    b[(*p)++] = v;
+    if (*pos >= cap)
+        return false;
+
+    buf[(*pos)++] = value;
     return true;
 }
 
-static bool put_u16(uint8_t *b, size_t cap, size_t *p, uint16_t v)
+static bool put_u16_be(uint8_t *buf, size_t cap, size_t *pos, uint16_t value)
 {
-    return put_u8(b, cap, p, (uint8_t)(v >> 8)) &&
-           put_u8(b, cap, p, (uint8_t)v);
+    return put_u8(buf, cap, pos, (uint8_t)(value >> 8)) &&
+           put_u8(buf, cap, pos, (uint8_t)value);
 }
 
-static bool put_utf8(uint8_t *b, size_t cap, size_t *p, const char *s)
+static bool put_utf8(uint8_t *buf, size_t cap, size_t *pos, const char *text)
 {
-    size_t n = strlen(s);
-    if (n > 0xffff) return false;
-    if (!put_u16(b, cap, p, (uint16_t)n)) return false;
-    while (*s) if (!put_u8(b, cap, p, (uint8_t)*s++)) return false;
+    size_t len = strlen(text);
+
+    if (len > UINT16_MAX)
+        return false;
+    if (!put_u16_be(buf, cap, pos, (uint16_t)len))
+        return false;
+    if (*pos + len > cap)
+        return false;
+
+    memcpy(buf + *pos, text, len);
+    *pos += len;
     return true;
 }
 
-/* MQTT Remaining Length 是变长编码，不能只写一个字节。 */
-static bool put_remaining_length(uint8_t *b, size_t cap, size_t *p, size_t n)
+static bool put_remaining_length(uint8_t *buf, size_t cap,
+                                 size_t *pos, size_t value)
 {
+    if (value > 268435455U)
+        return false;
+
     do {
-        uint8_t byte = n % 128;
-        n /= 128;
-        if (n) byte |= 0x80;
-        if (!put_u8(b, cap, p, byte)) return false;
-    } while (n);
+        uint8_t encoded = (uint8_t)(value % 128U);
+        value /= 128U;
+
+        if (value != 0U)
+            encoded |= 0x80U;
+        if (!put_u8(buf, cap, pos, encoded))
+            return false;
+    } while (value != 0U);
+
     return true;
 }
+```
 
+CONNECT 组包器可以写成：
+
+```c
 bool Mqtt_BuildConnect(uint8_t *out, size_t cap,
-                       const char *client_id, uint16_t keep_alive,
+                       const char *client_id,
+                       uint16_t keep_alive,
                        size_t *out_len)
 {
     size_t id_len = strlen(client_id);
-    size_t remaining = 10 + 2 + id_len;  /* variable header + payload */
-    size_t p = 0;
+    size_t remaining;
+    size_t pos = 0U;
 
-    if (!put_u8(out, cap, &p, 0x10)) return false;  /* CONNECT */
-    if (!put_remaining_length(out, cap, &p, remaining)) return false;
-    if (!put_u16(out, cap, &p, 4)) return false;
-    if (!put_u8(out, cap, &p, 'M') || !put_u8(out, cap, &p, 'Q') ||
-        !put_u8(out, cap, &p, 'T') || !put_u8(out, cap, &p, 'T')) return false;
-    if (!put_u8(out, cap, &p, 4)) return false;     /* MQTT 3.1.1 */
-    if (!put_u8(out, cap, &p, 0x02)) return false;  /* Clean Session */
-    if (!put_u16(out, cap, &p, keep_alive)) return false;
-    if (!put_utf8(out, cap, &p, client_id)) return false;
-    *out_len = p;
+    if (id_len > UINT16_MAX)
+        return false;
+
+    /* variable header 10 字节；payload 是 2 字节长度 + Client ID。 */
+    remaining = 10U + 2U + id_len;
+
+    if (!put_u8(out, cap, &pos, 0x10U)) return false;
+    if (!put_remaining_length(out, cap, &pos, remaining)) return false;
+    if (!put_u16_be(out, cap, &pos, 4U)) return false;
+
+    if (!put_u8(out, cap, &pos, 'M') ||
+        !put_u8(out, cap, &pos, 'Q') ||
+        !put_u8(out, cap, &pos, 'T') ||
+        !put_u8(out, cap, &pos, 'T'))
+        return false;
+
+    if (!put_u8(out, cap, &pos, 4U)) return false;     /* protocol level */
+    if (!put_u8(out, cap, &pos, 0x02U)) return false;  /* Clean Session */
+    if (!put_u16_be(out, cap, &pos, keep_alive)) return false;
+    if (!put_utf8(out, cap, &pos, client_id)) return false;
+
+    *out_len = pos;
     return true;
 }
-~~~
+```
 
-CONNACK 的最小成功帧是 `20 02 00 00`：固定头 `0x20`、剩余长度 2、会话标志 0、返回码 0。收到其他返回码时，记录它并停止业务发送；不要把“TCP 已连接”当作“Broker 已接受”。
+对于这组参数，成功的 MQTT 3.1.1 CONNACK 是 `20 02 00 00`。第三个字节是 Session Present，第四个字节是返回码。只有返回码为 0 才进入 MQTT 在线状态；其他返回码应记录下来，再按错误类型处理认证、Client ID 或 Broker 配置。
 
-### 第一条 PUBLISH 和 Keep Alive
+不要只用 `memcmp(buf, "\x20\x02\x00\x00", 4)` 处理所有接收情况。TCP 和 AT 外层都可能拆包或粘包，MQTT 接收器仍需要按字节流解析。
 
-QoS 0 的 PUBLISH 固定头为 `0x30`。Remaining Length 后先写 Topic 的 UTF-8 长度和内容，再写 payload。第一轮实验可以发送短文本：
+## 21.5 QoS 0 PUBLISH
 
-~~~text
-topic:   lab/zet6-01/telemetry
-payload: {"seq":17,"t":2534}
-~~~
+第一条遥测消息使用 QoS 0：
 
-每条 payload 加 `seq`，这样订阅端能分辨重连、重复和丢失。Keep Alive 到期前发送 PINGREQ（`C0 00`），等待 PINGRESP（`D0 00`）；超时则回到第 17 章的 BACKOFF 状态。
+```text
+Topic:   lab/zet6-01/telemetry
+Payload: {"seq":17,"t":2534}
+```
 
-### Broker 实验与排错
+`2534` 表示 25.34 °C，与前面章节使用的摄氏度百分之一单位保持一致。Payload 中继续保留业务 `seq`，订阅端可以据此发现缺失、重复或重连后的跳变。
 
-在你控制的 PC 上启动一个教学 Broker，并用独立终端订阅 `lab/#`。不要以公开 Broker 或真实产品账号作为第一站。
+QoS 0 PUBLISH 的固定头是 `0x30`。Topic 长度、Topic 和 Payload 都计入 Remaining Length：
 
-| 现象 | 优先检查 |
-|---|---|
-| TCP 建好但没有 CONNACK | CONNECT Remaining Length、协议名/级别、Client ID、认证要求 |
-| CONNACK 返回拒绝码 | Broker 权限、Client ID 冲突、用户名/密码或平台规则 |
-| 订阅端没有 PUBLISH | Topic 拼写、PUBLISH 长度、AT 发送的字节数、是否等待 ONLINE |
-| 很快断线 | Keep Alive、无线稳定性、模块 TCP 状态、重连风暴 |
-| 数据重复 | QoS 1 或重连重发；用 seq 在应用层幂等处理 |
-
-练习：先实现 QoS 0 的一发一收；随后让 Broker 重启，记录第一次失败、退避、重新 CONNACK 和恢复发布的时间线。
-
-## 21.10 QoS 0 PUBLISH 组包与 broker 回放测试
-
-首个实验的发布可以保持 QoS 0、无 retain，但 Topic 和 payload 都必须计入 Remaining Length：
-
-~~~c
-bool Mqtt_BuildPublish(uint8_t *out, size_t cap,
-                       const char *topic,
-                       const uint8_t *payload, size_t payload_len,
-                       size_t *out_len)
+```c
+bool Mqtt_BuildPublishQos0(uint8_t *out, size_t cap,
+                           const char *topic,
+                           const uint8_t *payload, size_t payload_len,
+                           size_t *out_len)
 {
     size_t topic_len = strlen(topic);
-    size_t remaining = 2 + topic_len + payload_len;
-    size_t p = 0;
+    size_t remaining;
+    size_t pos = 0U;
 
-    if (topic_len > 0xffff) return false;
-    if (!put_u8(out, cap, &p, 0x30)) return false;  /* PUBLISH, QoS 0 */
-    if (!put_remaining_length(out, cap, &p, remaining)) return false;
-    if (!put_utf8(out, cap, &p, topic)) return false;
-    if (p + payload_len > cap) return false;
-    memcpy(out + p, payload, payload_len);
-    p += payload_len;
-    *out_len = p;
+    if (topic_len > UINT16_MAX)
+        return false;
+    if (payload_len > 268435455U - 2U - topic_len)
+        return false;
+
+    remaining = 2U + topic_len + payload_len;
+
+    if (!put_u8(out, cap, &pos, 0x30U)) return false;
+    if (!put_remaining_length(out, cap, &pos, remaining)) return false;
+    if (!put_utf8(out, cap, &pos, topic)) return false;
+    if (pos + payload_len > cap) return false;
+
+    memcpy(out + pos, payload, payload_len);
+    pos += payload_len;
+
+    *out_len = pos;
     return true;
 }
-~~~
+```
 
-这个函数不包含 QoS 1 的 packet identifier、retain 或认证。先把它测对，再逐项增加：
+QoS 0 没有 PUBACK。`TCP_SendRaw()` 返回成功以后，本地没有 MQTT 级确认能证明 Broker 已接收这条 PUBLISH。对于周期遥测，可以接受这种语义，并通过后续样本继续更新状态。
 
-| 版本 | 新增内容 | 新的验证点 |
-|---|---|---|
-| V0 | CONNECT + QoS 0 PUBLISH | CONNACK、订阅端 payload |
-| V1 | PINGREQ/PINGRESP | 空闲连接不会超时 |
-| V2 | QoS 1 | PUBACK、重复消息的 seq 处理 |
-| V3 | retain/LWT | 新订阅者与异常断线状态 |
-| V4 | 平台认证/TLS | 以官方文档和模块能力为准 |
+## 21.6 Keep Alive 需要状态，不是定时无条件发 PINGREQ
 
-### 字节级回放测试
+CONNECT 中的 Keep Alive 是客户端与 Broker 的 MQTT 会话参数。客户端必须保证相邻 MQTT Control Packet 的发送间隔不超过 Keep Alive；Broker 在约 1.5 倍 Keep Alive 时间内没有收到客户端控制报文时，可以断开连接。
 
-保存一次已知正确的 CONNECT、CONNACK、PUBLISH 和 PINGRESP 十六进制序列。无需连接网络也能用它们测试：
+因此 PUBLISH 本身也会刷新发送活动时间。只有连接空闲、接近 Keep Alive 边界时才需要发送 PINGREQ：
 
-- Remaining Length 变长编码；
-- CONNACK 返回码；
-- PINGRESP 超时；
-- 多个 MQTT 包粘在同一 TCP 片段；
-- 一个 MQTT 包被拆进多个 TCP 片段。
+```text
+MQTT_ONLINE
+  ├─ 正常发送 PUBLISH ─────────────→ 更新 last_tx
+  ├─ 空闲接近 Keep Alive ──────────→ PINGREQ → WAIT_PINGRESP
+  ├─ 收到 PINGRESP ────────────────→ MQTT_ONLINE
+  └─ TCP/MQTT 超时或协议错误 ─────→ BACKOFF
+```
 
-这是把“协议偶尔能连上”升级为“解析器可重复验证”的关键步骤。
+PINGREQ 是 `C0 00`，PINGRESP 是 `D0 00`。PINGRESP 超时意味着当前会话不能继续信任，应关闭旧连接并进入统一的重连流程。
 
-## 21.11 为 MQTT 明确“已实现的子集”与接收状态机
+Keep Alive 为 0 时，协议不要求这种保活检查。本章实验建议使用非零值，并记录 `last_tx`、最后一次 PINGREQ 时间和 PINGRESP 超时次数。
 
-本章的入门发送器只适合一个很小的 MQTT 3.1.1 子集：短 Client ID、Clean Session、QoS 0 遥测、显式等待 CONNACK。把这条边界写出来，比给读者一个看似万能的组包函数更重要。
+## 21.7 MQTT 接收器按字节流工作
 
-| 功能 | 本章最小实现 | 后续实现前必须补的状态 |
-|---|---|---|
-| CONNECT | 无用户名/密码、无遗嘱、Clean Session | 平台认证字段、遗嘱、会话恢复 |
-| PUBLISH | QoS 0、长度受限 | QoS 1 的 packet id、PUBACK、重传与 DUP 标志 |
-| 收包 | CONNACK / PINGRESP 等少量控制包 | 完整固定头、Remaining Length、多帧连续输入 |
-| Keep Alive | 空闲时发送 PINGREQ，等待 PINGRESP | `last_tx/last_rx`、超时关闭与重连 |
-| TLS | 不在这个裸 TCP 入门例程中保证 | 模块 TLS、SNI、证书、时间和内存评估 |
+MQTT 固定头的第一个字节之后是 Remaining Length。这个字段最多占 4 字节，最大合法值为 268435455。接收器不能假定一次 UART/AT 回调就包含一条完整 MQTT 报文。
 
-### Remaining Length 必须按字节流解析
+一个受限解析器至少维护这些状态：
 
-MQTT 的固定头后是可变长 Remaining Length。接收端不能假定一个 UART 回调里有完整报文，也不能只支持一个字节后就悄悄解析错误。一个受限解析器至少维护：
-
-~~~text
+```text
 FIXED_HEADER
-  → REMAINING_LENGTH（最多 4 字节；乘数 1、128、16384、2097152）
-  → BODY（累计到声明长度）
-  → 产生一条 MQTT 事件，再回到 FIXED_HEADER
-~~~
+    ↓
+REMAINING_LENGTH
+    ↓
+BODY
+    ↓
+DISPATCH
+    └── 回到 FIXED_HEADER
+```
 
-每一步都检查：Remaining Length 是否超过你的接收上限、编码是否超过 4 字节、Body 是否超时、同一缓冲区里是否紧跟下一帧。这个解析器应通过“1 字节一喂、两帧粘连、超长长度、半包超时”的回放测试。
+解析 Remaining Length 时，每个字节低 7 位参与数值，高位表示后面还有字节。遇到超过 4 字节的编码、声明长度超过本地接收上限或 Body 超时，都应丢弃当前连接并记录协议错误；不要根据网络输入申请无上限内存。
 
-### QoS 1 不是给 QoS 0 加一个数字
+同一个输入片段里可能连续出现 CONNACK 和其他控制报文，一条 MQTT 报文也可能跨多个 TCP/AT Payload。解析器每产生一个完整事件后继续处理剩余字节，不能提前返回并丢掉后面的数据。
 
-控制命令若需要 QoS 1，最小状态机是：
+## 21.8 网络状态机只保留一个重连入口
 
-~~~text
-IDLE → 分配 packet_id → 发送 PUBLISH(QoS1) → WAIT_PUBACK
-  ├─ 收到匹配 packet_id 的 PUBACK → DONE
-  └─ 超时/断线 → 按策略重连并决定是否带 DUP 重发
-~~~
+MQTT 加入后，通信任务至少区分 TCP 和 MQTT 两层状态：
 
-`packet_id`、业务 `seq` 和执行结果是三件事。即使 Broker 已回 PUBACK，设备也不能因此假定“远端执行器已经完成动作”；控制协议仍需自己的 ACK、超时和幂等设计。
+```text
+WIFI_OFFLINE
+    ↓
+TCP_CONNECTING
+    ↓
+MQTT_CONNECTING
+    ↓ CONNACK success
+MQTT_ONLINE
+    │
+    └─ TCP close / timeout / protocol error
+                ↓
+             BACKOFF
+                ↓
+          TCP_CONNECTING
+```
 
-## 21.12 本章要点
+SensorTask 不直接连接 Broker，也不在发送失败后自己调用 `AT+CIPSTART`。所有 WiFi、TCP 和 MQTT 重连都由同一个通信任务处理，避免多个任务同时操作 AT 模块。
 
-- MQTT 运行在 TCP 之上，SPL 的工作重点仍是 UART 和 AT 发送；
-- Broker 负责转发，Topic 负责组织数据，Payload 才是实际内容；
-- CONNECT 成功并收到 CONNACK 后，才能开始业务通信；
-- 发布遥测数据与执行控制命令，可靠性要求不同；
-- 重连逻辑必须独立、可观察、可限速。
+连续失败时逐步增加退避时间并设置上限。具体初值和上限属于项目策略，本章不写成协议规定。每次失败记录当前状态、错误原因和累计次数，恢复后再继续发布新样本或按项目策略处理缓存。
 
----
+## 21.9 QoS 0、QoS 1、retain 和 LWT
 
-[上一章：第 20 章 · TCP/IP 协议栈与温度记录仪](./20-chapter.md)
+这些功能解决的问题不同：
 
-[下一章：第 22 章 · 云平台接入、设备身份与 HMAC](./22-chapter.md)
+| 功能 | 协议语义 | 本章使用方式 |
+|---|---|---|
+| QoS 0 | PUBLISH 后没有 MQTT 确认 | 周期遥测 |
+| QoS 1 | Broker/接收方按协议确认 PUBLISH，消息可能重复 | 后续重要消息实验 |
+| retain | Broker 保存该 Topic 的最后一条 retained 消息 | 可用于当前状态 |
+| LWT | Client 异常断开后，由 Broker 按 CONNECT 中的 Will 配置发布 | 可用于离线状态 |
+| Keep Alive | 限制客户端控制报文的最大空闲发送间隔 | 检测失效会话 |
+
+QoS 1 提供的是“至少一次”交付语义，因此重复 PUBLISH 是正常情况。应用层仍应保留业务 `seq` 或命令 ID，避免重复执行有副作用的操作。
+
+QoS 1 还需要 Packet Identifier 和 PUBACK 状态。MQTT 的 Packet Identifier 用于协议事务，业务 `seq` 用于业务数据，两者不要混用：
+
+```text
+IDLE
+  ↓ 分配 packet_id
+SEND_QOS1
+  ↓
+WAIT_PUBACK
+  ├─ 收到匹配 packet_id → 完成本次 MQTT 事务
+  └─ 断线/超时 → 按 MQTT 会话与重发策略处理
+```
+
+即使收到 PUBACK，也只能说明 QoS 1 的 MQTT 交付阶段完成。远端执行器是否已经完成“开继电器”等业务动作，需要另外定义业务 ACK。
+
+## 21.10 会话语义要和协议版本对应
+
+本章固定 MQTT 3.1.1，因此 CONNECT 标志叫 **Clean Session**。Clean Session 为 1 时，客户端断开后 Broker 不保留该客户端的持久会话状态；重新连接后需要重新建立订阅等状态。
+
+如果以后切换到 MQTT 5.0，相关字段和会话规则会变成 Clean Start、Session Expiry Interval 等概念。不要把 MQTT 5.0 的字段名直接套进本章 3.1.1 报文。
+
+本章的设备只做发布，因此暂时没有 SUBSCRIBE。后续加入 `command` 订阅时，重连成功并收到 CONNACK 后还要恢复订阅；是否能依赖持久会话，要根据 Clean Session 设置和 Broker 返回的 Session Present 判断。
+
+## 21.11 回放测试
+
+保存一组已验证的 MQTT 十六进制数据，可以在没有 WiFi 的情况下测试解析器。至少覆盖：
+
+1. 一个字节一个字节喂入成功 CONNACK；
+2. 两个 MQTT Control Packet 粘在同一个输入缓冲区；
+3. Remaining Length 使用 2 个字节的报文；
+4. Remaining Length 超过 4 字节；
+5. 声明 Body 长度超过本地缓冲区；
+6. PINGRESP 被拆成两次输入；
+7. CONNACK 返回非零错误码。
+
+网络联调时再做三组测试：正常发布、Broker 重启、WiFi 断开恢复。每次记录从第一次错误到重新收到成功 CONNACK 的状态变化，不要只看最终是否又开始出数据。
+
+## 21.12 本章完成标准
+
+先在 PC 上启动一个可控 Broker，并用另一个客户端订阅 `lab/zet6-01/#`。设备完成下面几项后，本章即可收尾：
+
+- TCP 建立后发送 CONNECT，并解析成功 CONNACK；
+- 每个遥测 Payload 带递增 `seq`，订阅端能看到数据；
+- 空闲时能完成 PINGREQ/PINGRESP；
+- Broker 停止后设备进入退避，不持续刷连接请求；
+- Broker 恢复后重新 CONNECT，再恢复发布；
+- 调试输出能区分 TCP 失败、CONNACK 拒绝、PINGRESP 超时和 PUBLISH 发送失败。
+
+完成这些测试后，再加入用户名密码、QoS 1、retain 或 LWT。一次只增加一个协议状态，出现问题时才能确定是哪一层出了错。
+
+> **上一章**：[第 20 章 · TCP/IP 协议栈与温度记录仪](./20-chapter.md)
+>
+> **下一章**：[第 22 章 · 云平台接入、设备身份与 HMAC](./22-chapter.md)
