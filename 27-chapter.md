@@ -1,18 +1,12 @@
-# 第 27 章 · 综合项目三：多协议智能网关（SPL版）
+# 第 27 章 · 综合项目三：多协议智能网关（SPL 版）
 
-> **本章产出**：把 WiFi、BLE、RS485/Modbus 等不同接口转换为统一事件，并实现最小的本地规则引擎。
->
-> **前置知识**：第 12B 章 RS485/Modbus、第 21–24 章网络与网关架构，以及第 25–26 章项目组织方法。
->
-> **项目目标**：接收多类设备数据、本地判断规则、上报云端，并能下发可追踪的控制命令。
+这一章把第 24 章的 UART → Parser → Adapter → Event 通路扩展到多个协议来源。RS485/Modbus、BLE 和 WiFi 各自保留驱动与协议状态，进入应用层以后统一成 `GatewayEvent`；规则、日志和云端不再解析原始协议。
 
----
+综合项目重点检查三件事：统一事件的字段语义、不同来源之间的故障隔离，以及控制命令从发起到完成的可追踪性。
 
-## 27.1 先定义“网关内的共同语言”
+## 27.1 先固定网关内部事件格式
 
-不要把 Modbus 寄存器地址、BLE 字节偏移和 MQTT Topic 直接传到应用层。先定义一个通用事件：
-
-~~~c
+```c
 typedef enum {
     SRC_MODBUS,
     SRC_BLE,
@@ -23,158 +17,111 @@ typedef enum {
     EVT_TEMPERATURE,
     EVT_HUMIDITY,
     EVT_DOOR_STATE,
-    EVT_COMMAND
+    EVT_COMMAND_RESULT
 } EventType;
 
 typedef struct {
-    uint16_t    schema_version; /* 统一事件格式的版本 */
+    uint16_t    schema_version;
     EventSource source;
     EventType   type;
     uint32_t    device_id;
     uint32_t    seq;
-    uint32_t    mono_tick;      /* 排序/超时用单调时间，不冒充真实 UTC */
-    int32_t     value;          /* 必须在 type 文档中规定单位，例如 centi-°C */
-    uint16_t    flags;          /* 有效、估算、CRC 错、离线等状态 */
+    uint32_t    mono_tick;
+    int32_t     value;
+    uint16_t    flags;
 } GatewayEvent;
-~~~
+```
 
-现在，Modbus 适配器和 BLE 适配器都只需要生成 GatewayEvent，规则引擎不再关心原始协议。
+`mono_tick` 用于本机超时和事件间隔，不当作 UTC 时间。`value` 的解释由 `type` 决定，例如温度统一为摄氏度 × 100；门状态使用文档规定的枚举值。复杂命令结果不够一个 `value` 表达时，应定义专门结构体或受版本控制的 payload，避免不断给这个结构硬塞字段。
 
-## 27.2 适配器模式
+`seq` 也要注明来源。它可以是远端设备序号，也可以由 Adapter 生成本地序号；两者在去重能力上不同，不能只看字段名字就假定含义相同。
 
-| 适配器 | 输入 | 输出 |
-|---|---|---|
-| modbus_adapter | RS485 帧、CRC | GatewayEvent |
-| ble_adapter | BLE UART 帧 | GatewayEvent |
-| mqtt_adapter | Topic + Payload | GatewayEvent |
-| cloud_adapter | GatewayEvent | MQTT/HTTP 上报 |
+## 27.2 Adapter 隔离协议细节
 
-每个适配器只负责一个方向的转换。不要让 modbus_adapter 直接调用 WiFi 函数；它应该把事件送到 Queue_GatewayEvent。
+每个 Adapter 只处理自己的协议和设备映射。例如 Modbus Adapter 把寄存器值、从站地址和 CRC 校验结果转换成 `GatewayEvent`；BLE Adapter 处理特征值或透明串口协议；WiFi Adapter 处理其定义好的业务消息。
 
-## 27.3 任务划分
+可以使用统一接口：
 
-~~~text
-Task_RS485_Poll      → Queue_GatewayEvent
-Task_BLE_Rx          → Queue_GatewayEvent
-Task_WiFi_Rx         → Queue_GatewayEvent
-Task_RuleEngine      ← Queue_GatewayEvent
-Task_CloudPublish    ← Queue_CloudEvent
-Task_LocalActuator   ← Queue_Command
-~~~
-
-轮询 Modbus 时要考虑总线时序；BLE/WiFi 接收依赖 UART 中断与环形缓冲区。所有任务都应该有超时与错误计数。
-
-## 27.4 本地规则引擎
-
-本地规则的价值是：即使云端断网，关键动作仍能执行。
-
-~~~text
-如果 room-01.temperature > 3000（30.00°C）
-那么：
-  1. 打开本地风扇
-  2. 记录告警
-  3. 网络可用时上报告警
-~~~
-
-初学阶段不需要实现脚本语言。用一个清晰的 C 表即可：
-
-~~~c
-typedef struct {
-    EventType type;
-    int32_t   greater_than;
-    uint8_t   action;
-} Rule;
-~~~
-
-规则任务收到事件后遍历表，命中后把动作发送到 Queue_Command。动作执行结果也要形成事件，避免“已经执行”只存在于某一行日志里。
-
-## 27.5 不要假定一根 UART 能同时承载一切
-
-WiFi/BLE 二合一模块是否支持并发，取决于模块固件。若模块不明确支持多角色、多连接或复用边界，不要把 AT 响应和 BLE 业务帧当作两条独立通道。
-
-优先级从高到低：
-
-1. WiFi、BLE、RS485 使用独立 UART 或独立模块；
-2. 使用模块官方支持的多路复用协议；
-3. 明确切换模式，并向上层报告当前不可用的服务。
-
-“能收到一些字节”不等于架构正确。
-
-## 27.6 设备注册与可追踪性
-
-每个来源设备至少需要：
-
-| 字段 | 作用 |
-|---|---|
-| device_id | 唯一身份 |
-| source | 来自哪个适配器 |
-| last_seen | 判断设备是否离线 |
-| last_seq | 检测重复或丢帧 |
-| error_count | 决定是否告警 |
-
-调试时，把 device_id、source、seq 一起打印；只有温度值而没有来源，后期很难排查。
-
-## 27.7 项目验收
-
-| 验收项 | 方法 |
-|---|---|
-| 协议转换 | 同一温度分别从 Modbus 和 BLE 上报，云端格式一致 |
-| 本地规则 | 断网后仍触发风扇或告警 LED |
-| 去重 | 重放同一 seq 的帧，不执行第二次动作 |
-| 故障隔离 | 一个设备持续发错误帧，不阻塞其他适配器 |
-| 资源稳定性 | 连续运行 24 小时，记录堆、栈、溢出计数 |
-
-## 27.8 本章练习
-
-1. 为两种来源生成相同的 GatewayEvent；
-2. 实现“温度过高开风扇”的本地规则；
-3. 为每个设备实现 last_seen 超时离线检测；
-4. 把错误计数和队列剩余空间显示到 OLED 调试页。
-
-## 27.9 适配器接口与可重复集成
-
-把每一种协议都限制在自己的适配器里。应用层只看 `GatewayEvent`，不应知道 Modbus 寄存器、BLE 特征值或 AT 提示符：
-
-~~~c
+```c
 typedef struct {
     bool (*init)(void);
-    void (*poll)(void);                  /* 从 RingBuffer/驱动取字节 */
-    bool (*next_event)(GatewayEvent *);  /* 只产出已验证事件 */
+    void (*poll)(void);
+    bool (*next_event)(GatewayEvent *out);
     const char *name;
 } GatewayAdapter;
-~~~
+```
 
-每个适配器都必须维护自己的超时、解析状态、错误计数和最后在线时间。适配器之间不直接调用，统一把事件交给 Queue。
+`next_event()` 只返回已经通过协议校验并完成单位转换的事件。Adapter 维护自己的 Parser 状态、超时和错误计数，不直接调用 MQTT、OLED 或其他 Adapter。
 
-### 三层集成顺序
+如果协议本身需要主动轮询，例如 Modbus RTU Master，轮询调度和响应超时也属于该 Adapter/驱动路径。上层只看到最终事件和设备状态。
 
-| 阶段 | 使用的输入 | 通过标准 |
-|---|---|---|
-| A | UART 回放的固定字节数组 | 每种协议都能独立产生同一类事件 |
-| B | 单个真实来源 | 断线/坏帧只影响该适配器 |
-| C | 两个来源并发 | Queue、seq 和 source 可追踪，无互相阻塞 |
-| D | 云端/本地规则 | 规则只消费 GatewayEvent，不反向耦合驱动 |
-| E | 长稳测试 | 24 小时的错误、队列和内存指标可解释 |
+## 27.3 多来源通过 Queue 汇合
 
-### 背压设计题
+任务结构可以是：
 
-网关输入可以突发，云端输出可以很慢。每种事件应明确处理策略：
+```text
+RS485Task ─┐
+BLETask ───┼─→ gateway_event_q ─→ RuleTask
+WiFiTask ──┘                         ├→ local_command_q
+                                    └→ cloud_event_q
 
-- 遥测最新值：可覆盖旧值；
-- 审计日志：保留顺序，满时记录丢失；
-- 控制命令：不能静默丢弃，必须 ACK、拒绝或进入超时；
-- 错误告警：限速聚合，避免日志风暴。
+CloudTask ← cloud_event_q
+ActuatorTask ← local_command_q
+```
 
-练习：用 UART 同时模拟一个“每秒温度”的来源和一个“突发 100 帧”的来源；证明它们的错误计数、来源 ID 和 Queue 策略都可见。
+多个任务向同一个 FreeRTOS Queue 发送值类型消息是受支持的，但 Queue 容量仍然有限。发送端要使用明确的等待策略；本项目不允许某个突发来源无限阻塞整个采集路径。
 
-## 27.10 命令关联、设备注册与规则隔离
+如果事件速率差距很大，可以为来源设置独立输入 Queue，再由聚合任务按策略合并。这样一个高流量来源不会轻易占满所有来源共用的入口。是否需要这层结构由压力测试决定。
 
-网关既要处理遥测，也要处理“下发控制后到底发生了什么”。为命令建立关联 ID，而不是只打印一条字符串：
+## 27.4 每个 EventType 都要规定单位和 flags
 
-~~~c
+本项目至少固定这些语义：
+
+- `EVT_TEMPERATURE`：`value` 为 °C × 100，例如 `3000` 表示 30.00 °C；
+- `EVT_HUMIDITY`：`value` 为 %RH × 100，例如 `5830` 表示 58.30% RH；
+- `EVT_DOOR_STATE`：`value` 使用项目定义的门状态枚举；
+- `EVT_COMMAND_RESULT`：使用关联 ID 和专门结果字段，不能靠一个数值猜命令上下文。
+
+`flags` 也要集中定义，例如 VALID、STALE、SENSOR_ERROR。CRC 错误通常在 Adapter 输入阶段就被拒绝并计入协议统计，不应生成一条带 `CRC_ERROR` 的正常温度事件让规则继续计算。
+
+若事件格式写入 Flash、SD 或发往云端，`schema_version` 用于识别字段语义。读取未知版本时拒绝解析或走显式迁移路径，不能把旧字节直接强转成当前结构体。
+
+## 27.5 本地规则只产生决策
+
+断网时，本地规则仍可以根据已经收到的事件运行。第一版不需要脚本语言，用可测试的 C 逻辑即可：
+
+```c
 typedef struct {
-    uint32_t correlation_id;   /* 云端/本地发起一次命令的编号 */
-    uint16_t target_source;
+    bool fan_should_run;
+    bool alarm_should_raise;
+} RuleDecision;
+
+RuleDecision Rules_Evaluate(const GatewayEvent *e)
+{
+    RuleDecision d = {0};
+
+    if (e->type == EVT_TEMPERATURE &&
+        (e->flags & EVENT_FLAG_VALID) != 0U &&
+        e->value > 3000) {
+        d.fan_should_run = true;
+    }
+
+    return d;
+}
+```
+
+规则函数不访问 UART、继电器或 MQTT。RuleTask 把决策转换成 `GatewayCommand`，再交给执行层。这样同一组录制事件可以在 PC 测试和固件测试中回放，不需要连接真实设备。
+
+温度阈值 30.00 °C 只是教学规则。真实项目把阈值、迟滞和故障时默认行为写进配置；如果只有一个 `> 3000` 条件而没有迟滞，温度在阈值附近波动时可能频繁开关执行器。
+
+## 27.6 控制命令使用 correlation ID
+
+定义命令事务：
+
+```c
+typedef struct {
+    uint32_t correlation_id;
+    uint32_t target_device_id;
     uint16_t command;
     uint32_t deadline_tick;
 } GatewayCommand;
@@ -185,85 +132,87 @@ typedef enum {
     CMD_TIMEOUT,
     CMD_COMPLETED
 } CommandResult;
-~~~
+```
 
-当一个控制命令到达时：
+收到云端或本地规则命令后，先验证目标设备、参数和当前状态，再放入目标 Adapter/执行器的受限 Queue。`CMD_ACCEPTED` 只表示命令已经被当前层接受处理，不能当成设备动作完成；只有取得协议或物理层定义的完成证据后才产生 `CMD_COMPLETED`。
 
-1. 检查来源、设备状态和参数范围；
-2. 创建 `GatewayCommand` 并放入该适配器的受限队列；
-3. 适配器产生 `CMD_ACCEPTED/REJECTED/COMPLETED` 事件；
-4. 网络层根据 `correlation_id` 上报结果；
-5. 超时后明确报 `CMD_TIMEOUT`，而不是无声消失。
+超时产生 `CMD_TIMEOUT`，拒绝产生 `CMD_REJECTED`。结果事件保留同一个 `correlation_id`，云端日志才能把请求和最终结果对应起来。
 
-### 规则引擎只消费事件
+重试还要考虑命令是否幂等。开灯到指定状态通常可以设计成幂等命令；“脉冲一次”“加 1”这类动作重试可能产生第二次副作用，需要设备侧 request ID 或其他去重机制。
 
-本地规则应是纯函数式判断，不直接操作 UART 或继电器：
+## 27.7 设备注册保存协议身份和运行状态
 
-~~~c
-typedef struct {
-    bool fan_should_run;
-    bool alarm_should_raise;
-} RuleDecision;
+一个注册项至少需要设备 ID、Adapter 类型、协议地址/服务标识、配置版本和安全默认策略。`last_seen`、`last_seq`、错误数属于运行状态，可以和持久配置分开保存。
 
-RuleDecision Rules_Evaluate(const GatewayEvent *e)
-{
-    RuleDecision d = {0};
-    if (e->type == EVT_TEMPERATURE && e->value > 3000)
-        d.fan_should_run = true;  /* 教学示例：真实值需按格式解析 */
-    return d;
-}
-~~~
+`last_seen` 的更新条件要明确。收到任意噪声字节不能算设备在线；通常在得到一条通过协议校验的响应或事件后更新。设备离线判断使用单调时间，并用无符号 tick 差值处理计数器回绕。
 
-执行层接到 `RuleDecision` 后仍需使用安全状态机、权限与超时。这样可以单独用录制的 GatewayEvent 测试规则，而不接任何真实设备。
+`last_seq` 只有在对应协议确实提供有意义的序号时才用于丢帧或重复检测。Modbus RTU 本身没有通用消息 sequence 字段，不能为了统一结构就假定所有来源都有远端 seq。
 
-### 长稳验收
+持久注册配置写入 Flash 时保存版本、长度和校验。无法识别或校验失败的条目进入未注册/受限状态，由明确流程重新配置。
 
-- 同时注入有效帧、CRC 错帧、离线和突发数据；
-- 每个适配器都仍能报告 `last_seen`、错误数、溢出数；
-- 命令都有 correlation ID 和终态；
-- 网络断开时本地规则仍有明确行为；
-- 重启后设备注册、配置和默认安全状态可重复。
+## 27.8 UART 和模块并发能力按硬件实际设计
 
-练习：录制 20 条 GatewayEvent，在 PC/固件测试函数中回放；同一份事件序列应得到同一组 RuleDecision 和统计。
+WiFi、BLE 和 RS485 使用独立 UART 时最容易保持所有权。若开发板 UART 数量、引脚复用或模块设计不允许，就要根据实际硬件选择外部 UART、总线复用器或模块官方支持的多路复用机制。
 
-## 27.11 统一事件要有版本、单位、容量和回放边界
+WiFi/BLE 二合一模块能否同时运行多个角色和连接取决于具体模块及固件。AT 响应、异步事件和业务 Payload 如果共用一条串口，必须先由同一个模块 Parser 分类，不能让两个任务各自在同一字节流中找关键字。
 
-`GatewayEvent` 不是“随便塞几个 payload 字节”的容器。每个 `type` 都应在一张表里规定 value 的单位、有效范围和 flags 的含义；否则一台适配器传“30”，另一台传“3000”时，规则引擎会在看似正常的条件下做错事。
+模式切换型设计还要向上层暴露当前不可用的服务。例如切到 BLE 配网期间 WiFi 暂停，就让 CloudTask 得到明确离线状态，不要让它继续等待永远不会到来的 AT 响应。
 
-| type | `value` 的约定示例 | 必须保留的 flags |
-|---|---|---|
-| `EVT_TEMPERATURE` | 摄氏度 × 100，3000 = 30.00°C | 有效/传感器错/数据过期 |
-| `EVT_HUMIDITY` | %RH × 100 | 有效/范围错 |
-| `EVT_DOOR_STATE` | 枚举值，不把字符串塞入数值 | 物理反馈可信度 |
-| `EVT_COMMAND` | 不用 `value` 表示全部命令；使用关联 ID + 参数结构 | 接受/拒绝/超时/完成 |
+## 27.9 背压按事件类型处理
 
-### 注册表与配置恢复
+输入可能突发，云端也可能长时间不可用。不同数据使用不同策略：
 
-设备注册不只存 `device_id`。一个可恢复的登记项至少包括：适配器类型、地址/服务标识、配置版本、最后成功版本、默认安全策略和 CRC。Flash 中的配置必须有版本、长度和校验；无法识别时进入“未注册/只观察”的安全状态，而不是把旧字节强转成新结构体。
+- 最新遥测可以覆盖旧值，但要保留丢弃/覆盖计数；
+- 审计日志保持顺序，容量不足时记录明确的数据缺口；
+- 控制命令不能静默丢弃，Queue 满时返回 busy/rejected 或在 deadline 内等待；
+- 重复错误和告警可以限速聚合，避免故障设备把日志和网络通道占满。
 
-### 先算 RAM，再决定支持多少设备
+如果所有事件共用一个 Queue，高流量遥测可能排在控制结果前面。项目有不同延迟要求时，可以拆 Queue 或在聚合层做有限调度；不要只靠提高某个任务优先级解决已经进入 Queue 的排队问题。
 
-假设网关最多同时跟踪 `N` 台设备、每台保留一个状态项 `S` 字节、事件队列深度 `Q`、事件大小 `E`，最小 RAM 预算至少包含：
+网络断开几小时仍需要保留的审计或遥测数据应进入持久存储。RAM Queue 只覆盖按容量计算出的短期积压。
 
-~~~text
-device_registry = N × S
-event_queue     = Q × E
-rx_buffers      = 每个适配器的 RingBuffer 之和
-task_stacks + FreeRTOS heap + 日志格式化缓冲
-~~~
+## 27.10 先算 SRAM 预算
 
-写出最大 N、Q、E 后，再选择“遥测覆盖、审计限速、控制不静默丢失”的策略。最后将录制的正常帧、CRC 错帧、断线、突发和重复 seq 保存成回放集；PC 测试与固件测试应对同一输入给出相同的事件计数和规则结果。
+STM32F103ZET6 有 64 KB SRAM，事件注册表、Queue、RingBuffer、任务栈和协议缓冲都从这里分配。至少列出：
 
-## 27.12 本章要点
+```text
+device_registry = N × sizeof(DeviceState)
+event_queue     = Q × sizeof(GatewayEvent)
+command_queue   = C × sizeof(GatewayCommand)
+rx_buffers      = 各 Adapter RingBuffer 之和
+task_stacks     = 各任务 StackType_t 深度 × sizeof(StackType_t)
+other           = FreeRTOS 对象、协议缓冲、日志格式化缓冲、全局/静态数据
+```
 
-- 多协议网关的核心是统一事件模型；
-- 适配器之间通过 Queue 交接，而不是相互直接调用；
-- 本地规则让系统在断网时仍能工作；
-- 协议并发能力必须由模块文档证明；
-- 可追踪的 device_id、seq 与错误计数是长期维护基础。
+Queue 还会有 FreeRTOS 控制结构开销，因此 `Q × E` 只是消息存储部分。最终以链接 map、heap 统计和任务 high-water mark 检查实际占用。
 
----
+最大设备数 `N`、事件深度 `Q` 和命令深度 `C` 都要写成项目约束。不要先宣称“支持几十台设备”，再让动态分配失败决定实际容量。
 
-[上一章：第 26 章 · BLE 智能门锁](./26-chapter.md)
+## 27.11 用回放和并发故障做验收
 
-[下一章：第 28 章 · 调试与排错](./28-chapter.md)
+先给每个 Adapter 单独准备固定输入：合法帧、CRC 错误、非法长度、超时和重复数据。相同输入在不同字节切分下应产生相同的合法事件序列。
+
+随后同时运行至少两个来源，注入一个高流量来源和一个正常来源，检查 `gateway_event_q` 的最大占用、各 Adapter overflow、事件 drop 和规则处理延迟。让其中一个来源持续产生错误帧，其他来源仍应继续产生事件。
+
+命令路径单独检查 `correlation_id`：正常完成、拒绝、设备离线、Queue 满和超时都要得到终态。网络断开时本地规则继续运行，CloudTask 只进入离线/积压策略。
+
+最后检查重启恢复：注册配置能通过版本和校验加载；无法识别的配置不会被当成有效设备；执行器回到项目定义的安全启动状态。长时间测试用于覆盖日志轮换、最大退避、tick 回绕测试方案等长周期机制，不能代替这些故障注入。
+
+## 27.12 本章完成标准
+
+项目完成时应能回答：
+
+- 每种协议在哪个 Adapter 内结束，应用层从哪里开始；
+- 每个 EventType 的单位、范围和 flags 如何定义；
+- 哪些来源有远端 seq，哪些只有网关本地序号；
+- 一个高流量或故障设备如何避免拖住其他来源；
+- 控制命令怎样从 `correlation_id` 追踪到最终结果；
+- Queue 满、网络离线和持久存储满时分别执行什么策略；
+- 最大设备数和 Queue 深度对应多少 SRAM；
+- 重启后设备注册和执行器默认状态如何恢复。
+
+这些边界通过回放、并发压力和故障注入验证后，多协议网关的基本架构就完成了。下一章集中处理调试与排错方法。
+
+> **上一章**：[第 26 章 · BLE 智能门锁](./26-chapter.md)
+>
+> **下一章**：[第 28 章 · 调试与排错](./28-chapter.md)
