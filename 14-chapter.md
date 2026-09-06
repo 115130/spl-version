@@ -1,484 +1,247 @@
-# 第 14 章 · 为什么需要 RTOS（SPL版）
+# 第 14 章 · 为什么需要 RTOS（SPL 版）
 
-> **本章产出**：能从一个阻塞的裸机循环拆出任务、事件和时间边界；理解调度器到底替你保存了什么、没有替你解决什么。
->
-> **前置知识**：第 5 章 SysTick、第 6 章中断，以及至少一个能通过 UART 输出日志的 SPL 工程。
->
-> **本章边界**：迷你调度器只用于理解 Cortex-M3 上下文切换；后续项目使用经过长期维护的 FreeRTOS。
+前 13 章都可以用裸机主循环组织。本章开始加入 FreeRTOS，先解决一个具体问题：程序里同时存在周期任务、事件处理和可能阻塞的外设操作时，怎样明确每项工作的运行时机和阻塞边界。
 
-## 14.1 裸机 while(1) 的局限
+本章还会拆开 Cortex-M3 的 SysTick、PendSV、PSP 和上下文切换。迷你调度器只用于理解机制；从第 15 章开始，工程使用 FreeRTOS。
 
-前 13 章你写的程序都是这种结构：
+## 14.1 裸机主循环什么时候开始难维护
+
+裸机本身可以处理相当复杂的程序。只要每个模块都采用非阻塞状态机，主循环同样能稳定完成多个周期和事件任务。问题通常出现在某个调用长时间不返回，或者所有模块的时间状态都堆进同一个循环之后。
+
+例如：
 
 ```c
-int main(void) {
-    // 初始化全部外设
-    LED_Init();
-    USART1_Init();
-    ADC1_Init();
+for (;;) {
+    Console_Poll();
+    Sensor_Poll();
 
-    while (1) {
-        LED_Toggle();              // 每 500ms 闪灯
-        uint16_t adc = ADC1_Read(); // 读 ADC
-        printf("ADC=%d\r\n", adc);
-        Delay_ms(100);
+    if (Log_IsDue())
+        Log_WriteToSd();
+
+    Display_Poll();
+}
+```
+
+如果 `Log_WriteToSd()` 因 SD 卡访问等待 200 ms，这 200 ms 内 `Console_Poll()` 和 `Display_Poll()` 都不会再次执行。可以继续把 SD 写入改造成状态机，但随着 WiFi、文件系统、传感器和 UI 同时加入，每个模块都要自行维护等待状态、超时和调度条件。
+
+RTOS 提供任务状态和调度器，让等待中的工作离开就绪队列，CPU 去运行其他可执行任务。它不会让一个长时间占用 CPU、从不阻塞的高优先级函数自动变得友好；任务设计仍然要明确阻塞点。
+
+## 14.2 任务和阻塞
+
+FreeRTOS 任务通常是一个长期运行的函数：
+
+```c
+static void SensorTask(void *argument)
+{
+    (void)argument;
+
+    for (;;) {
+        Sensor_ReadAndPublish();
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 ```
 
-这个 `while(1)` 大循环在项目简单时够用。但随着你加入越来越多的功能，问题开始暴露：
+`vTaskDelay()` 会把当前任务放入 Blocked 状态。延时期间它不占用 CPU；到期后重新进入 Ready 状态，再由调度器根据优先级决定何时运行。
 
-### 场景 1：一件事阻塞了所有事
+一个简单系统可以拆成：
 
-假设你加了一个「每 30 秒写一次 SD 卡日志」的功能：
-
-```c
-while (1) {
-    LED_Toggle();          // ① 闪灯
-    ProcessUART();         // ② 处理串口命令
-    if (uwTick % 30000 == 0) {
-        WriteSD_Log();     // ③ 写 SD 卡——耗时 200ms！
-    }
-}
+```text
+SensorTask   周期采样并发布数据
+DisplayTask  等待新数据后刷新显示
+LoggerTask   等待日志消息并写 SD
+ConsoleTask  等待串口输入并执行命令
+ISR          捕获硬件事件并通知相应任务
 ```
 
-**问题**：`WriteSD_Log()` 执行的那 200ms 里，LED 不闪了（卡在灭或亮的状态），串口来了命令也不处理了。因为裸机是**顺序执行**——一个函数不返回，后面的代码永远轮不到。
+这些任务并不会在单核 Cortex-M3 上同时执行。任一时刻只有一个任务占用 CPU；调度器在任务阻塞、时间片到期、高优先级任务变为 Ready 等时机选择下一项工作。
 
-### 场景 2：定时任务不准
+抢占也不能消除驱动内部的全局影响。例如某个任务长时间关中断，其他任务和 ISR 都会受到影响；两个任务同时访问同一个 I2C 外设，也仍需要互斥或统一的设备服务。
 
-用 `uwTick % 500 == 0` 来做 LED 定时翻转——但如果某次循环因为等 ADC、等 UART 耗时超过了 500ms，LED 的翻转时机就会乱掉。所有「定时」在裸机里都是**近似值**，取决于大循环里最慢的那个函数。
+## 14.3 Cortex-M3 怎样切换任务
 
-### 场景 3：代码越改越乱
+Cortex-M3 为 RTOS 提供了适合上下文切换的异常机制。典型 FreeRTOS Cortex-M3 port 会用 SysTick 提供 tick，用 PendSV 执行上下文切换，用 SVC 启动第一个任务。
 
-当你有「收到串口 AT 命令 → 读温度 → 显示到 OLED → 同时 LED 呼吸指示模式」，你会写成：
+任务在线程模式运行时通常使用 PSP。异常进入时，处理器硬件自动保存：
 
-```c
-while (1) {
-    if (UART_DataReady()) {
-        ParseCMD();         // 解析命令
-        switch (mode) {
-            case SHOW_TEMP: ReadTemp(); break;
-            case SHOW_OLED: OLED_Update(); break;
-        }
-    }
-    LED_Breath();            // 呼吸灯
-    OLED_Update();           // 刷新显示
-    CheckKey();              // 检测按键
-    // 这里顺序和优先级不可控……
-}
+```text
+r0-r3, r12, LR, PC, xPSR
 ```
 
-所有逻辑混在一起。想加一个新功能就要改这个大循环，怕改崩旧功能。**项目的复杂度从「能不能跑」变成「能不能维护」了。**
+`r4-r11` 属于被调用者保存寄存器，需要上下文切换代码另外保存。一次简化的切换过程可以表示为：
 
-### 你前 13 章做过的项目，哪些会碰到这些问题？
-
-| 项目 | 裸机能搞定吗 | 为什么 |
-|------|------------|--------|
-| 第 3 章：按键点灯 | ✅ 简单 | 就一件事 |
-| 第 8 章：UART 指令控制台 | ⚠️ 勉强 | 加个定时器读传感器就开始乱了 |
-| 第 8 章实验②：WiFi 发数据 | ❌ 痛苦 | 配网 10 秒 → 发数据 500ms，期间按键、LED 全挂 |
-| 第 10 章：I2C 读 MPU6050 + OLED 显示 | ❌ 混乱 | 要同时读传感器、刷新显示、处理命令 |
-| 物联网网关（后面 21-24 章）| ❌ 不可能 | 同时跑 WiFi、MQTT、传感器、OLED、按键 |
-
-## 14.2 RTOS 的解法：从一个大循环拆成多个小循环
-
-RTOS（Real-Time Operating System，实时操作系统）做的事很简单：**让你把程序拆成多个独立的死循环（称为 Task/任务），每个任务只关心自己那一件事。内核帮你决定哪个任务占用 CPU、什么时候切换。**
-
-裸机的思维：
-
-```c
-while (1) {
-    做A();
-    做B();
-    做C();
-}
+```text
+SysTick 到期或其他事件要求重新调度
+        ↓
+PendSV 置为 pending
+        ↓
+进入 PendSV
+        ↓
+保存当前任务 r4-r11 和 PSP
+        ↓
+调度器选择下一个 Ready 任务
+        ↓
+装载该任务 PSP，恢复 r4-r11
+        ↓
+异常返回，硬件恢复其余寄存器
 ```
 
-RTOS 的思维：
+PendSV 通常配置为很低的异常优先级，使真正的外设 ISR 先完成，再进行任务上下文切换。具体优先级和向量映射由 FreeRTOS port 与 `FreeRTOSConfig.h` 配置，不应在应用代码里另写一套。
 
-```c
-void TaskA(void *pv) { while (1) { 做A(); } }   // 独立
-void TaskB(void *pv) { while (1) { 做B(); } }   // 独立
-void TaskC(void *pv) { while (1) { 做C(); } }   // 独立
-```
+## 14.4 一个只用于理解的切换片段
 
-### 具体对比：第 8 章 WiFi 实验的裸机 vs RTOS
-
-**裸机版**（你第 8 章写的）：
-
-```c
-int main(void) {
-    USART1_Init(); USART2_Init();
-    WiFi_AT_Setup();                     // 配网——耗时长
-    while (1) {
-        temp = ReadTemp();
-        WiFi_SendData(temp);              // 发数据——阻塞
-        Delay_ms(5000);
-        // 这时候按键不响应、LED 不闪
-    }
-}
-```
-
-**RTOS 版**：
-
-```c
-void TaskWiFi(void *pv) {                // 任务 A：只管 WiFi
-    WiFi_AT_Setup();
-    while (1) {
-        WiFi_SendData(ReadTemp());
-        vTaskDelay(5000);
-    }
-}
-
-void TaskLED(void *pv) {                 // 任务 B：只管闪灯
-    while (1) {
-        LED_Toggle();
-        vTaskDelay(500);
-    }
-}
-
-void TaskKey(void *pv) {                 // 任务 C：只管按键
-    while (1) {
-        if (Key_Pressed()) mode++;
-        vTaskDelay(20);
-    }
-}
-
-int main(void) {
-    xTaskCreate(TaskWiFi, "WiFi", ...);
-    xTaskCreate(TaskLED,  "LED",  ...);
-    xTaskCreate(TaskKey,  "Key",  ...);
-    vTaskStartScheduler();               // 启动！三个任务「同时」跑
-    while (1);                           // 永不执行到这里
-}
-```
-
-三个任务各跑各的。当 TaskWiFi 在 `vTaskDelay(5000)` 睡眠时，CPU 自动去跑 TaskLED 和 TaskKey。当 TaskWiFi 的 `WiFi_SendData()` 在执行时，它也在跑——但 500ms 后 TaskLED 的时间到了，**内核会强行打断** WiFi 任务，让 LED 先翻转，再回来继续发 WiFi。这就是**抢占式调度**。
-
-### RTOS 解决的核心问题总结
-
-| 裸机问题 | RTOS 的解法 |
-|---------|------------|
-| 一个函数阻塞，全系统卡住 | **多任务**：一个任务阻塞，其他任务继续运行 |
-| 定时不精确 | **调度器**：内核强制切换，高优先级任务准时执行 |
-| 代码难以维护 | **职责分离**：每个 task 只干一件事，改一个不影响其他 |
-| 新功能难加 | **即插即用**：新建一个 task 文件，跟已有 task 零耦合 |
-
-### 什么时候用 RTOS，什么时候不用
-
-| 适合裸机 | 适合 RTOS |
-|---------|----------|
-| 只有一个独立功能 | 多个任务需要「同时」运行 |
-| 逻辑简单（读按键→亮灯）| 涉及无线通信（WiFi/BLE 有长延迟）|
-| 实时性要求不高 | 有严格的时序要求 |
-| 代码 < 1000 行 | 代码 > 5000 行，多人协作 |
-
-对于后面第 17-30 章（WiFi、MQTT、网关、三个综合项目），**没有 RTOS 几乎不可能组织代码**。这就是现在学 FreeRTOS 的原因。
-
----
-
-## 14.3 自己动手：一个最简抢占式调度器（50 行）
-
-FreeRTOS 几千行。但抢占式多任务的核心，只靠 **SysTick + PendSV + 任务控制块** 三个机制就能实现。Cortex-M3 为此提供了完美的硬件支持。
-
-### 核心数据结构
-
-每个任务只需要保存自己的栈指针：
-
-```c
-#define MAX_TASKS  4
-struct TCB {
-    uint32_t *sp;                  // 栈指针——任务切换时只需换这个
-    uint32_t  stack[128];          // 每个任务 512 字节栈
-};
-struct TCB tasks[MAX_TASKS];
-volatile int current_task = 0;
-```
-
-### SysTick——触发调度
-
-```c
-void SysTick_Handler(void) {
-    // 设 PendSV 位——等当前 ISR 处理完再切换
-    SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
-}
-```
-
-SysTick 只设一个标志位。PendSV 是 Cortex-M3 优先级最低的异常，它会等所有更高级的中断处理完才执行——**绝不会在另一个 ISR 中间切任务**。
-
-### PendSV——真正的上下文切换
-
-汇编写，约 20 行：
+下面只展示 PendSV 中最关键的保存/恢复动作，不构成可运行调度器：
 
 ```asm
-PendSV_Handler:
-    MRS r0, PSP              ; 读当前任务的栈指针
-    STMDB r0!, {r4-r11}      ; 保存 r4~r11 到栈上
-                             ; r0~r3, r12, LR, PC, xPSR 已被硬件自动压栈
-    ; 保存当前任务的 sp 到 TCB
-    LDR r1, =current_task
-    LDR r2, [r1]             ; current_task id
-    LDR r3, =tasks
-    MOV r4, #16              ; sizeof(struct TCB) = 16
-    MLA r2, r2, r4, r3
-    STR r0, [r2]             ; tasks[id].sp = current SP
+MRS     r0, PSP
+STMDB   r0!, {r4-r11}
 
-    ; 选下一个任务（轮转）
-    LDR r2, [r1]             ; 重新加载 current_task
-    ADD r2, r2, #1
-    CMP r2, #MAX_TASKS-1
-    ITT GT
-    MOVGT r2, #0
-    STR r2, [r1]             ; current_task = (current_task+1) % MAX_TASKS
+; 把 r0 保存到当前任务的 TCB
+; 调度器选择下一个任务
+; 从新任务 TCB 取出 PSP 到 r0
 
-    ; 恢复新任务的寄存器
-    MOV r4, #16
-    MLA r2, r2, r4, r3
-    LDR r0, [r2]             ; 新任务的 sp
-    LDMIA r0!, {r4-r11}      ; 弹出 r4~r11
-    MSR PSP, r0              ; 设 PSP 为新任务的栈
-    BX LR                    ; 返回→硬件自动弹出 r0~r3, PC, xPSR→新任务跑起来了
+LDMIA   r0!, {r4-r11}
+MSR     PSP, r0
+BX      LR
 ```
 
-**硬件帮了大忙**：进入 PendSV 时，CPU 自动把 r0-r3、r12、LR、PC、xPSR 压栈了；`BX LR` 返回时硬件自动弹出。你只需要手动保存/恢复 r4-r11。
+TCB 至少要保存任务当前栈指针。任务第一次运行之前，还要在它自己的栈上准备与 Cortex-M3 异常返回格式匹配的初始栈帧。这里涉及 EXC_RETURN、8 字节栈对齐、编译器 ABI、临界区和首次任务启动等细节。
 
-### 创建任务
+这也是本章不提供“50 行可运行 RTOS”的原因。一个看似能切换两个测试函数的汇编片段，不等于能安全处理嵌套中断、优化编译、任务退出、栈溢出和不同工具链。第 15 章直接使用 FreeRTOS 官方 Cortex-M3 port。
 
-创建任务本质是**伪造一个栈帧**——看起来刚刚被中断过：
+## 14.5 `Delay_ms()` 和 `vTaskDelay()` 的差别
+
+裸机忙等延时可能写成：
 
 ```c
-void TaskCreate(void (*func)(void), int id) {
-    uint32_t *sp = &tasks[id].stack[128];
-    *--sp = 0x01000000;              // xPSR（Thumb 位 = 1，必须）
-    *--sp = (uint32_t)func;           // PC = 任务入口地址
-    *--sp = 0xFFFFFFFD;               // LR = 异常返回 magic 值（回到线程模式+PSP）
-    *--sp = 0x0C; *--sp = 0x03;      // r12, r3, r2, r1, r0
-    *--sp = 0x02; *--sp = 0x01;
-    *--sp = 0x00;
-    for (int i = 0; i < 8; i++) *--sp = 0;   // r4~r11
-    tasks[id].sp = sp;
+void Delay_ms(uint32_t ms)
+{
+    uint32_t start = Timebase_NowMs();
+
+    while ((uint32_t)(Timebase_NowMs() - start) < ms) {
+    }
 }
 ```
 
-### 启动调度器
+放进 FreeRTOS 任务后，SysTick 和抢占调度通常仍然可以发生；忙等并不会天然禁止任务切换。它的问题是当前任务始终保持 Ready，并持续消耗自己获得的 CPU 时间。如果它又是最高优先级的 Ready 任务，低优先级任务可能长期得不到运行机会。
+
+`vTaskDelay()` 会让任务进入 Blocked：
 
 ```c
-void StartScheduler(void) {
-    __set_PSP((uint32_t)tasks[0].sp);        // 设 PSP 指向任务 0 的栈
-    SysTick_Config(SystemCoreClock / 1000);  // 1ms tick
-    SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;     // 触发一次切换→跑任务 0
-    __set_CONTROL(0x03);                     // 切换到线程模式+PSP
-    __ISB();
-    asm("SVC 0");                            // 触发 SVC→跳 PendSV→第一个任务开始
+for (;;) {
+    BoardLed_Toggle();
+    vTaskDelay(pdMS_TO_TICKS(500));
 }
 ```
 
-### 两个任务跑起来
+这 500 ms 内调度器可以运行其他 Ready 任务。周期任务如果希望减少自身执行时间造成的周期漂移，还可以使用 `vTaskDelayUntil()`，让下一次唤醒时间基于固定周期推进。
+
+FreeRTOS 接管 SysTick 后，前面章节自建的 SysTick 时间基准不能继续以冲突的中断实现同时存在。需要毫秒时间时，可以使用 RTOS tick，或者使用独立硬件定时器提供不与内核 SysTick 冲突的时间源。
+
+## 14.6 优先级解决的是调度顺序
+
+FreeRTOS 总是优先运行最高优先级的 Ready 任务。高优先级任务如果从不阻塞，低优先级任务可能被饿死：
 
 ```c
-void Task1(void) {
-    while (1) { GPIOC->ODR ^= GPIO_Pin_13;  /* LED toggle */  }
-}
-void Task2(void) {
-    while (1) { /* 另一个任务 */ }
-}
+static void BadHighPriorityTask(void *argument)
+{
+    (void)argument;
 
-int main(void) {
-    TaskCreate(Task1, 0);
-    TaskCreate(Task2, 1);
-    StartScheduler();
-    while (1);   // 永不执行到这里
+    for (;;) {
+        ComputeForever();
+    }
 }
 ```
 
-### 这个迷你 RTOS vs FreeRTOS
+周期采样、控制回路、网络处理和日志写入不应仅凭“感觉重要”分配优先级。先确定响应时间和阻塞条件，再决定谁需要抢占谁。日志写 SD 往往可以等几毫秒，硬件控制事件可能有更短的响应边界。
 
-| 功能 | 迷你 RTOS | FreeRTOS |
-|------|----------|----------|
-| 抢占式调度 | ✅ 轮转 | ✅ 可配优先级 8~32 级 |
-| vTaskDelay | ❌ 自己加链表 | ✅ |
-| 信号量/队列 | ❌ | ✅ |
-| 代码量 | **~50 行** | ~8000 行 |
-| 工业级可靠性 | ❌ | ✅ 数亿设备验证 |
+任务优先级也不能替代 ISR 优先级。调用 FreeRTOS `...FromISR()` API 的中断必须满足该 port 对 NVIC 优先级的限制；第 15 章配置 `configMAX_SYSCALL_INTERRUPT_PRIORITY` 时会具体处理。
 
-这证明了抢占式调度的本质就那么几行——SysTick 里设 PendSV 位，PendSV 里保存寄存器+换 SP。FreeRTOS 在这之上加了优先级、阻塞、同步、十年来的 bug 修复和几十种芯片的移植层。
+## 14.7 任务之间怎样交数据
 
----
+进入 RTOS 后，不要因为有多个任务就把更多状态放进全局变量。先确定数据所有权和交接方式。
 
-## 14.4 FreeRTOS 内部：SysTick → PendSV 切换流程
-
-上面的迷你 RTOS 帮你理解了核心机制。FreeRTOS 的上下文切换也是完全相同的原理：
-
-```
-SysTick_Handler（每 1ms）
-    │
-    └── 设置 PendSV 位（SCB->ICSR |= PENDSVSET）
-        │
-        └── 系统 PendSV 优先级最低，等所有中断处理完
-            │
-            └── PendSV_Handler 执行：
-                1. 保存 r4~r11 到当前任务栈
-                2. 调用 vTaskSwitchContext() 选下一个任务
-                3. 恢复下一个任务的 r4~r11
-                4. BX LR → 硬件弹出剩下的寄存器→新任务跑
-```
-
-唯一区别是第 2 步——FreeRTOS 用优先级就绪位图而不是简单的 `(current+1)%N` 来选下一个任务，O(1) 时间找到最高优先级的就绪任务。
-
-### 为什么裸机的 Delay_ms 不能和 FreeRTOS 共存
-
-你的 `Delay_ms` 是这样做的：
+例如传感器产生一份完整样本：
 
 ```c
-void Delay_ms(uint32_t ms) {
-    uint32_t start = uwTick;       // 读 SysTick 计数值
-    while (uwTick - start < ms);   // 忙等
-}
-```
-
-问题在执行 `while` 忙等时，**任务切换不会发生**——因为 PendSV 也是在 SysTick 中断里触发的，但 `Delay_ms` 的 while 循环不在中断里，SysTick 照常触发，PendSV 也照常执行。
-
-真正的问题是：**`Delay_ms` 阻塞了当前任务的全部执行时间**。如果 Task1 调了 `Delay_ms(1000)`，这一秒里 Task1 占用 CPU——FreeRTOS 的调度器只在每个 SysTick 中断里切换，如果 Task1 不主动让出（`vTaskDelay` 或阻塞），且优先级最高，它就一直跑。
-
-**`vTaskDelay` 和 `Delay_ms` 的区别**：
-
-| | `Delay_ms(1000)` | `vTaskDelay(1000)` |
-|--|-----------------|-------------------|
-| 行为 | CPU 忙等 1 秒 | 任务进入 Blocked 状态，不占 CPU |
-| 其他任务 | 不能运行 | ❓ 可以运行 |
-| 调度器效果 | 无 | 任务被移出就绪队列，调度器选其他任务 |
-
-RTOS 里的延时**不是忙等**——是把任务从就绪队列移到延时队列，然后调度其他任务。延时到后自动回到就绪队列。
-
-### FreeRTOS 占用资源
-
-| 资源 | 用量 |
-|------|------|
-| ROM（Flash） | ~5KB（内核源码）|
-| RAM | 每个任务 ~200-500 字节栈 + 内核堆 ~1-10KB |
-| CPU | 每 1ms 进入 SysTick ~1µs，约 0.1% 开销 |
-
-STM32F103 ZET6（512KB Flash / 64KB RAM）跑 FreeRTOS 绰绰有余。
-
----
-
-## 14.5 SPL 版和 HAL 版的不同
-
-HAL 版用 CubeMX 勾选「FreeRTOS」即可自动生成配置代码。SPL 版需要你**手动完成** CubeMX 自动做的事：
-
-| | HAL 版 | SPL 版 |
-|---|---|---|
-| FreeRTOS 添加 | CubeMX 勾选 | 手动下载源码、写 `FreeRTOSConfig.h`、改 Makefile |
-| 外设初始化 | `MX_GPIO_Init()` 自动生成 | 自己 `GPIO_Init()` |
-| ISR 写法 | `HAL_GPIO_EXTI_Callback` 回调 | 直接写 `EXTIx_IRQHandler` |
-| 延时 | `HAL_Delay` 或 `vTaskDelay` | 只有 `vTaskDelay`（SysTick 被 FreeRTOS 接管） |
-| 编译 | CubeIDE | `make` |
-
-**FreeRTOS 的 API 本身在两个版本中一模一样**——`xTaskCreate`、`xQueueSend`、`vTaskDelay` 是 FreeRTOS 的函数，不是 HAL 或 SPL 的。
-
-## 14.6 迷你调度器的边界
-
-本章的几十行调度器用于帮助你看懂 SysTick、PendSV、PSP 和上下文切换的关系。它不是可直接放入项目的 RTOS：
-
-- 没有完整的临界区与中断优先级管理；
-- 没有可靠的任务创建、栈检查、延时队列和同步原语；
-- 没有经过不同优化等级、不同异常路径和长期运行的验证；
-- 很容易因为汇编、ABI、栈对齐或启动顺序细节而出现 HardFault。
-
-阅读它的正确目标是“知道 FreeRTOS 为什么需要 port.c”，而不是“为了省代码自己实现一个生产调度器”。从下一章开始，项目统一使用 FreeRTOS。
-
-
-## 14.7 从裸机循环拆成任务：一个可执行的设计练习
-
-不要从“我要几个 Task”开始，而是先列出每件事的时间和阻塞边界。以温度节点为例：
-
-| 工作 | 频率/触发条件 | 可能阻塞什么 | 合适归属 |
-|---|---|---|---|
-| 读取 ADC | 每 100ms | 采样时间很短 | SensorTask |
-| OLED 刷新 | 每 250ms | I2C 可能等待 ACK | DisplayTask |
-| WiFi AT | 事件驱动、可超时 | 网络可能几十秒无响应 | RadioTask |
-| 串口收字节 | 中断到来 | 不能等待 | USART ISR + 缓冲区 |
-| 告警按键 | 边沿到来 | 不能解析完整命令 | EXTI ISR + ButtonTask |
-
-然后给每一项写出接口，而不是让任务直接互相读全局变量：
-
-~~~c
 typedef struct {
     uint32_t seq;
     int16_t temperature_centi;
     uint16_t voltage_mv;
 } EnvSample;
 
-/* 生产者只发送完整副本；消费者不依赖生产者的局部变量。 */
-QueueHandle_t sample_q;
-~~~
+static QueueHandle_t sample_queue;
+```
 
-这个表解决三件事：
+`SensorTask` 可以把 `EnvSample` 的副本发送到 Queue；消费者收到的是一份完整消息，不依赖生产者的局部变量生命周期。对于“只需要唤醒某个任务”的 ISR，Task Notification 通常比创建一个消息结构更直接。共享 I2C/SPI 设备则可以使用 Mutex，或者把所有访问集中到一个设备任务。
 
-1. 需要多快响应；  
-2. 哪些工作绝不能在 ISR 中做；  
-3. 哪些数据必须通过 Queue、通知或受保护的接口交接。  
+选择同步原语时先看数据关系：
 
-如果一项工作没有周期、超时、输入和输出，就先不要急着给它创建任务。
+- 需要传递一条条数据：Queue。
+- 只需要计数或唤醒任务：Task Notification / Semaphore。
+- 多个任务共享同一资源：Mutex。
+- ISR 向任务交事件：使用对应的 `...FromISR()` API，并根据返回值决定是否请求切换到刚唤醒的高优先级任务。
 
-## 14.8 最小验收、故障演练与排错
+这些机制的具体 API 放到第 15、16 章。本章只先建立“谁产生、谁消费、能否丢、能阻塞多久”这几个边界。
 
-先用两个任务验证调度，再接传感器。最小验收可以是：
+## 14.8 从裸机模块拆任务
 
-1. Task_A 每 500ms 翻转 LED；
-2. Task_B 每秒通过 UART 打印自身 tick；
-3. 两者同时持续运行 10 分钟；
-4. 给一个任务加入 `vTaskDelay`，确认另一个任务仍然运行；
-5. 记录每个任务的栈高水位，而不是只看“暂时没死机”。
+以一个同时采样、显示、记录和响应按键的节点为例，可以先写出运行条件：
 
-| 现象 | 优先检查 |
-|---|---|
-| 启动调度器后没有任何日志 | SysTick/PendSV/SVC 向量、FreeRTOS port、时钟配置 |
-| 一个任务跑一次就消失 | 任务函数意外 return；任务栈或参数生命周期错误 |
-| 系统偶发 HardFault | 栈太小、非法 ISR API、优先级配置、共享数据越界 |
-| 低优先级任务永远不运行 | 高优先级任务没有阻塞/让出 CPU |
-| 把 delay 放进任务后系统“卡” | 仍在使用裸机 busy-wait，而不是 `vTaskDelay` |
+| 工作 | 触发条件 | 允许阻塞 | 数据交接 |
+|---|---|---|---|
+| 传感器采样 | 每 100 ms | 短时间等待外设 | Queue 发布完整样本 |
+| OLED 刷新 | 收到新样本或每 250 ms | I2C 事务有超时 | 消费样本副本 |
+| SD 日志 | 收到日志消息 | SD 操作可能较慢 | 独占文件系统/块设备 |
+| UART RX | 字节/IDLE 中断 | ISR 不阻塞 | DMA/环形缓冲后通知任务 |
+| 按键 | EXTI 边沿 | ISR 不阻塞 | 通知 ButtonTask |
 
-故障演练：故意把一个任务优先级提高且去掉阻塞，观察其他任务被饿死；恢复 `vTaskDelay` 后解释为什么系统重新平衡。这个实验比背“抢占”定义更重要。
+这张表先回答运行时问题，再决定要创建几个任务。两个工作如果访问同一个设备、周期相近且没有独立响应要求，也可以放在同一任务中；RTOS 不要求每个模块都创建一个 Task。
 
-## 14.9 迷你调度器只能用来读，不能混入工程
+还要给每个任务分配栈。栈大小不能按固定的“每个任务几百字节”猜测，应根据调用深度、局部数组、库函数和实际高水位测量调整。`printf`、文件系统和较大的局部缓冲通常会明显增加栈需求。
 
-> ⚠️ **机制演示边界**：14.3 节的迷你调度器用于理解“SysTick 计时、PendSV 换上下文”这条链路。它不是一个可移植的 RTOS 内核，也不能和 FreeRTOS 共用向量表、SysTick 或 PendSV。不要把其中的汇编、任务栈布局或启动函数复制进第 15 章以后的工程。
+## 14.9 最小 FreeRTOS 验收
 
-用下面的时间线检查自己是否真的理解了它：
+第 15 章完成移植后，先用两个简单任务验收调度器：
 
-~~~text
-SysTick 到期
-  → 只记录“需要调度”
-  → 触发 PendSV
-  → 当前任务保存寄存器
-  → 调度器选择下一个就绪任务
-  → PendSV 恢复下一个任务寄存器
-  → 回到任务代码
-~~~
+```c
+static void LedTask(void *argument)
+{
+    (void)argument;
 
-这里有两个容易被忽略的前提：
+    for (;;) {
+        BoardLed_Toggle();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
 
-- `SysTick` 和 `PendSV` 必须处在合适且一致的异常优先级；它们不是普通外设中断。
-- 上下文切换代码依赖编译器 ABI、启动文件、栈对齐和异常入口格式；换一个工具链或优化选项都可能让“看起来只有几十行”的代码失效。
+static void LogTask(void *argument)
+{
+    (void)argument;
 
-因此从本章过渡到第 15 章时，只保留你学到的**设计语言**：任务有输入、输出、阻塞点、优先级和栈预算。调度、临界区和中断 API 统一交给一个已选定版本的 FreeRTOS port。最小交接检查如下：
+    for (;;) {
+        Console_PrintTick();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+```
 
-- [ ] 工程中只存在一套 `SysTick_Handler`、`PendSV_Handler`、`SVC_Handler` 映射；
-- [ ] 没有同时编译迷你调度器和 FreeRTOS 的上下文切换代码；
-- [ ] 高优先级任务有明确阻塞点，不能靠忙等“让出 CPU”；
-- [ ] 对所有 ISR 都注明：是否会调用 `...FromISR()` API、其 NVIC 优先级是否允许这样做。
+连续运行一段时间后检查两项任务都在执行，再读取各任务的栈高水位。随后故意让一个高优先级任务不再阻塞，观察低优先级任务停止运行；恢复阻塞点后再次验证。
 
-练习：不修改汇编，先用伪代码画出两个任务、一个 Queue 和一个 ISR 通知的时间线；能说明“ISR 为什么只通知、任务为什么可以阻塞”后，再开始第 15 章的移植。
+如果启动调度器后没有日志，先检查 Cortex-M3 port、SysTick/PendSV/SVC 向量和系统时钟。任务运行一次就消失时，检查任务函数是否错误 `return`、参数生命周期和栈。出现 HardFault 时，优先检查栈溢出、越界访问、ISR API 与 NVIC 优先级配置。
 
-## 14.10 本章要点
+## 14.10 本章边界
 
-- RTOS 的价值是把时间、阻塞和责任边界显式化，不是让代码自动并行；
-- ISR 负责尽快留下事件，任务负责等待、解析、重试和恢复；
-- 每个任务都应有输入、输出、周期/超时、优先级和栈预算；
-- 迷你调度器帮助理解机制，项目必须使用经验证的 FreeRTOS；
-- 下一章开始先搭出一个可观察、可失败、可定位的 FreeRTOS 最小工程。
+本章只解释为什么项目开始使用 RTOS，以及 Cortex-M3 怎样完成任务切换。以下内容留给后续章节：
 
----
+- FreeRTOS 源码、port 和 `FreeRTOSConfig.h` 的实际接入；
+- Heap 实现与动态/静态任务创建；
+- Queue、Semaphore、Mutex、Task Notification；
+- ISR 可调用 API 与 NVIC 优先级限制；
+- 栈溢出、断言和运行时统计。
 
-[下一章：第 15 章 · FreeRTOS 核心 API 与手动移植](./15-chapter.md)
+进入第 15 章前，先确认工程里不会同时存在两套 SysTick、PendSV 或 SVC 实现。前面章节的裸机时基如果占用了 SysTick，也要先决定迁移到 RTOS tick 还是独立定时器。
+
+> **上一章**：[第 13 章 · 存储语义：NOR 与 FatFs](./13-chapter.md)
+>
+> **下一章**：[第 15 章 · FreeRTOS 核心 API 与手动移植](./15-chapter.md)
