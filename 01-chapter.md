@@ -1,245 +1,226 @@
 # 第 1 章 · 什么是嵌入式系统
 
-> **本章产出**：能画出程序从复位向量到 `main()` 再到 `while(1)` 的路径，并能把 Flash、SRAM、栈、外设寄存器同你熟悉的 PC 软件层次对应起来。
->
-> **前置知识**：完成第 0 章，已有一个能编译、能烧录的 LED 工程。
->
-> **本章验收**：不看资料，解释“为什么 MCU 没有 OS 也能运行 C 程序”，并在自己的工程里找到启动文件、`SystemInit()` 与 `main()`。
+第 0 章已经把程序烧进 STM32，并让 LED 跑了起来。这一章先回答一个更基础的问题：没有操作系统时，C 程序是怎么从上电一路执行到 `main()` 的。
 
----
+读完后，你应该能在自己的工程里找到向量表、`Reset_Handler`、`SystemInit()` 和 `main()`，并说清 Flash、SRAM、栈和外设寄存器分别做什么。
 
-## 1.1 你熟悉的 PC 世界
+## 1.1 PC 程序和裸机程序差在哪
 
-先回顾一下你写 Java 时发生了什么：
+写 Java 时，源码不会直接成为 CPU 上电后执行的第一段代码。中间还有 JVM、操作系统、驱动等软件层：
 
-```
-你写的 HelloWorld.java
-        ↓ javac 编译
-    HelloWorld.class (字节码)
-        ↓ java 命令启动 JVM
-    JVM 加载 .class → 解释/即时编译 → 系统调用
-        ↓
-    Linux/Windows/macOS 内核 → 驱动 → CPU 执行
+```text
+HelloWorld.java
+      ↓ javac
+HelloWorld.class
+      ↓ JVM
+操作系统
+      ↓
+驱动 / 硬件
 ```
 
-这个链条上有几层：
+STM32 裸机程序的链路短得多。GCC 把 C 和汇编编译成 Cortex-M3 机器码，链接器按照链接脚本安排地址，最终镜像被写进片上 Flash。芯片复位后，CPU 从向量表取得初始栈地址和复位入口，然后开始执行启动代码。
 
-| 层 | 干什么 | 在嵌入式世界 |
-|----|--------|------------|
-| 编程语言运行时（JVM/CLR） | GC、JIT、类加载... | **没有** |
-| 操作系统内核 | 进程调度、虚拟内存、文件系统、网络栈... | **可能没有**（裸机），或只有一个轻量 RTOS |
-| 驱动层 | 把 OS 的抽象操作翻译成硬件操作 | 你自己写 |
-| 硬件 | CPU + 内存 + 外设 | 就是 MCU 本身 |
+这里没有 JVM，也没有进程、虚拟内存和文件系统。需要 GPIO 时，程序配置 GPIO 寄存器；需要串口时，程序配置 USART 寄存器。SPL 提供了一层 C 函数封装，但底下仍然是这些外设寄存器。
 
-**嵌入式的本质**：你的 C 代码直接被编译成 ARM 机器码，烧进 Flash，CPU 上电后从第一条指令开始执行。没有 JVM，没有 OS，没有虚拟内存，什么都要自己来。
+## 1.2 上电后先执行什么
 
-这可能让你觉得无所适从，但换个角度：**你也因此拥有了对硬件的完全掌控**。
+STM32F103 按启动配置从用户 Flash 启动时，用户 Flash 的物理起始地址是 `0x08000000`。启动别名会让复位时的向量表出现在 CPU 期望的启动地址空间中。
 
-## 1.2 MCU 是怎么「跑」程序的
-
-### 上电瞬间发生了什么
-
-当你给 STM32 供上 3.3V 电，并按启动配置从用户 Flash 启动时：
-
-```
-上电 → 内部复位电路等电压稳定
-     → 启动存储器在 0x0000_0000 处形成一个别名映射
-     → 用户 Flash 的物理起始地址仍是 0x0800_0000
-     → 0x0000_0000 存的是 栈顶指针 MSP 的初始值
-     → 0x0000_0004 存的是 Reset_Handler 的地址（这就是第一个要执行的函数）
-     → Reset_Handler 里：初始化数据段、初始化时钟、调 main()
-     → 你的 main() 开始执行
-```
-
-用代码说话。打开本书的 [`code/startup_stm32f10x_hd.s`](./code/startup_stm32f10x_hd.s)（启动汇编文件）：
+向量表最前面的两个 32 位值最重要：
 
 ```asm
 .section .isr_vector,"a",%progbits
-.word  _estack           @ 偏移 0x00：栈顶地址
-.word  Reset_Handler     @ 偏移 0x04：复位后第一条指令地址
-.word  NMI_Handler       @ 偏移 0x08：不可屏蔽中断
-.word  HardFault_Handler @ 偏移 0x0C：硬件错误
-@ ... 其他中断向量 ...
+.word  _estack           @ 初始 MSP
+.word  Reset_Handler     @ 复位入口
+.word  NMI_Handler
+.word  HardFault_Handler
+@ ...
 ```
 
-这个表就叫**中断向量表**（Vector Table）。它告诉 CPU：发生各种事件时，跳到哪里去执行。
+CPU 复位时先把第一项装入 MSP（Main Stack Pointer），再从第二项取得 `Reset_Handler` 地址。后面的表项对应 NMI、HardFault 和各种外设中断。
 
-`Reset_Handler` 的简化逻辑：
+本书的启动文件在 [`code/startup_stm32f10x_hd.s`](./code/startup_stm32f10x_hd.s)。`Reset_Handler` 的核心流程可以简化成：
 
-```asm
-Reset_Handler:
-    @ 把 .data 段从 Flash 复制到 RAM（初始化全局变量）
-    ldr   r0, =_sidata
-    ldr   r1, =_sdata
-    ldr   r2, =_edata
-1:  cmp   r1, r2
-    bcs   2f
-    ldr   r3, [r0], #4
-    str   r3, [r1], #4
-    b     1b
-
-    @ 清零 .bss 段（未初始化的全局变量）
-2:  ldr   r1, =_sbss
-    ldr   r2, =_ebss
-    movs  r3, #0
-3:  cmp   r1, r2
-    bcs   4f
-    str   r3, [r1], #4
-    b     3b
-
-4:  bl    SystemInit          @ 按 system_stm32f10x.c 的配置初始化时钟
-    bl    __libc_init_array    @ 运行期初始化钩子（若链接到）
-    bl    main                 @ 跳到你的 main() 函数
-    b     .                    @ main() 返回后的死循环（理论上不会执行到）
+```text
+复制 .data 到 SRAM
+      ↓
+清零 .bss
+      ↓
+SystemInit()
+      ↓
+__libc_init_array()
+      ↓
+main()
 ```
 
-注意两点：CPU 在进入 `Reset_Handler` 前已经把向量表第一项装入 MSP，所以启动汇编不必再次设置栈指针；`.data`、`.bss` 的边界符号由链接脚本和启动文件共同约定，二者必须成对修改。本书第 0 章的实际模板已经把这份约定放进 `examples/00-blink-zet6/`，不要混用网上另一份启动文件和链接脚本。
-
-### Flash 和 RAM 的分工
-
-对比你熟悉的 PC：
-
-| | PC（跑 Java） | STM32F103ZET6（跑裸机） |
-|---|---|---|
-| **程序在哪** | 硬盘 → OS 加载到 RAM | 直接烧在 Flash（512KB），CPU 直接从 Flash 取指执行 |
-| **数据在哪** | 堆（new 出来的对象）+ 栈 | SRAM（64KB）= 全局/静态变量 + 堆 + 栈 |
-| **「加载」** | OS 的加载器把 ELF/PE 读到 RAM | 不需要加载——Flash 就是 ROM，CPU 直接读 |
-
-这就是「哈佛架构」的体现：**指令总线从 Flash 取指，数据总线从 SRAM 读写，两者可以同时进行**。
-
-## 1.3 裸机 vs RTOS vs Linux
-
-很多初学者会问：「STM32 能跑 Linux 吗？」
-
-**不能。** 因为 STM32F103 没有 MMU（内存管理单元），Linux 内核必须要 MMU 来做虚拟内存。
-
-三种嵌入式软件架构：
-
-| | 裸机（Bare Metal） | RTOS | Embedded Linux |
-|---|---|---|---|
-| **代表** | 本书 Part 1-3 | 本书 Part 4+ | 树莓派、全志、i.MX |
-| **CPU** | Cortex-M0/M3/M4 | Cortex-M3/M4/M7 | Cortex-A 系列 |
-| **RAM** | 几 KB ~ 几百 KB | 几十 KB ~ 几 MB | ≥ 64MB |
-| **调度** | 一个 `while(1)` 循环 + 中断 | 多任务抢占调度 | 完整的 Linux 进程调度 |
-| **网络** | 自己接 WiFi 模块 + 手动发 AT 指令 | lwIP 协议栈 | 完整的 TCP/IP 栈 |
-| **学习曲线** | 最陡但最根本 | 中等 | 类 PC 开发，但硬件细节被屏蔽 |
-
-本书的路线：**裸机起步 → RTOS → 加上无线模块 → 上云**。你学的是最底层的、但也最通用的能力。
-
-## 1.4 嵌入式开发的「全栈」
-
-在全栈 Web 开发中，一个开发者要懂：前端（HTML/CSS/JS）→ 后端（Java/Go/Node）→ 数据库 → DevOps。
-
-嵌入式也有自己的「全栈」：
-
-```
-    ┌──────────────────────┐
-    │   云平台 / 手机 App    │  ← MQTT / HTTP / BLE
-    ├──────────────────────┤
-    │   无线通信模块         │  ← WiFi (DX-WF24/ESP8266) / 蓝牙 (HC-05)
-    ├──────────────────────┤
-    │   MCU 固件            │  ← C 语言 + FreeRTOS + SPL
-    ├──────────────────────┤
-    │   硬件 / 电路          │  ← 原理图、PCB、焊接
-    └──────────────────────┘
-```
-
-这本书覆盖中间两层（MCU 固件 + 无线模块），基础涉及第四层（会看原理图、会用面包板接线），并延伸到第一层（设备如何跟云端交互）。
-
-## 1.5 动手：逐行读 SPL 版 `main.c`
-
-回到实际模板的 [`examples/00-blink-zet6/main.c`](./examples/00-blink-zet6/main.c)。下面另用 **PB5 上外接的测试 LED** 演示 SPL 的 GPIO 调用；它不是本书默认板载 LED，也不能替代 `board.h` 的板级配置。
-
-### 头文件
+`.data` 和 `.bss` 的处理发生在 `main()` 之前。比如：
 
 ```c
-#include "stm32f10x.h"          // 芯片寄存器地址定义（GPIOA→0x40010800 这些宏）
-#include "stm32f10x_rcc.h"      // 时钟控制 API
-#include "stm32f10x_gpio.h"     // GPIO 驱动 API
+uint32_t a = 123;
+uint32_t b;
 ```
 
-SPL 的头文件体系非常扁平——你要用什么外设，就 include 什么头文件。没有 HAL 的 `main.h` 把所有东西包一层。
+`a` 运行时放在 SRAM，但初始值 `123` 需要保存在 Flash。启动代码会把这个初始值复制到 `.data` 对应的 SRAM 地址。`b` 放在 `.bss`，启动代码在进入 `main()` 前把它清零。
 
-### 延时函数
+对应的边界符号由链接脚本提供：
 
-```c
-void delay(void) {
-    volatile uint32_t i;
-    for (i = 0; i < 500000; i++);
-}
+```text
+_sidata
+_sdata
+_edata
+_sbss
+_ebss
 ```
 
-- `volatile` 告诉编译器“每次读写这个对象都必须保留为可观察访问”
-- 不带 `volatile`，编译器看到 `for(i=0;i<500000;i++);` 空循环可能会直接删掉，因为它觉得「这循环啥也没干」
-- 这个延时非常粗略——不精确，也会占满 CPU。`volatile` 不能让它变成定时器，不能让递增操作原子，也不能替代中断同步；第 5 章会用 SysTick 定时器替代它
+启动文件和链接脚本必须使用同一套符号名。第 0 章已经用 GDB 验证过 `Reset_Handler → main()`，这里要理解那两个断点之间实际发生了什么。
 
-### main() 三部曲
+## 1.3 Flash、SRAM 和栈
+
+STM32F103ZET6 有 512 KB Flash 和 64 KB SRAM。
+
+Flash 主要保存程序代码、只读数据和初始化数据。断电后内容仍然保留，烧录器写入的就是这块存储器。CPU 可以直接从 Flash 取指执行程序，不需要像 PC 那样先由操作系统把整个可执行文件加载进 RAM。
+
+SRAM 保存运行期间会变化的数据，包括全局变量、静态变量、栈，以及程序使用堆时分配出来的动态内存。断电后 SRAM 内容消失。
+
+栈位于 SRAM。函数调用时，局部变量、保存的寄存器和返回地址等内容可能进入栈。向量表第一项 `_estack` 给出了初始栈顶地址；在本书的 ZET6 链接脚本里，它位于 SRAM 顶部附近。
+
+可以在第 0 章生成的 ELF 中查看这些符号：
+
+```bash
+arm-none-eabi-nm -n build/blink.elf \
+  | rg '(_estack|_sidata|_sdata|_edata|_sbss|_ebss|Reset_Handler|main)'
+```
+
+MAP 文件则能看到 `.text`、`.data`、`.bss` 等段到底占了多少空间。
+
+## 1.4 裸机、RTOS 和 Linux
+
+STM32F103 很适合裸机和小型 RTOS。它有 Cortex-M3 内核、64 KB SRAM，没有面向桌面或应用处理器那类系统设计的 MMU，内存和存储资源也远小于常见 Linux 系统。
+
+Linux 历史上存在针对无 MMU 处理器的配置，但 STM32F103 这一级别的芯片并不是本书所说的 Embedded Linux 平台。实际产品里，常见 Linux SoC 会有 Cortex-A 一类应用处理器、更多 RAM、外部存储和更完整的系统外设。
+
+本书前半段使用裸机：
 
 ```c
 int main(void)
 {
-    // ① 开启 GPIOB 的时钟
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
-```
+    Hardware_Init();
 
-**任何外设使用前必须先开时钟**——这是 STM32 的铁律。不开时钟，属于那个外设的所有寄存器都不可访问，写入无效，读取为 0。STM32F103 的时钟设计像一栋大楼每层有独立电闸——GPIOB 挂在 APB2 总线上，对应 RCC 寄存器的第 3 位。`RCC_APB2PeriphClockCmd` 就是帮你去置那个位的。
-
-```c
-    // ② 配置 PB5 为推挽输出（外接测试 LED，不是板载 LED 的固定引脚）
-    GPIO_InitTypeDef gpio;
-    GPIO_StructInit(&gpio);               // 填默认值：输入浮空、2MHz、所有引脚
-    gpio.GPIO_Pin   = GPIO_Pin_5;         // 选外接测试引脚 PB5
-    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;   // 推挽输出（Push-Pull）
-    gpio.GPIO_Speed = GPIO_Speed_2MHz;    // LED 等低速信号不需要 50MHz 边沿
-    GPIO_Init(GPIOB, &gpio);
-```
-
-`GPIO_InitTypeDef` 是 SPL 的 GPIO 配置结构体。`GPIO_StructInit` 把字段填成该库定义的默认值，你再覆盖需要的字段，这样不会因为遗漏字段而把栈上的随机值写入寄存器。实际板载 LED 的端口、有效电平不应硬编码在这里，而应放进 `board.h`（见第 0 章模板）。
-
-```c
-    // ③ 主循环——嵌入式程序永不退出
     while (1) {
-        GPIO_ResetBits(GPIOB, GPIO_Pin_5);   // 输出 0（外接 LED 若低有效则亮）
-        delay();
-        GPIO_SetBits(GPIOB, GPIO_Pin_5);     // 输出 1（外接 LED 若低有效则灭）
-        delay();
+        App_Poll();
     }
 }
 ```
 
-`GPIO_ResetBits` 和 `GPIO_SetBits` 最终操作的是 GPIO 的 **BSRR** 寄存器——一个特殊的硬件设计：写 `1` 到某个位 = 置位/复位对应引脚；写 `0` 无效。这个机制保证了 GPIO 操作的**原子性**——你不需要读-改-写，不会产生竞态条件。
+中断负责处理需要及时响应的硬件事件，主循环处理普通业务。后面加入 FreeRTOS 后，会把部分工作拆成任务，由调度器决定哪个任务运行。
 
-### SPL vs HAL 对照
+RTOS 仍然运行在 MCU 上，不会自动带来 Linux 的进程、虚拟内存和完整文件系统。它主要提供任务调度、队列、信号量、软件定时器等机制。
 
-| 初始化步骤 | HAL（CubeMX 生成） | SPL（你手写） |
-|---|---|---|
-| 重置外设状态 | `HAL_Init()` | `SystemInit()` 在启动文件中自动调用 |
-| 配置系统时钟 | `SystemClock_Config()` | 默认 HSI 8MHz，够用（后面章节再调） |
-| 初始化 GPIO | `MX_GPIO_Init()` | `RCC_...ClockCmd()` + `GPIO_Init()` 你亲手写的 |
-| 翻转引脚 | `HAL_GPIO_TogglePin()` | `GPIO_SetBits/ResetBits()` 直接映射 BSRR |
-| 延时 | `HAL_Delay()` | 手写的 `for` 循环——简陋但透明 |
+## 1.5 外设寄存器也在地址空间里
 
-**关键差异**：HAL 版的 `MX_GPIO_Init()` 是 CubeMX 自动生成的，你不仔细看源文件根本不知道里面做了什么。SPL 版的四行时钟 + GPIO 配置是你亲手写的，**每一行你都知道它在做什么**。这就是 SPL 的核心理念——不隐匿任何硬件细节。
+在 C 代码里看到：
 
-**⚠️ 嵌入式程序没有「结束」的概念。你的代码跑起来，就一直跑下去，直到断电。** `while(1)` 不是 bug，是 feature。
+```c
+GPIOB->ODR
+USART1->SR
+RCC->APB2ENR
+```
 
----
+这些看起来像普通结构体成员，但对应的是固定硬件地址。Cortex-M3 通过内存映射 IO 访问外设，读写这些地址会直接访问 RCC、GPIO、USART 等硬件模块。
 
-## 1.6 最小验收、常见误解与练习
+例如 GPIOB 的寄存器基地址在设备头文件里由宏定义出来，SPL 再把常见操作封装成函数：
 
-**验收**：打开你自己的 `startup_stm32f10x_hd.s`，找到向量表和 `Reset_Handler`；再在 `main.c` 中标出第一次 GPIO 时钟使能的位置。能把它们连成“上电 → 启动代码 → SystemInit → main → while(1)”就是本章通过。
+```c
+RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+GPIO_Init(GPIOB, &gpio);
+GPIO_SetBits(GPIOB, GPIO_Pin_5);
+```
 
-| 误解 | 正确理解 |
-|---|---|
-| MCU 也会自动运行 main | 复位后先执行启动文件，启动文件再调用系统初始化和 main |
-| Flash 只是硬盘 | Flash 是 CPU 可直接取指的程序存储；SRAM 才承载运行期数据 |
-| while(1) 是低级写法 | 裸机程序本来就需要持续运行；关键是循环内是否有阻塞和状态管理 |
+第一行使能 GPIOB 所在外设时钟。STM32F1 为了控制功耗，很多外设复位后默认没有时钟；在配置这类外设前，应先使能对应 RCC 时钟。没有时钟时，外设不会按正常工作状态响应配置，具体寄存器行为要以参考手册为准。
 
-练习：画出你第 0 章 blink 工程的文件关系图，并用一句话说明每个文件在上电后的作用。
+## 1.6 读一段最小 GPIO 代码
 
-### 用 GDB 验证启动路径
+下面用 PB5 上的外接 LED 演示 SPL 调用。PB5 只是实验引脚，板载 LED 继续由 `board.h` 配置。
 
-把“我以为程序跑到了 `main`”变成可检查的事实。烧录后启动 OpenOCD，再在另一个终端执行：
+先包含需要的头文件：
+
+```c
+#include "stm32f10x.h"
+#include "stm32f10x_rcc.h"
+#include "stm32f10x_gpio.h"
+```
+
+然后打开 GPIOB 时钟：
+
+```c
+RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+```
+
+配置 PB5 为推挽输出：
+
+```c
+GPIO_InitTypeDef gpio;
+
+GPIO_StructInit(&gpio);
+gpio.GPIO_Pin = GPIO_Pin_5;
+gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+gpio.GPIO_Speed = GPIO_Speed_2MHz;
+GPIO_Init(GPIOB, &gpio);
+```
+
+`GPIO_StructInit()` 先给结构体填入 SPL 定义的默认值，再覆盖本次需要的字段。这样所有字段都有明确值。
+
+输出高低电平：
+
+```c
+GPIO_ResetBits(GPIOB, GPIO_Pin_5);
+GPIO_SetBits(GPIOB, GPIO_Pin_5);
+```
+
+在 STM32F1 SPL 中，`GPIO_SetBits()` 写 GPIO 的 BSRR 置位部分，`GPIO_ResetBits()` 写 BRR 完成复位。两种操作都通过“写 1 触发对应位”的寄存器完成，不需要先读 ODR、修改某一位再写回，因此适合单独改变指定 GPIO。
+
+如果 LED 是低电平点亮，那么 `GPIO_ResetBits()` 会让它亮，`GPIO_SetBits()` 会让它灭；高有效 LED 的结果相反。有效电平由实际电路决定。
+
+## 1.7 `while (1)` 为什么一直存在
+
+裸机固件通常不会像命令行程序那样执行完后退出。`main()` 完成初始化后，会进入长期运行的主循环：
+
+```c
+while (1) {
+    ReadInputs();
+    UpdateState();
+    DriveOutputs();
+}
+```
+
+程序运行到这里后会一直循环，直到复位或断电。真正需要关心的是循环里每次做多少工作、有没有长时间阻塞，以及中断和主循环之间怎样交换数据。
+
+第 0 章的 blink 工程已经使用 SysTick 计时，没有继续采用这种空循环延时：
+
+```c
+for (volatile uint32_t i = 0; i < 500000U; ++i) {
+}
+```
+
+空循环的实际时间会随主频、编译器和优化等级变化，而且执行期间 CPU 一直被占用。第 5 章会继续把时基、回绕和非阻塞等待讲清楚。
+
+## 1.8 SPL 在这里做了什么
+
+SPL 没有改变硬件工作方式。它主要把寄存器位操作整理成结构体和函数。
+
+例如：
+
+```c
+GPIO_Init(GPIOB, &gpio);
+```
+
+内部会根据 `GPIO_Pin`、`GPIO_Mode` 和 `GPIO_Speed` 计算 STM32F1 的 CRL/CRH 配置位并写入寄存器。你可以直接打开 `stm32f10x_gpio.c` 看实现。
+
+这也是本书前面使用 SPL 的原因：写代码时不用每次手算寄存器位，同时还能顺着函数看到具体寄存器操作。以后换 HAL 时，可以继续用同样的方法追它的初始化流程。
+
+## 1.9 用 GDB 再走一次启动路径
+
+烧录第 0 章的 blink 工程后启动 OpenOCD，然后连接 GDB：
 
 ```gdb
 arm-none-eabi-gdb build/blink.elf
@@ -250,23 +231,56 @@ arm-none-eabi-gdb build/blink.elf
 (gdb) continue
 ```
 
-先命中 `Reset_Handler`、再命中 `main`，才说明向量表、链接脚本和基本启动链路一致。若第一个断点都不命中，先回第 0 章检查 HD 启动文件、`FLASH` 起始地址和 OpenOCD 连接；不要先怀疑 GPIO。
+命中 `Reset_Handler` 后，可以用：
 
-## 1.7 本章要点
+```gdb
+(gdb) info registers sp pc
+```
 
-- PC 上有 JVM → OS → 驱动 → 硬件；嵌入式只有你的 C 代码 → 寄存器 → 硬件
-- MCU 上电 → 取中断向量表第一条（栈顶）→ 取第二条（Reset_Handler）→ `SystemInit()` → `main()` → `while(1)` 永远循环
-- STM32F103ZET6 的 Flash（512KB）= 你程序的「永久存储」；SRAM（64KB）= 全局变量 + 堆 + 栈
-- SPL 版 `main.c` 的每一行都是你手动写的配置代码，没有 CubeMX 生成的「黑箱」
-- 使用任何外设前必须先使能对应时钟——这是 STM32 的铁律，忘记就是硬件不响应
-- SPL 的 `GPIO_SetBits/ResetBits` 通过 BSRR 寄存器实现原子操作——写 1 生效，写 0 无效，不用读-改-写
+查看当前栈指针和程序计数器。继续运行到 `main`，再比较 PC 的位置。
 
----
+如果 `Reset_Handler` 断点都不能命中，先检查启动文件、链接地址、烧录结果和 OpenOCD 连接。如果能进入 `main`，启动链路已经成立，GPIO 或 LED 的问题再到外设配置里查。
 
-> **下一章**：[第 2 章 · STM32F103 硬件概览](./02-chapter.md)
->
-> 你知道了 MCU 怎么跑程序。接下来我们打开芯片的「内部地图」——存储器映射、总线矩阵、时钟树。这些概念决定了后面你写的每一行代码。
+## 1.10 本章练习
 
----
+先打开自己的 `startup_stm32f10x_hd.s` 和 `link.ld`，找到：
+
+- 向量表第一项 `_estack`
+- 向量表第二项 `Reset_Handler`
+- `.data` 的 `_sidata`、`_sdata`、`_edata`
+- `.bss` 的 `_sbss`、`_ebss`
+- `SystemInit()`
+- `main()`
+
+然后在 `main.c` 新增两个变量：
+
+```c
+uint32_t initialized_value = 0x12345678U;
+uint32_t zero_value;
+```
+
+重新构建，用 MAP 文件或 `arm-none-eabi-nm` 找到它们。确认 `initialized_value` 属于 `.data`，`zero_value` 属于 `.bss`。
+
+最后画出这条路径：
+
+```text
+复位
+ ↓
+向量表
+ ↓
+Reset_Handler
+ ↓
+.data 复制 / .bss 清零
+ ↓
+SystemInit
+ ↓
+main
+ ↓
+while (1)
+```
+
+能根据工程里的实际文件解释这条路径，这一章就完成了。
 
 > **上一章**：[第 0 章 · 开发环境搭建（SPL版）](./00-chapter.md)
+>
+> **下一章**：[第 2 章 · STM32F103 硬件概览](./02-chapter.md)
