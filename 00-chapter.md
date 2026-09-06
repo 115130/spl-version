@@ -1,65 +1,53 @@
 # 第 0 章 · 开发环境搭建（ZET6 SPL 版）
 
-> **本章产出**：一个可构建、可烧录、可调试的 STM32F103ZET6 SPL 最小工程，而不是只在教程里“看起来能运行”的代码。
->
-> **硬件前置**：先完成 [第 0.5 章](./00.5-hardware-basics.md)。你至少应能确认 SWDIO、SWCLK、GND、板卡供电方式，以及 LED 的实际引脚与有效电平。
->
-> **通过标准**：生成 ELF/BIN/HEX/MAP；OpenOCD `verify` 成功；GDB 能先停在 `Reset_Handler` 再停在 `main`；LED 以约 500 ms 开、500 ms 关的节奏变化。
+这一章把最小工程真正跑起来：能编译、能烧录、能调试，最后让板载 LED 按约 500 ms 的节奏亮灭。
 
----
+开始前先完成 [第 0.5 章](./00.5-hardware-basics.md)。至少确认 SWDIO、SWCLK、GND、板卡供电方式，以及 LED 的实际引脚和有效电平。
 
-## 0.1 这一章解决什么问题
+完成这一章后，你应该能得到 ELF、BIN、HEX 和 MAP 文件；OpenOCD `verify` 成功；GDB 能停在 `Reset_Handler` 和 `main`；LED 的实际行为和 `board.h` 配置一致。
 
-你熟悉的 Web 项目通常由运行时、操作系统和 IDE 接住大量细节；裸机工程必须明确回答下面六个问题：
+## 0.1 先把工程身份固定下来
 
-| 问题 | 本章中的答案 |
-|---|---|
-| 由谁把 C 编译成 ARM 指令？ | `arm-none-eabi-gcc` |
-| 哪些 SPL 源文件参与构建？ | Makefile 中明确列出的 RCC、GPIO、CMSIS 文件 |
-| 复位后从哪里开始？ | HD 启动文件的完整中断向量表与 `Reset_Handler` |
-| 程序和变量分别放在哪里？ | 链接脚本：Flash 512KB、SRAM 64KB |
-| 如何烧录与调试？ | OpenOCD + ST-Link/DAP-Link + GDB |
-| LED 实际在哪个引脚？ | `board.h`；由你的原理图/测量确认 |
+本书的硬件基线是 STM32F103ZET6。对应的 SPL 宏是 `STM32F10X_HD`，启动文件使用 `startup_stm32f10x_hd.s`，链接脚本按 512 KB Flash 和 64 KB SRAM 配置。调试接口使用 SWD，核心信号是 PA13（SWDIO）、PA14（SWCLK）和 GND。
 
-本书不支持把 C8T6/MD 工程改几个宏后“凑合运行”。ZET6 的工程身份必须始终一致：
+这几项必须互相匹配。拿 C8T6 或 Medium Density 工程改几个宏，可能编译能过，但启动文件里的中断向量、芯片密度宏和链接脚本已经不一致，后面很难排错。
 
-| 项目 | 固定值 |
-|---|---|
-| MCU | STM32F103ZET6（LQFP144） |
-| SPL 宏 | `STM32F10X_HD` |
-| 启动文件 | `startup_stm32f10x_hd.s` |
-| Flash / SRAM | 512KB / 64KB |
-| 调试接口 | SWD：PA13、PA14、GND |
+板载 LED、按键、USB 串口和 SPI Flash 的接线属于开发板配置。把这些信息统一写进 [板卡资源约定](./board-zet6-profile.md)，代码里通过 `board.h` 使用。
 
-板载 LED、按键、USB 串口、板载 Flash 的接线不是上述“芯片身份”的一部分。请先填写 [板卡资源约定](./board-zet6-profile.md)；它是全书唯一的板卡事实入口。
+## 0.2 安装工具链
 
-## 0.2 安装命令行工具
+PC 上的编译器默认生成 x86-64 或 ARM64 程序，STM32F103 使用 Cortex-M3 指令集，需要 `arm-none-eabi` 交叉工具链。
 
-### ARM GCC 交叉编译器
-
-你的 PC 是 x86-64/ARM64，而目标是 Cortex-M3；因此必须使用“为 ARM 生成代码”的交叉编译器。
+Ubuntu / Debian：
 
 ```bash
-# Ubuntu/Debian
 sudo apt install gcc-arm-none-eabi binutils-arm-none-eabi
+```
 
-# Arch
+Arch：
+
+```bash
 sudo pacman -S arm-none-eabi-gcc arm-none-eabi-binutils
+```
 
-# Fedora
+Fedora：
+
+```bash
 sudo dnf install arm-none-eabi-gcc arm-none-eabi-binutils
+```
 
+安装后检查：
+
+```bash
 arm-none-eabi-gcc --version
 arm-none-eabi-objcopy --version
 arm-none-eabi-gdb --version
 ```
 
-### OpenOCD
-
-OpenOCD 让命令行、GDB 与 ST-Link/DAP-Link 通过 SWD 通信。
+还需要 OpenOCD。它负责通过 ST-Link 或 DAP-Link 与 STM32 的 SWD 接口通信，GDB 也通过它访问目标芯片。
 
 ```bash
-# Ubuntu/Debian
+# Ubuntu / Debian
 sudo apt install openocd
 
 # Arch
@@ -71,11 +59,11 @@ sudo dnf install openocd
 openocd --version
 ```
 
-Linux 上若普通用户无法访问调试器，需要为**自己的调试器型号**配置 udev 规则。先用 `lsusb` 看 VID:PID，再按发行版与调试器官方文档添加规则；不要把来源不明的 `0666` 规则当成通用解法。规则生效后，重新插拔调试器并确认 OpenOCD 能连接。
+如果 OpenOCD 用 `sudo` 能连、普通用户不能连，先运行 `lsusb` 找到调试器的 VID:PID，再按发行版或调试器文档配置 udev 规则。规则修改后重新插拔调试器，再用普通用户测试。
 
-## 0.3 获取并识别 SPL
+## 0.3 准备 SPL
 
-本章按 ST 的 `STM32F10x_StdPeriph_Lib_V3.5.0` 目录结构编写。下载/解压后，不要把 CMSIS、驱动源码、头文件随机散拷到多个工程；先保持原始库树，并通过 `SPL_ROOT` 指向它。
+本书按 `STM32F10x_StdPeriph_Lib_V3.5.0` 的目录结构编写。解压后保留原始目录，工程通过 `SPL_ROOT` 引用它，不需要把 CMSIS 和驱动文件复制到每个示例里。
 
 ```text
 STM32F10x_StdPeriph_Lib_V3.5.0/
@@ -86,41 +74,47 @@ STM32F10x_StdPeriph_Lib_V3.5.0/
     │       ├── system_stm32f10x.c
     │       └── stm32f10x.h
     └── STM32F10x_StdPeriph_Driver/
-        ├── inc/      ← GPIO、RCC 等头文件
-        └── src/      ← GPIO、RCC 等实现
+        ├── inc/
+        └── src/
 ```
 
-最小 blink 只需要 CMSIS、`system_stm32f10x.c`、RCC 与 GPIO。之后每增加一个外设，才把对应 SPL 的 `.c` 文件和头文件加入 Makefile/`stm32f10x_conf.h`。**头文件被 include 不等于实现已经参与链接**；最终是否链接，由 Makefile 的源文件列表决定。
+第一个 blink 工程只需要 CMSIS、`system_stm32f10x.c`、RCC 和 GPIO。以后用到 USART、SPI、ADC 等外设，再把对应的 SPL `.c` 文件加入 Makefile，并在 `stm32f10x_conf.h` 中包含相应头文件。
 
-## 0.4 使用可构建的起步工程
+这里要分清头文件和实现文件。`#include "stm32f10x_gpio.h"` 只让编译器知道 `GPIO_Init()` 的声明；链接阶段还需要 `stm32f10x_gpio.c` 编译出的目标文件，否则会出现 `undefined reference to GPIO_Init`。
 
-仓库中的 [`examples/00-blink-zet6`](./examples/00-blink-zet6) 是本书第一个工程的唯一源码版本。不要手抄下面以外的旧 Makefile、旧链接脚本或不完整向量表。
+## 0.4 编译第一个工程
+
+仓库里的 [`examples/00-blink-zet6`](./examples/00-blink-zet6) 是这一章对应的完整工程。
 
 ```bash
 cd examples/00-blink-zet6
 
-# 先只验证 SPL 路径。失败时不要继续编译。
-make check-spl SPL_ROOT=$HOME/opt/STM32F10x_StdPeriph_Lib_V3.5.0
+make check-spl \
+  SPL_ROOT=$HOME/opt/STM32F10x_StdPeriph_Lib_V3.5.0
 
-# 编译，并生成 ELF/BIN/HEX/MAP。
-make SPL_ROOT=$HOME/opt/STM32F10x_StdPeriph_Lib_V3.5.0
+make \
+  SPL_ROOT=$HOME/opt/STM32F10x_StdPeriph_Lib_V3.5.0
 ```
+
+`check-spl` 先检查库路径。它失败时先修正 `SPL_ROOT`，不要继续追编译错误。
 
 工程结构如下：
 
 ```text
 00-blink-zet6/
-├── Makefile               ← 工具链、SPL 路径、参与编译的源码
-├── link.ld                ← ZET6 的 Flash/SRAM 与段布局
-├── main.c                 ← SysTick 1 ms 时基 + LED 状态机
-├── board.h                ← 唯一允许写板载 LED 物理引脚的地方
-├── stm32f10x_conf.h       ← 本例启用的 SPL 头文件
-└── build/                 ← 自动生成，禁止手工编辑
+├── Makefile
+├── link.ld
+├── main.c
+├── board.h
+├── stm32f10x_conf.h
+└── build/
 ```
 
-启动文件位于仓库根目录 [`code/startup_stm32f10x_hd.s`](./code/startup_stm32f10x_hd.s)，由 Makefile 以相对路径编译。它包含高容量 F1 的完整向量表：除了常见 GPIO/USART 中断，还包括 ADC3、FSMC、SDIO、TIM5–7、SPI3、UART4/5、DMA2 等条目。不能用 C8T6/Medium Density 启动文件替代它。
+`Makefile` 决定用什么编译器、从哪里找 SPL、哪些源码参与构建。`link.ld` 定义 Flash、SRAM 和各段的位置。`main.c` 负责 SysTick 和 LED 逻辑，`board.h` 保存板卡相关引脚，`build/` 只放自动生成的文件。
 
-### 读懂 Makefile 的关键部分
+启动文件在仓库根目录 [`code/startup_stm32f10x_hd.s`](./code/startup_stm32f10x_hd.s)。它包含 High Density STM32F1 的中断向量表和 `Reset_Handler`，不能替换成 Medium Density 版本。
+
+Makefile 里最关键的几行是：
 
 ```makefile
 SPL_ROOT ?= ../../STM32F10x_StdPeriph_Lib_V3.5.0
@@ -133,43 +127,32 @@ OBJS += $(BUILD)/stm32f10x_rcc.o $(BUILD)/stm32f10x_gpio.o
 LDFLAGS += -Wl,--gc-sections,-Map,$(BUILD)/$(TARGET).map,--cref
 ```
 
-| 项 | 作用 | 出错时先看什么 |
-|---|---|---|
-| `SPL_ROOT` | 未修改 SPL 根目录的位置 | 目录下是否同时存在 `Libraries/CMSIS` 和 `Libraries/STM32F10x_StdPeriph_Driver` |
-| `STM32F10X_HD` | 让设备头文件选择高容量 F1 定义 | 不要写成 `MD`，也不要在多个文件重复定义不同密度 |
-| `-MMD -MP` | 生成头文件依赖，改 `.h` 后能重编 | `build/*.d` 是自动产物 |
-| `-ffunction-sections` + `--gc-sections` | 允许链接器删除未引用函数 | 不会替你修复漏加的 SPL `.c` 文件 |
-| `-Map` | 输出符号/段布局地图 | 这是 Flash/RAM 超限和符号冲突的第一手证据 |
+`STM32F10X_HD` 让设备头文件按 High Density 芯片选择定义。`OBJS` 决定哪些 SPL 实现最终参与链接；`-MMD -MP` 生成头文件依赖；`--gc-sections` 删除没有被引用的函数；`-Map` 生成链接地图，后面查 Flash、RAM 和符号位置都会用到。
 
-`Makefile` 中的命令行必须以 **Tab** 开头，不能用空格。若你复制后看到 `missing separator`，优先检查这一点。
+Makefile 的命令行必须以 Tab 开头。看到 `missing separator` 时，先检查命令前面是不是被编辑器换成了空格。
 
-### 链接脚本和启动文件必须配对
+## 0.5 启动文件和链接脚本怎么配合
 
-链接脚本不是“随便写个内存大小”。它向链接器承诺每个段放在哪里，并导出启动汇编需要的边界符号：
+STM32F103 复位后，CPU 从向量表取出初始栈顶地址和复位入口。启动文件里的 `Reset_Handler` 随后复制 `.data`、清零 `.bss`，完成后进入 C 运行环境，再调用 `main()`。
+
+链接脚本给这些步骤提供实际地址。ZET6 的内存区域是：
 
 ```ld
 FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
 RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 64K
 
 _estack = ORIGIN(RAM) + LENGTH(RAM);
-/* .data 在 RAM 运行、在 Flash 保存初始化值。 */
-_sdata, _edata, _sidata
-/* .bss 只占 RAM，复位时清零。 */
-_sbss, _ebss
 ```
 
-| 组件 | 契约 |
-|---|---|
-| 向量表第一项 | `_estack`，CPU 复位时装入 MSP |
-| `Reset_Handler` | 从 `_sidata` 复制到 `_sdata.._edata`，清零 `_sbss.._ebss` |
-| `.isr_vector` | 必须 `KEEP`，否则 `--gc-sections` 可能删除入口 |
-| 链接脚本 | 为 ZET6 保留 512KB Flash、64KB SRAM，并在 RAM 溢出时失败 |
+初始化过的全局变量运行时放在 RAM，但初始值保存在 Flash。启动代码根据 `_sidata`、`_sdata`、`_edata` 把它们复制到 RAM；未初始化的全局变量落在 `.bss`，由 `_sbss` 和 `_ebss` 标出范围，复位时清零。
 
-如果启动文件使用 `_data_start`、而链接脚本只提供 `_sdata`，或者向量表段名与链接脚本 `KEEP` 的段名不同，构建即使侥幸通过，复位后也可能无法到达 `main`。本书模板已经统一使用 `_sidata/_sdata/_edata/_sbss/_ebss` 和 `.isr_vector`。
+向量表所在的 `.isr_vector` 需要在链接脚本中用 `KEEP` 保留。工程启用了 `--gc-sections`，没有 `KEEP` 时，链接器可能把入口段当成未引用内容删除。
 
-### `board.h`：把“板子差异”关进一个文件
+启动文件和链接脚本使用的符号名必须一致。比如启动文件查找 `_sdata`，链接脚本就要提供 `_sdata`；段名也一样，启动文件把向量表放进 `.isr_vector`，链接脚本就要保留这个段。
 
-模板默认把 PC13、低有效作为**常见示例**，并非所有 ZET6 板都如此。先修改下面三个宏，再运行程序：
+## 0.6 在 `board.h` 里写板卡差异
+
+模板默认示例使用 PC13、低电平点亮：
 
 ```c
 #define BOARD_LED_PORT       GPIOC
@@ -177,58 +160,78 @@ _sbss, _ebss
 #define BOARD_LED_ACTIVE_LOW 1
 ```
 
-业务代码只调用 `BoardLed_Init()` 与 `BoardLed_Write(on)`。换板时改 `board.h`，不要把同一份 LED 引脚复制到第 3、7、8 章的业务文件里。
+先根据自己的原理图确认这三个值。很多 STM32F103 开发板的 LED 接法不同，有的接 PC13，有的接 PB5，也有高电平点亮的设计。
 
-### 为什么 blink 不再用空循环延时
+业务代码只调用：
 
-`main.c` 配置 SysTick 为 1 ms：
+```c
+BoardLed_Init();
+BoardLed_Write(1U);
+```
+
+以后换板时，优先改板级配置，不要把具体 LED 引脚散落到各章代码里。
+
+## 0.7 用 SysTick 做 500 ms 闪烁
+
+这个工程不使用空循环延时。空循环持续时间会受主频、编译优化和指令生成结果影响，同一段源码换一个优化等级，实际延时就可能变化。
+
+`main.c` 把 SysTick 配成 1 ms 中断：
 
 ```c
 SystemCoreClockUpdate();
 SysTick_Config(SystemCoreClock / 1000U);
 ```
 
-中断中只做 `g_ms++`；主循环用无符号减法判断经过的时间。这样即使计数器回绕，`(uint32_t)(now - start) < delay` 仍在一个周期内成立。`__WFI()` 让 CPU 在等待 SysTick 中断时休眠，而不是用一个对优化等级和时钟频率敏感的空循环占满 CPU。第 5 章会系统讲时钟与这个时基的边界。
+SysTick ISR 每次只把毫秒计数加一。主循环记录起始时间，通过无符号减法判断已经过去多少毫秒；这种写法可以正确跨过 `uint32_t` 回绕点，只要单次比较的时间跨度小于计数器周期。
 
-## 0.5 构建、烧录与调试
+等待下一次事件时可以执行 `__WFI()`。CPU 会停下来等中断，SysTick 到来后继续运行，不需要让空循环一直占用处理器。
 
-### 构建产物分别是什么
+## 0.8 看懂构建结果
 
-| 文件 | 用途 |
-|---|---|
-| `build/blink.elf` | 带符号和调试信息；烧录/调试首选它 |
-| `build/blink.bin` | 裸二进制，适合某些下载器 |
-| `build/blink.hex` | Intel HEX，适合某些烧录工具 |
-| `build/blink.map` | 段、符号、交叉引用；分析占用和链接问题 |
+成功构建后，`build/` 里会有几种文件：
 
-构建后先检查容量，而不是看到“Build finished”就结束：
+- `blink.elf`：包含机器码、符号和调试信息，GDB 使用它。
+- `blink.bin`：纯二进制镜像。
+- `blink.hex`：Intel HEX 格式镜像。
+- `blink.map`：链接器生成的段和符号地图。
+
+先看看程序实际占用了多少空间：
 
 ```bash
 arm-none-eabi-size build/blink.elf
-arm-none-eabi-nm -n build/blink.elf | rg '(_estack|_sidata|_sdata|_edata|_sbss|_ebss|Reset_Handler|main)'
 ```
 
-`size` 的数值是当前镜像占用，不是芯片总容量；64KB RAM 和 512KB Flash 的上限由 `link.ld` 保证。若链接报 RAM overflow，先看 map 中的 `.bss`、`.data` 和栈预留，而不是擅自把内存长度改大。
-
-### 连接和烧录
-
-断电确认 SWD 线序后，按第 0.5 章的供电方式连接目标板和调试器。然后：
+再确认关键启动符号存在：
 
 ```bash
-make flash SPL_ROOT=$HOME/opt/STM32F10x_StdPeriph_Lib_V3.5.0
+arm-none-eabi-nm -n build/blink.elf \
+  | rg '(_estack|_sidata|_sdata|_edata|_sbss|_ebss|Reset_Handler|main)'
 ```
 
-该目标执行 `program ... verify reset exit`。日志出现 `verified` 只证明 Flash 写入与读回一致；它不证明 LED 引脚、有效电平或板载电路假设正确。
+`size` 显示的是当前程序占用，不代表芯片总容量。Flash 512 KB、SRAM 64 KB 的边界由 `link.ld` 限制；如果链接器报告 RAM overflow，要从 MAP 文件里查 `.bss`、`.data` 和栈占用。
 
-### 用 GDB 验证“代码确实在跑”
+## 0.9 烧录
 
-终端 A：
+先断电检查 SWDIO、SWCLK、GND 和供电，再连接调试器。接线确认后执行：
+
+```bash
+make flash \
+  SPL_ROOT=$HOME/opt/STM32F10x_StdPeriph_Lib_V3.5.0
+```
+
+这个目标通过 OpenOCD 写入程序，并执行 `verify`。日志出现 `verified`，说明写入 Flash 的内容读回后与镜像一致。
+
+如果 `verify` 成功但 LED 没动，烧录链路已经基本确认，可以继续检查 `board.h`、LED 有效电平和实际板卡接线。
+
+## 0.10 用 GDB 检查启动过程
+
+LED 不亮时，先确认程序有没有进入 `main()`。终端 A 启动 OpenOCD：
 
 ```bash
 make debug
 ```
 
-终端 B：
+终端 B 启动 GDB：
 
 ```gdb
 arm-none-eabi-gdb build/blink.elf
@@ -239,46 +242,32 @@ arm-none-eabi-gdb build/blink.elf
 (gdb) continue
 ```
 
-先命中 `Reset_Handler`、再命中 `main`，再观察 LED。这样可以把“启动链路错误”和“LED 接线错误”分开排查。
+正常情况下会先停在 `Reset_Handler`，继续后再停在 `main`。如果连 `Reset_Handler` 都到不了，重点检查启动文件、向量表、链接脚本和芯片连接；如果能到 `main`，再查 LED 引脚和 GPIO 配置。
 
-## 0.6 常见失败路径
+## 0.11 常见问题
 
-| 现象 | 证据/原因 | 先做什么 |
-|---|---|---|
-| `arm-none-eabi-gcc: command not found` | 工具链未装或 PATH 不含它 | 运行 `arm-none-eabi-gcc --version` |
-| `SPL_ROOT must point ...` | 路径不是 SPL 根目录或库版本结构不同 | 运行 `make check-spl SPL_ROOT=...`，检查三个必需 `.c` 文件 |
-| `undefined reference to GPIO_Init` | 头文件存在但 `stm32f10x_gpio.c` 未参与链接 | 检查 Makefile 的 `OBJS`，不要只加 include |
-| OpenOCD 找不到目标 | 供电、GND、SWDIO/SWCLK、权限或调试器配置错误 | 回第 0.5 章，先量供电并确认线序 |
-| `verify` 成功但不能到 `main` | 启动文件、向量表段、链接脚本符号不一致 | 用 GDB 断在 `Reset_Handler`；核对 HD 文件和 `.isr_vector` |
-| 到了 `main` 但 LED 不动 | LED 引脚、低/高有效、板载电路不符 | 修改 `board.h`，或先用万用表测该 GPIO 电平 |
-| LED 亮但节奏错误/串口乱码 | 时钟假设与实际不一致 | 记录 `SystemCoreClock`，第 5/8 章再校准时钟/波特率 |
+`arm-none-eabi-gcc: command not found`：先运行 `arm-none-eabi-gcc --version`。命令本身找不到，就检查工具链安装和 `PATH`。
 
-## 0.7 本章验收与练习
+`SPL_ROOT must point ...`：检查 `SPL_ROOT` 是否指向 `STM32F10x_StdPeriph_Lib_V3.5.0` 根目录，并确认下面存在 `Libraries/CMSIS` 和 `Libraries/STM32F10x_StdPeriph_Driver`。
 
-完成后保存一次实验记录：
+`undefined reference to GPIO_Init`：通常是 `stm32f10x_gpio.c` 没有参与链接。头文件已经找到，只说明编译阶段通过；继续检查 Makefile 的对象文件列表。
 
-- [ ] 写下板卡的实际 LED 端口、引脚和有效电平；
-- [ ] `make check-spl`、`make` 和 `make flash` 的输出已保存；
-- [ ] `build/blink.map` 存在，链接脚本写的是 512KB Flash / 64KB RAM；
-- [ ] GDB 断点已分别命中 `Reset_Handler` 与 `main`；
-- [ ] LED 的实际观察结果与 `board.h` 匹配。
+OpenOCD 找不到芯片：先量目标板供电，再查 GND、SWDIO、SWCLK、调试器配置和 Linux 权限。不要先改程序代码。
 
-练习按风险从低到高进行：
+`verify` 成功，但 GDB 到不了 `main`：检查是否真的用了 `startup_stm32f10x_hd.s`、`STM32F10X_HD` 和 ZET6 链接脚本，再核对 `.isr_vector` 和启动符号。
 
-1. 只改 `board.h` 的有效电平，预测 LED 行为并恢复；
-2. 在 `main.c` 添加一个已初始化全局变量和一个未初始化全局变量，用 `nm`/map 找到它们分别进入 `.data` 与 `.bss`；
-3. 复制整个目录到临时位置，把链接脚本故意改为 20KB RAM，观察 `size`、map 和链接错误的变化，然后恢复。不要在可用工程中做破坏性实验。
+GDB 能到 `main`，LED 仍不闪：检查 `board.h`。用万用表或逻辑分析仪量目标 GPIO，能看到约 500 ms 高低变化时，程序已经在工作，剩下是 LED 接线或有效电平问题。
 
-## 0.8 本章要点
+## 0.12 验收和练习
 
-- ZET6 工程身份是 HD 启动文件、`STM32F10X_HD`、512KB Flash、64KB SRAM 的组合；四者缺一不可。
-- Makefile 的源码列表决定真正参与链接的 SPL 驱动；头文件不会自动带来实现。
-- 启动文件、向量表段名、链接脚本符号和内存长度是一个不可拆分的契约。
-- `board.h` 隔离开发板差异；芯片功能表不能替代原理图。
-- `verify`、GDB 断点、GPIO 电平/LED 观察分别验证不同层次，不能用其中一个代替全部。
+做完后保存这些结果：实际 LED 端口和有效电平、`make check-spl` 输出、构建输出、`build/blink.map`、OpenOCD `verify` 结果，以及 GDB 命中 `Reset_Handler` 和 `main` 的记录。
 
----
+然后做三个小实验：
+
+1. 修改 `BOARD_LED_ACTIVE_LOW`，先预测 LED 会发生什么，再实际验证并恢复。
+2. 在 `main.c` 增加一个已初始化全局变量和一个未初始化全局变量，用 `arm-none-eabi-nm` 或 MAP 文件确认它们分别进入 `.data` 和 `.bss`。
+3. 复制工程到临时目录，把链接脚本里的 RAM 改成 20 KB，观察链接器在什么情况下开始报告 RAM overflow。实验结束后删除临时目录，不修改正常工程。
+
+到这里，第一个 ZET6 SPL 工程已经具备完整的构建、烧录和调试链路。下一章开始看复位向量、Flash、SRAM、栈和 `main()` 之间的关系。
 
 > **下一章**：[第 1 章 · 什么是嵌入式系统](./01-chapter.md)
->
-> 现在工程已经能被验证。下一章解释复位向量、Flash、SRAM、栈和 `main()` 是如何连成一条启动链路的。
