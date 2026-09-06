@@ -1,244 +1,245 @@
-# 第 19 章 · 温度记录仪 BLE 版（SPL版）
+# 第 19 章 · 温度记录仪 BLE 版（SPL 版）
 
-> **本章产出**：把第 18 章的温度记录仪从“连接路由器后上报”改为“由手机近距离读取”；理解 BLE 的广播、连接、特征值和通知在 AT 模块项目中的位置。
->
-> **前置知识**：第 17 章无线与 AT 模块、第 18 章温度记录仪。
->
-> **用在哪**：手机调试、低功耗传感器、近距离配置与控制。
+这一章复用第 18 章的传感器、`TempSample` 和状态字段，只替换通信层：数据不再经过路由器和 TCP 网关，而是通过 BLE 模块发给附近的手机。重点放在广播、连接、Characteristic、Notify、控制命令和重连边界。
 
----
+具体 AT 命令、UUID 配置方式和最大载荷取决于模块固件。本章先固定 MCU 侧业务协议和任务职责，再把它映射到手头模块支持的 GATT 接口。
 
-## 19.1 BLE 不是把 WiFi 命令换个名字
+## 19.1 先确定模块能提供什么
 
-第 18 章的 WiFi 路径是：
+BLE AT 模块大致有两种常见形态。第一种是 UART 透传模块，Service 和 Characteristic 已经由固件固定，STM32 只负责收发字节。第二种允许通过 AT 命令配置 UUID、Notify、读写属性和连接参数。
 
-~~~text
-STM32 → AT 模块 → 路由器 → TCP 网关
-~~~
+选模块时先查手册并记录：
 
-BLE 的典型路径是：
+- 是否能配置 Service / Characteristic UUID；
+- 哪个 Characteristic 支持 Notify；
+- 手机写入数据时模块怎样通过 UART 上报；
+- 连接、断开和订阅 Notify 是否有独立事件；
+- 模块是否报告 MTU 或单次可发送载荷上限；
+- 模块复位后哪些配置需要重新设置。
 
-~~~text
-STM32 → AT 模块 → 手机
-~~~
+这些能力确认以后，MCU 侧代码才知道自己是在控制 GATT，还是只在一条固定的 BLE 串口通道里收发业务帧。
 
-WiFi 更像设备主动连接服务器；BLE 常常先广播，让手机发现后再连接。因此，连接状态、数据方向和功耗策略都不同。
+## 19.2 GATT 契约先写清楚
 
-## 19.2 认识 BLE 的四个对象
+如果模块支持自定义 GATT，可以把温度记录仪设计成三个逻辑接口：
 
-| 名词 | 先这样理解 |
-|---|---|
-| 广播 Advertising | 设备周期性喊“我在这里” |
-| 连接 Connection | 手机选择一个设备后建立会话 |
-| Service | 一组相关功能，例如环境监测 |
-| Characteristic | 可读、可写、可通知的数据项 |
-
-例如可设计：
-
-~~~text
+```text
 Environmental Service
-  ├─ Temperature Characteristic：Notify
-  ├─ Humidity Characteristic：Notify
-  └─ Command Characteristic：Write
-~~~
+  ├─ Telemetry Characteristic : Notify
+  ├─ Control Characteristic   : Write / Write With Response
+  └─ Status Characteristic    : Read + Notify
+```
 
-若使用 AT 模块，Service 与 Characteristic 可能由模块固件预定义，也可能通过 AT 命令配置。必须以模块手册为准，不能把一个模块的命令照搬到另一个模块。
+Telemetry 只发送传感器样本；Control 接收手机命令；Status 返回协议版本、错误计数或设备状态。若模块只有固定透传 Service，也继续保留这三个业务概念，只是在同一 UART/BLE 通道上用消息 `type` 区分。
 
-## 19.3 数据仍然需要协议
+Notify 必须在手机订阅后才发送。断开连接后，订阅状态失效；设备重新连接时不能假定客户端仍然开启 Notify。
 
-BLE Notify 也不是“天然完整的一条业务消息”。为温度记录仪定义最小帧：
+## 19.3 复用第 18 章的样本，不重复定义传感器协议
 
-~~~text
-SOF | type | seq | payload_len | payload | CRC
-~~~
+第 18 章已经有：
 
-其中：
+```c
+typedef struct {
+    uint32_t seq;
+    uint8_t status;
+    int16_t ntc_centi;
+    int16_t ds_centi;
+    int16_t dht_centi;
+    uint16_t humidity_permille;
+} TempSample;
+```
 
-- seq 用于识别重复通知；
-- payload 可以是定点温度、湿度和电池电压；
-- CRC 能帮助区分链路问题与解析错误。
+BLE 层只负责把这个样本包装成业务消息。不要为了 BLE 再定义一套不同的温度单位或错误表示，否则 WiFi 版和 BLE 版会逐渐变成两个不兼容项目。
 
-不要直接把 printf 文本当作长期协议；调试文本可变，二进制帧才适合程序稳定解析。
+业务消息可以统一成：
 
-## 19.4 一个清晰的 BLE 状态机
+```text
+magic | version | type | seq | payload_len | payload | crc16
+```
 
-~~~text
-INIT → ADVERTISING → CONNECTED → NOTIFYING
-             ↑             |          |
-             └── disconnect/error ────┘
-~~~
+其中 `type` 区分样本、命令、ACK 和状态。`payload_len` 明确指出后续长度；`seq` 用于发现重复和关联 ACK；CRC 负责检测应用层帧损坏。多字节字段仍按固定端序逐字段编码，不直接发送 C struct。
 
-每个状态都应通过模块的明确响应切换。手机断开后，模块应回到广播；STM32 不应该因为手机离开而停止采样或记录数据。
+## 19.4 连接状态和业务状态分开
 
-## 19.5 任务划分
+BLE 连接状态可以写成：
 
-~~~text
-Task_Sensor
-  → Queue_LatestSample
-  → Task_BLETx
-
-Task_BLE_Rx
-  → 解析写入命令
-  → Queue_Command
-
-Task_BLETx
-  → 仅在 CONNECTED 时发送 Notify
-~~~
-
-BLETxTask 应有发送频率限制。例如温度每秒更新一次已经足够；高频发送只会增加功耗、增加手机处理压力，也更难排查丢包。
-
-## 19.6 用手机验证，而不是猜
-
-推荐的验证顺序：
-
-1. 手机能发现设备广播名称；
-2. 连接成功后能看到 Service 与 Characteristic；
-3. 订阅 Notify 后每秒收到一条温度数据；
-4. 写入一条测试命令，STM32 在串口打印并返回状态；
-5. 关闭手机蓝牙，设备重新进入广播而不死机。
-
-记录手机应用、模块固件版本、广播间隔和连接参数；BLE 问题高度依赖这些条件。
-
-## 19.7 安全和功耗边界
-
-教学项目中可以用简单测试命令理解流程，但不要把它变成真实门锁或生产控制协议：
-
-- 不能因为收到字符串 OPEN 就执行危险动作；
-- 控制命令应有身份、序号、确认和超时；
-- 广播间隔越短，越容易被发现，但越耗电；
-- 真正的配对、绑定和加密能力由模块与手机系统共同决定。
-
-第 26 章会把这些原则放进一个门锁状态机中。
-
-## 19.8 从 UART 字节到可验证的 BLE 业务帧
-
-不同 BLE AT 模块把“广播、连接、Notify、写特征值”的命令暴露得并不一样，因此教材不把某家命令表硬编码为通用协议。对 STM32 侧，稳定的部分是：**无论模块怎样封装 GATT，业务数据仍应有自己的帧边界。**
-
-~~~c
+```c
 typedef enum {
-    BLE_MSG_SAMPLE = 0x01,
-    BLE_MSG_COMMAND = 0x02,
-    BLE_MSG_ACK = 0x03
-} BleMessageType;
+    BLE_OFFLINE,
+    BLE_ADVERTISING,
+    BLE_CONNECTED,
+    BLE_READY,
+    BLE_RECOVERING
+} BleLinkState;
+```
 
+`BLE_CONNECTED` 只表示手机和模块建立了连接；只有模块确认相关 Characteristic 可用、手机已经订阅 Notify 后，才进入 `BLE_READY`。这样可以避免“一连上就发 Notify”，但客户端实际上还没完成订阅。
+
+手机断开时，采样任务继续运行。是否缓存历史数据由产品需求决定：实时监视可以只保留最新值；需要查看断线期间历史则应接第 13 章的持久化日志，不能无限把样本堆在 RAM 里。
+
+模块重启或 UART 出现 `ready` 一类启动事件时，状态回到探测/恢复流程。不能只保留一个 `connected = true` 的布尔变量然后继续发送。
+
+## 19.5 BLETxTask 只在链路可用时发送
+
+如果手机只关心最新温湿度，可以使用长度 1 的覆盖 Queue：
+
+```c
+static QueueHandle_t latest_sample_queue;
+
+static void SensorTask(void *argument)
+{
+    TempSample sample;
+
+    (void)argument;
+
+    for (;;) {
+        Sensor_ReadAll(&sample);
+        xQueueOverwrite(latest_sample_queue, &sample);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+```
+
+BLE 发送任务等待最新值，并检查当前链路状态：
+
+```c
+static void BleTxTask(void *argument)
+{
+    TempSample sample;
+    uint8_t frame[64];
+
+    (void)argument;
+
+    for (;;) {
+        if (xQueueReceive(latest_sample_queue, &sample,
+                          portMAX_DELAY) != pdPASS)
+            continue;
+
+        if (Ble_GetLinkState() != BLE_READY)
+            continue;
+
+        size_t len = BleFrame_EncodeSample(frame, sizeof frame, &sample);
+        if (len == 0U)
+            continue;
+
+        if (!Ble_SendNotification(frame, len))
+            Ble_ReportSendError();
+    }
+}
+```
+
+这里没有承诺每个采样点都会到手机。长度 1 Queue 的含义就是“保留最新值”。如果项目需要完整历史，通信队列和离线存储要换成另一种策略。
+
+## 19.6 Notify 的载荷受模块和 MTU 限制
+
+一次 Notify 能发送多少业务字节，取决于 ATT MTU、模块固件和模块自己的 UART/GATT 封装。不能因为某台手机能一次显示 100 字节，就把 100 当成协议固定上限。
+
+应用层定义一个经过实测的 `BLE_PAYLOAD_MAX`，它应不超过模块文档和实际协商结果允许的范围。消息小于这个上限时直接发送；更长的数据再做分片。
+
+分片头可以包含：
+
+```c
 typedef struct {
-    uint8_t magic;         // 固定值，例如 0xA5
-    uint8_t type;
     uint16_t seq;
-    uint8_t length;        // payload 长度
-    /* payload[length] */
-    /* crc16 */
-} BleFrameHeader;
-~~~
-
-接收侧不要因为 UART 收到一段文本就立即执行动作。推荐状态机：
-
-~~~text
-WAIT_MAGIC → READ_HEADER → READ_PAYLOAD → READ_CRC → VALID / DROP
-                     ↑                         │
-                     └──── 长度非法或 CRC 错 ────┘
-~~~
-
-每次失败都丢弃当前半帧、增加错误计数，再回到 `WAIT_MAGIC`。这与第 24 章网关的字节流处理完全同构。
-
-### BLE 连接状态和业务状态分开
-
-| 连接状态 | 业务动作 |
-|---|---|
-| 未广播 | 只允许启动/配置模块，不发送样本 |
-| 广播中 | 本地采样继续，等待手机连接 |
-| 已连接 | 允许 Notify/读取；仍需要业务帧校验 |
-| 已断开 | 停止 Notify，保留本地缓存并重新广播 |
-| 模块异常 | 重新探测 AT，不把“未知状态”当作已连接 |
-
-### 手机验收流程
-
-1. 只验证广播：用通用 BLE 扫描工具看到预期设备名/服务；
-2. 再连接：确认模块向 STM32 报告连接事件；
-3. 只读取一个固定值：例如 `seq=1` 的温度样本；
-4. 开启 Notify：每秒收到一帧递增序号的数据；
-5. 从手机写入一个无害命令：例如 `GET_STATUS`；确认 STM32 先返回 ACK，再执行读取；
-6. 强制断开手机：确认采样和 UART 心跳继续。
-
-| 现象 | 优先检查 |
-|---|---|
-| 手机扫描不到 | 模块供电、广播状态、天线环境、模块手册配置 |
-| 能连但没有数据 | 连接事件是否被解析、Notify 是否启用、业务帧长度/CRC |
-| 手机发命令后设备异常 | 没有长度/类型/序号校验，或在 UART ISR 中做了业务处理 |
-| 断开后不再广播 | 状态机没有处理 DISCONNECTED 或模块需要重新配置 |
-
-练习：先用 LED 作为 `GET_STATUS` 的唯一副作用，只有收到“长度、CRC、序号都正确”的命令时才允许改变它。
-
-## 19.9 Notify 不是无限长消息：分片、确认与幂等
-
-BLE 的一次 Notify 能承载多少字节取决于协商 MTU、模块固件和手机侧实现。不要把业务消息刚好能在你的手机上显示当作协议保证。对超过保守载荷上限的数据，应用层明确分片：
-
-~~~c
-typedef struct {
-    uint16_t seq;          /* 同一条业务消息的编号 */
-    uint8_t part_index;    /* 从 0 开始 */
-    uint8_t part_count;    /* 总分片数 */
     uint8_t type;
-    uint8_t length;
-    /* payload[length] + crc */
+    uint8_t part_index;
+    uint8_t part_count;
+    uint8_t payload_len;
 } BleFragmentHeader;
-~~~
+```
 
-接收端必须先校验每片的长度/CRC，再按 `seq + part_index` 重组；超时、缺片或重复片都要形成可观察结果。对于控制命令尤其不要依赖“Notify 一定送到”：
+接收端按 `seq + part_index` 重组。缺片、重复片和超时都要丢弃整条未完成消息，不能把半条控制命令交给业务层。
 
-| 消息 | 是否需要应用层 ACK | 重复时如何处理 |
-|---|---|---|
-| 高频遥测 | 常常不需要 | 按 seq 丢弃旧值 |
-| 配置读取 | 建议需要 | 重复返回同一份状态 |
-| 改变状态的命令 | 必须需要 | 用 seq/状态机保证幂等 |
-| 安全相关动作 | 除 ACK 外还需认证/超时 | 默认拒绝，不凭重发放行 |
+温度样本本身很小，一般没有必要为了演示而强行分片。本节主要给后面较长配置、日志或固件信息建立边界。
 
-### 断连、重连与缓存策略
+## 19.7 控制命令必须能重复处理
 
-- **传感器数据**：按产品需求缓存最新值或有限历史，不能无限堆积；
-- **控制命令**：连接断开时立即失效，恢复连接后必须重新认证/确认；
-- **订阅/通知开关**：重连后不能假定手机仍已开启；
-- **模块复位**：回到第 17 章的 AT 探测，而不是只重新发送一条 Notify。
+手机写入 Control Characteristic 后，模块通常会把字节通过 UART 上报给 STM32。UART 接收层继续沿用第 17 章的字节流解析，先收满完整业务帧、检查长度和 CRC，再交给命令状态机。
 
-练习：让手机端故意在第 2 个分片后断开。设备应记录“未完成消息”，但绝不能把半条控制命令交给执行状态机。
+例如：
 
-## 19.10 先写 GATT 契约，再决定使用哪一种 BLE 模块
+```c
+typedef enum {
+    CMD_GET_STATUS = 0x01,
+    CMD_SET_PERIOD = 0x02
+} BleCommandType;
 
-本章既可能配合“UART 透传 BLE 模块”，也可能配合某个带 AT 指令的 BLE 模块。两者的能力差异很大：有的只能暴露固定服务，有的能配置 UUID、Notify 和连接参数。不要把本章的业务帧误写成所有模块都支持的 GATT 配置命令。
+typedef struct {
+    uint16_t seq;
+    BleCommandType type;
+    uint32_t value;
+} BleCommand;
+```
 
-先选一条明确路线：
+执行改变状态的命令前，先检查参数范围和 `seq`。如果手机因为超时重发同一个 `seq`，设备应返回同样的结果，不重复执行会产生副作用的操作。这就是幂等边界。
 
-| 路线 | 你需要从模块手册确认 | 教学边界 |
-|---|---|---|
-| UART 透传 | 固定 Service/Characteristic、如何收发字节、连接状态文本 | MCU 只定义业务帧，不能假定能控制任意 UUID 或 MTU |
-| 可配置 AT BLE 模块 | UUID、读/写/Notify、CCCD、MTU、最大连接数 | 每条 AT 命令以对应固件文档为准 |
-| 自己实现 BLE 协议栈 | BLE 栈、RAM、广播/连接/安全实现 | 超出本书 ZET6 + 通用 AT 模块的入门范围 |
+ACK 可以包含：
 
-无论模块路线如何，应用层都应先有一份可评审的契约：
+```text
+command_seq | result_code | current_state
+```
 
-| 项目 | 示例约定 |
-|---|---|
-| Service UUID | 项目自定义占位 UUID，发布前固定 |
-| Telemetry characteristic | `Notify`；仅发已校验的遥测帧 |
-| Control characteristic | `Write` 或 `Write With Response`；每帧有 seq、长度、CRC |
-| Status characteristic | `Read` + `Notify`；携带连接/错误/版本状态 |
-| 载荷上限 | 取“协商 MTU、模块限制、应用保守上限”三者中的最小值 |
-| Notify 开关 | 只有客户端明确订阅 CCCD 后才发送；断连后失效 |
+这样手机能区分“命令没到”“命令被拒绝”“命令已经执行但 ACK 丢了”。对于门锁、继电器等安全相关动作，还需要认证、授权和超时策略，本章不把简单 BLE 写命令当作安全控制方案。
 
-### 手机端验收不只看“能看到字符串”
+## 19.8 手机端怎样验收
 
-记录一份可复现的手机测试单：手机型号/系统、BLE 工具版本、服务 UUID、是否已启用 Notify、协商后的可用载荷、测试的 seq 范围和断连结果。若模块没有报告 MTU 或通知背压能力，就把应用层单包限制设得更保守，并在发送频率过高时统计丢弃/合并，而不是无限堆积。
+先用通用 BLE 工具验证链路，不急着写 App。测试顺序如下：
 
-## 19.11 本章要点
+1. 扫描到设备广播，并记录实际设备名和 Service UUID。
+2. 连接后确认模块向 STM32 报告连接事件。
+3. 找到 Telemetry Characteristic，并手动开启 Notify。
+4. 每秒收到一条递增 `seq` 的样本，状态位和数值都能正确解析。
+5. 向 Control Characteristic 写 `GET_STATUS`，收到带相同 `seq` 的 ACK。
+6. 重复发送同一条命令，确认不会重复产生副作用。
+7. 关闭手机蓝牙或强制断开，确认 STM32 采样继续，模块回到广播或恢复状态。
 
-- BLE 面向近距离手机连接，WiFi 面向路由器和互联网；
-- 广播、连接、Service、Characteristic 是 BLE 的基本组织方式；
-- Notify 传递的仍是字节流，业务协议需要长度、序号与校验；
-- 手机断开不应影响传感器采样和本地记录；
-- BLE 控制命令需要状态机和安全边界。
+测试记录里保存手机型号、系统版本、BLE 工具版本、模块固件、UUID、协商 MTU（如果可见）和发送频率。不同手机和模块组合出现差异时，这些信息能直接帮助定位。
 
----
+## 19.9 解析器和状态机分别统计什么
 
-[上一章：第 18 章 · 温度记录仪 WiFi 版](./18-chapter.md)
+BLE 运行时至少保留这些计数：
 
-[下一章：第 20 章 · TCP/IP 协议栈与温度记录仪](./20-chapter.md)
+```c
+typedef struct {
+    uint32_t connect_count;
+    uint32_t disconnect_count;
+    uint32_t notify_error;
+    uint32_t rx_bad_length;
+    uint32_t rx_bad_crc;
+    uint32_t duplicate_command;
+    uint32_t fragment_timeout;
+    uint32_t module_reset;
+} BleStats;
+```
+
+`rx_bad_crc` 增长说明业务帧解析失败；`module_reset` 增长说明无线模块本身重新启动；`notify_error` 增长则说明发送阶段失败。这些状态不能合并成一个“BLE error”。
+
+手机长时间不连接时，设备不应持续累积无上限的通知消息。实时遥测通常合并到最新值；历史记录另存本地。控制命令则只在当前连接会话内有效，断线后丢弃未完成命令。
+
+## 19.10 分阶段接入
+
+按下面顺序集成：
+
+1. **广播**：只验证手机能扫描到模块。
+2. **连接事件**：STM32 能收到连接和断开状态。
+3. **固定 Notify**：每秒发送固定 4 字节序列，手机端能稳定接收。
+4. **业务帧**：发送 `TempSample`，检查 version、seq 和 CRC。
+5. **Control 写入**：手机发送 `GET_STATUS`，STM32 解析后返回 ACK。
+6. **重连**：手机断开再连接，必须重新订阅 Notify，设备状态恢复正确。
+7. **故障测试**：模块复位、UART 溢出、错误长度、错误 CRC、重复命令都能留下计数。
+
+每一步只新增一个变量。这样手机收不到数据时，可以判断是广播、连接、订阅、模块 UART 还是业务帧的问题。
+
+## 19.11 练习
+
+1. 让 Telemetry 只发送最新样本，手机断开 30 秒后重连，确认第一条收到的是当前值而不是积压的 30 条旧数据。
+2. 给 `CMD_SET_PERIOD` 增加范围检查，只接受 200 ms 到 60 s，并让 ACK 返回最终采用的周期。
+3. 构造一个超过 `BLE_PAYLOAD_MAX` 的状态消息，完成两片分片和超时丢弃测试。
+4. 让手机重复发送同一 `seq` 的控制命令，确认设备只执行一次，并返回相同结果。
+5. 在模块复位后检查：广播配置、连接状态、Notify 订阅和统计项分别怎样恢复。
+
+完成这一章后，WiFi 版和 BLE 版应共用同一份传感器数据模型。差别只留在通信任务和链路状态机里；采样、状态码和业务字段不重复实现。
+
+> **上一章**：[第 18 章 · 温度记录仪 WiFi 版](./18-chapter.md)
+>
+> **下一章**：[第 20 章 · TCP/IP 协议栈与温度记录仪](./20-chapter.md)
