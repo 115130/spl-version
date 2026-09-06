@@ -1,54 +1,54 @@
 # 第 5 章 · 时钟、时基与可测时间（SPL 版）
 
-> **本章产出**：能以有超时、有回退的方式配置 72MHz；能建立正确的 1ms SysTick 时基；能把 UART 乱码、PWM 偏频和单线时序失败统一追溯到时钟证据。
->
-> **前置知识**：完成第 0 章模板，理解 HCLK/PCLK 和外设时钟门控。
->
-> **通过标准**：`SystemCoreClock`、PCLK1、PCLK2 与代码配置一致；用仪器/串口交叉验证一个频率；HSE 不起振时程序在有限时间内回退而不是无限卡死。
+这一章把 STM32F103 的时钟配置真正落到代码和测量上。完成后，你应该能配置一套确定的 HCLK、PCLK 和外设时钟，建立 1 ms SysTick 时基，并在外部晶振失败时让程序退出等待而不是永久卡住。
 
----
+前面的章节已经用过 `SystemCoreClock`、SysTick、UART 和定时器。这里把这些东西连起来：UART 波特率错、PWM 频率错、ADC 时钟超规格，往往都可以从时钟树找到原因。
 
-## 5.0 前置知识速览：本章涉及的新概念
+## 5.1 先确认时钟从哪里来
 
-如果你从第 2 章直接跳到本章，以下几个概念是理解本章代码的前提：
+STM32F103 有 HSI、HSE、PLL 等时钟源。HSI 是片内 RC 振荡器；HSE 由板卡上的外部晶体、振荡器或外部时钟提供。HSE 的实际频率必须看开发板原理图，不能因为常见板使用 8 MHz 就直接写死。
 
-| 概念 | 一句话 | 为什么本章关心 |
-|------|--------|---------------|
-| **PLL（锁相环）** | "频率放大器"——把 HSE 的 8MHz ×9 得到 72MHz | 接通后需要等待锁定（几 μs～几百 μs），锁定失败通常是 HSE 没起振 |
-| **晶振（HSE）** | 板上的 8MHz 石英晶体，一个模拟器件 | 可能因焊接、匹配电容或损坏不起振；代码无法区分"正在起振"和"永不振"，必须设超时 |
-| **Flash 等待周期** | Flash 读取速度跟不上 CPU 频率时，需要插入等待周期 | 72MHz 需 2 个等待周期（`FLASH_Latency_2`），不设或少设会导致取指错误、程序跑飞 |
-| **ADC 时钟上限** | ADC 是逐次逼近型（SAR），每步转换需要固定时间 | F103 的 ADC 时钟 ≤ 14MHz，72MHz 的 PCLK2 要经 `/6`（12MHz）才能给 ADC |
-| **SWS 状态位** | `RCC_CFGR` 中的"当前系统时钟来源"只读位 | `0x00` = HSI、`0x04` = HSE、`0x08` = PLL；代码用 `RCC_GetSYSCLKSource() != 0x08U` 验证时钟切换成功 |
-
-如果以上概念你已经清楚，可以直接跳到 5.1 节；如果某个概念还模糊，记住一个主线就够了：**本章的核心思路是"不稳定时回退到 HSI"**——所有配置和检查都围绕着这个目标展开。
-
----
-
-## 5.1 时钟不是一个数字，而是一份分发合同
-
-STM32F103 的常见 72MHz 配置是 `HSE 8MHz × PLL 9`，但“系统是 72MHz”还不够。每个消费者拿到的时钟不同：
+本章的 72 MHz 示例只适用于已经确认 **HSE = 8 MHz** 的板卡：
 
 ```text
-HSE 8MHz → PLL ×9 → SYSCLK 72MHz
-                       │
-                       ├─ AHB /1 → HCLK 72MHz → CPU、SRAM、DMA、SysTick(HCLK)
-                       ├─ APB1 /2 → PCLK1 36MHz → USART2–5、I2C、SPI2/3、TIM2–7
-                       └─ APB2 /1 → PCLK2 72MHz → GPIO、USART1、SPI1、ADC、TIM1/8
+HSE 8 MHz
+   │
+   └── PLL ×9 → SYSCLK 72 MHz
+                    │
+                    ├── AHB /1  → HCLK  72 MHz
+                    ├── APB1 /2 → PCLK1 36 MHz
+                    └── APB2 /1 → PCLK2 72 MHz
 ```
 
-| 限制/规则 | 为什么后续章节关心 |
-|---|---|
-| PCLK1 不得高于 36MHz | 超过额定值不能靠“能跑”证明安全 |
-| APB 预分频不是 /1 时，该 APB 上的定时器时钟为 `2 × PCLK` | TIM2–7 在 PCLK1=36MHz 时仍可得到 72MHz |
-| ADC 时钟不超过 14MHz | 72MHz 的 PCLK2 通常选择 `/6`，即 12MHz |
-| Flash 高速运行需要等待周期 | 提高 SYSCLK 前先设 Flash latency，防止取指不可靠 |
-| USB 需要精确 48MHz | 未配置 USB 预分频前，不要声明 USB 可用 |
+STM32F103 的 APB1 最高 36 MHz，APB2 最高 72 MHz。APB 上的定时器还有一条规则：当对应 APB 预分频不是 `/1` 时，定时器输入时钟是 `2 × PCLK`。因此 PCLK1 为 36 MHz 时，TIM2 等 APB1 定时器仍可以得到 72 MHz。
 
-`SystemCoreClock` 只表示内核时钟的**软件记录**，不会魔法般校验硬件。自定义 RCC 后调用 `SystemCoreClockUpdate()`；再用 `RCC_GetClocksFreq()` 读取 HCLK/PCLK1/PCLK2 交叉检查。
+ADC 时钟由 PCLK2 再分频得到，STM32F103 的 ADC 时钟不能超过 14 MHz。PCLK2 为 72 MHz 时，可以选择 `/6` 得到 12 MHz。
 
-## 5.2 72MHz 配置：每个等待都有退出路径
+## 5.2 提高主频前先处理 Flash
 
-下面的函数适用于已确认板上 HSE 为 8MHz 的 ZET6 开发板。若你的板的晶振不同，PLL 倍频、USB、串口与定时器计算都要重算；先看原理图，不要照抄 `×9`。
+CPU 提高到 72 MHz 后，Flash 不能按零等待周期直接提供每次读取。时钟切换前先配置 Flash latency，并按器件要求打开预取缓冲：
+
+```c
+FLASH_SetLatency(FLASH_Latency_2);
+FLASH_PrefetchBufferCmd(ENABLE);
+```
+
+这里的顺序很重要。先把 Flash 配置到能够承受目标频率，再把 SYSCLK 提高。降回 HSI 后，才可以把等待周期降回较低值。
+
+不同供电电压和频率对应的 Flash latency 应以 STM32F103 数据手册为准。本书的 72 MHz、正常 3.3 V 供电示例使用 `FLASH_Latency_2`。
+
+## 5.3 配置 72 MHz，并给每个等待加退出条件
+
+外部晶振和 PLL 都需要等待就绪标志。硬件异常时，如果代码只写：
+
+```c
+while (RCC_GetFlagStatus(RCC_FLAG_HSERDY) == RESET) {
+}
+```
+
+程序可能永远停在这里。
+
+下面先做一个最简单的有限轮询：
 
 ```c
 #include <stdbool.h>
@@ -56,89 +56,135 @@ HSE 8MHz → PLL ×9 → SYSCLK 72MHz
 #include "stm32f10x_flash.h"
 #include "stm32f10x_rcc.h"
 
-#define CLOCK_WAIT_LIMIT  0x5000U
+#define CLOCK_WAIT_LIMIT 0x5000U
 
-static bool WaitRccFlag(FlagStatus (*get_flag)(uint8_t), uint8_t flag)
+static bool WaitRccFlag(uint8_t flag)
 {
     uint32_t left = CLOCK_WAIT_LIMIT;
-    while (get_flag(flag) == RESET) {
+
+    while (RCC_GetFlagStatus(flag) == RESET) {
         if (left-- == 0U)
             return false;
     }
+
     return true;
 }
+```
 
-/* 返回 true 表示已切到 PLL 72MHz；false 表示保留/回退在 HSI。 */
+`CLOCK_WAIT_LIMIT` 表示最多轮询多少次，不代表固定的微秒或毫秒。编译优化、当前 CPU 频率和函数调用都会改变一次循环的实际耗时。这里用它解决“不能无限等”的问题；需要确定超时时间时，应使用已经建立好的独立时基。
+
+完整配置：
+
+```c
 bool SystemClock_Try72MHz(void)
 {
-    RCC_DeInit();                       /* 已知起点：HSI 为系统时钟，PLL/HSE 关闭。 */
+    RCC_DeInit();
+
     RCC_HSEConfig(RCC_HSE_ON);
-    if (!WaitRccFlag(RCC_GetFlagStatus, RCC_FLAG_HSERDY))
+    if (!WaitRccFlag(RCC_FLAG_HSERDY))
         goto fallback_hsi;
 
-    /* 先设置不会超规格的总线和 Flash，再提高 SYSCLK。 */
     FLASH_SetLatency(FLASH_Latency_2);
     FLASH_PrefetchBufferCmd(ENABLE);
+
     RCC_HCLKConfig(RCC_SYSCLK_Div1);
     RCC_PCLK1Config(RCC_HCLK_Div2);
     RCC_PCLK2Config(RCC_HCLK_Div1);
-    RCC_ADCCLKConfig(RCC_PCLK2_Div6);   /* 72MHz / 6 = 12MHz <= 14MHz */
+    RCC_ADCCLKConfig(RCC_PCLK2_Div6);
 
     RCC_PLLConfig(RCC_PLLSource_HSE_Div1, RCC_PLLMul_9);
     RCC_PLLCmd(ENABLE);
-    if (!WaitRccFlag(RCC_GetFlagStatus, RCC_FLAG_PLLRDY))
+
+    if (!WaitRccFlag(RCC_FLAG_PLLRDY))
         goto fallback_hsi;
 
     RCC_SYSCLKConfig(RCC_SYSCLKSource_PLLCLK);
-    for (uint32_t left = CLOCK_WAIT_LIMIT;
-         RCC_GetSYSCLKSource() != 0x08U; /* SWS: PLL */) {
-        if (left-- == 0U)
-            goto fallback_hsi;
+
+    {
+        uint32_t left = CLOCK_WAIT_LIMIT;
+        while (RCC_GetSYSCLKSource() != 0x08U) {
+            if (left-- == 0U)
+                goto fallback_hsi;
+        }
     }
 
     SystemCoreClockUpdate();
     return true;
 
 fallback_hsi:
-    /* 先确认已真正切回 HSI，才允许关闭当前可能正在供时的 PLL/HSE。 */
     RCC_HSICmd(ENABLE);
-    (void)WaitRccFlag(RCC_GetFlagStatus, RCC_FLAG_HSIRDY);
-    RCC_SYSCLKConfig(RCC_SYSCLKSource_HSI);
-    for (uint32_t left = CLOCK_WAIT_LIMIT;
-         RCC_GetSYSCLKSource() != 0x00U; /* SWS: HSI */) {
-        if (left-- == 0U)
-            break;
+
+    if (WaitRccFlag(RCC_FLAG_HSIRDY)) {
+        RCC_SYSCLKConfig(RCC_SYSCLKSource_HSI);
+
+        uint32_t left = CLOCK_WAIT_LIMIT;
+        while (RCC_GetSYSCLKSource() != 0x00U) {
+            if (left-- == 0U)
+                break;
+        }
     }
+
     if (RCC_GetSYSCLKSource() == 0x00U) {
         RCC_PLLCmd(DISABLE);
         RCC_HSEConfig(RCC_HSE_OFF);
+        FLASH_SetLatency(FLASH_Latency_0);
     }
-    FLASH_SetLatency(FLASH_Latency_0);
+
     SystemCoreClockUpdate();
     return false;
 }
 ```
 
-这里的轮询上限是“防止永久等待”的保护，不是精准的毫秒计时。实际产品还应记录失败原因、在安全状态下提示，并根据板级设计决定是否允许继续在 HSI 上运行。不要在时钟切换失败后仍把串口波特率、PWM 和延时当作 72MHz。
+`RCC_GetSYSCLKSource()` 读取的是 SWS 状态位。`0x00` 表示当前系统时钟来自 HSI，`0x08` 表示来自 PLL。调用 `RCC_SYSCLKConfig()` 只是在请求切换，继续检查 SWS 才能确认硬件已经完成切换。
 
-在 `main()` 中保存结果：
+回退路径里也要先确认 HSI 已经接管 SYSCLK，再关闭 PLL 和 HSE。不能在 CPU 仍由 PLL 供时的时候直接把 PLL 关掉。
+
+这个函数返回 `false` 时，程序仍可能继续在 HSI 上运行，但后面的 UART、定时器和 SysTick 都必须按照实际时钟重新初始化。不能继续拿 72 MHz 的参数使用。
+
+## 5.4 `SystemCoreClock` 只是软件记录
+
+CMSIS 提供：
 
 ```c
-bool clock_72m = SystemClock_Try72MHz();
-RCC_ClocksTypeDef clocks;
-RCC_GetClocksFreq(&clocks);
-/* clocks.HCLK_Frequency / PCLK1_Frequency / PCLK2_Frequency 是后续计算依据。 */
+SystemCoreClockUpdate();
 ```
 
-> SPL 的 `SystemInit()` 由 `system_stm32f10x.c` 的编译选项决定；不要假定任何 SPL 工程“默认必然 8MHz”或“默认必然 72MHz”。本章函数显式配置、显式检查、显式更新软件记录。
+它根据 RCC 寄存器重新计算 `SystemCoreClock`。这个变量不会主动配置硬件，也不会自动发现“外部晶振实际不是你以为的频率”。
 
-## 5.3 SysTick：CMSIS `SysTick_Config()` 用的是 HCLK
-
-SysTick 是 Cortex-M3 的 24 位递减计数器。CMSIS 的 `SysTick_Config(ticks)` 会选择核心时钟（HCLK），所以 72MHz 下 1ms 的正确装载值是 **72000**，不是 `72000 / 8`：
+配置完成后还可以读取 SPL 计算出的总线频率：
 
 ```c
-#include "stm32f10x.h"
+RCC_ClocksTypeDef clocks;
 
+SystemCoreClockUpdate();
+RCC_GetClocksFreq(&clocks);
+```
+
+可以检查：
+
+```c
+clocks.SYSCLK_Frequency
+clocks.HCLK_Frequency
+clocks.PCLK1_Frequency
+clocks.PCLK2_Frequency
+clocks.ADCCLK_Frequency
+```
+
+这些值来自当前 RCC 配置和库中定义的时钟源频率。真正排查频率问题时，最好再用逻辑分析仪、示波器或已验证的串口进行外部测量。
+
+## 5.5 SysTick 做 1 ms 时基
+
+SysTick 是 Cortex-M3 内核里的 24 位递减计数器。CMSIS 的 `SysTick_Config()` 默认把 SysTick 时钟源设为处理器时钟，也就是当前 HCLK。
+
+72 MHz 下，1 ms 需要：
+
+```text
+72 000 000 / 1000 = 72 000 tick
+```
+
+代码可以直接使用 `SystemCoreClock`：
+
+```c
 static volatile uint32_t g_ms;
 
 int Timebase_Init_1ms(void)
@@ -147,105 +193,149 @@ int Timebase_Init_1ms(void)
     return SysTick_Config(SystemCoreClock / 1000U);
 }
 
+void SysTick_Handler(void)
+{
+    ++g_ms;
+}
+
 uint32_t Timebase_NowMs(void)
 {
     return g_ms;
 }
+```
 
-void SysTick_Handler(void)
-{
-    g_ms++;
+`SysTick_Config()` 返回非零时，说明要求的 reload 值超出了 SysTick 的 24 位范围。72 MHz 下配置 1 ms 不会达到这个上限，但初始化代码仍应检查返回值。
+
+有些代码会手动把 SysTick 时钟改成 HCLK/8。那属于另一种配置，reload 也必须跟着重新计算。直接使用 CMSIS `SysTick_Config()` 时，不要再额外除以 8。
+
+## 5.6 用无符号减法处理计数器回绕
+
+`g_ms` 是 `uint32_t`，最终会从 `0xFFFFFFFF` 回到 0。判断已经过去多少时间时，使用无符号减法：
+
+```c
+uint32_t start = Timebase_NowMs();
+
+while ((uint32_t)(Timebase_NowMs() - start) < 500U) {
+    __WFI();
 }
+```
 
+只要等待区间小于 `uint32_t` 计数周期，这种写法跨过回绕点仍然成立。
+
+`__WFI()` 会让 CPU 等待中断。SysTick、UART 或其他已经使能的中断都可能唤醒 CPU，因此醒来后仍然要重新检查时间条件。
+
+可以封装成：
+
+```c
 void Delay_ms(uint32_t delay)
 {
-    const uint32_t start = Timebase_NowMs();
+    uint32_t start = Timebase_NowMs();
+
     while ((uint32_t)(Timebase_NowMs() - start) < delay) {
         __WFI();
     }
 }
 ```
 
-`SysTick_Config()` 返回非零表示装载值超出 24 位；本书的 72MHz/1ms 不会超出，但仍应检查返回值。`__WFI()` 不是“保证睡满一毫秒”：其他中断也可能唤醒它，循环会重新检查时间，所以功能仍正确。
+这个延时的时间来源已经可靠，但调用期间当前执行流仍然被阻塞。主循环需要同时处理按键、UART、状态机时，应改成非阻塞判断。
 
-`SysTick_Handler` 是向量表中的弱符号名。若你写错名字，默认处理函数通常会停在死循环；这不是 GPIO 或时钟的症状。用 GDB 在 `SysTick_Handler` 断点，或用一个独立 GPIO/串口计数验证它确实每毫秒进入一次。
-
-### 阻塞延时和非阻塞调度
-
-`Delay_ms` 的时间来源正确，但它仍让当前主循环等待。对于 LED 闪烁，优先写成状态机：
+例如 LED 每 500 ms 翻转：
 
 ```c
-static uint32_t next_toggle;
+static uint32_t last_toggle;
 static uint8_t led_on;
 
 void Blink_Poll(void)
 {
     uint32_t now = Timebase_NowMs();
-    if ((int32_t)(now - next_toggle) >= 0) {
+
+    if ((uint32_t)(now - last_toggle) >= 500U) {
+        last_toggle = now;
         led_on ^= 1U;
         BoardLed_Write(led_on);
-        next_toggle = now + 500U;
     }
 }
 ```
 
-这样主循环仍可读取按键、处理 UART、检查超时。`Delay_ms` 只用于短暂、明确的初始化等待；微秒级单线时序不要由 SysTick 1ms 时基承担，见第 7 章的 1MHz 定时器方案。
+主循环可以不断调用 `Blink_Poll()`，中间继续处理其他任务。
 
-## 5.4 从时钟到一个外设公式
+## 5.7 外设到底用哪个时钟
 
-每次配置外设都先写具体时钟来源，再计算寄存器：
+配置外设时，不要直接看到 `SystemCoreClock = 72000000` 就把所有公式都代入 72 MHz。
 
-| 外设 | 输入时钟 | 示例 |
-|---|---|---|
-| USART1 | PCLK2 = 72MHz | 115200 波特率由 72MHz 分频得到 |
-| USART2 | PCLK1 = 36MHz | 不能误用 `SystemCoreClock` 直接计算 |
-| TIM2 | APB1 定时器时钟 = 72MHz（PCLK1=/2） | `PSC=71, ARR=999` → 1kHz |
-| ADC1 | ADCCLK = PCLK2/6 = 12MHz | 低于 14MHz 上限 |
-| SysTick | HCLK = 72MHz | `SysTick_Config(72000)` → 1ms |
+| 外设 | 本章 72 MHz 配置下的输入时钟 | 例子 |
+|---|---:|---|
+| USART1 | PCLK2 = 72 MHz | BRR 根据 72 MHz 和目标波特率计算 |
+| USART2/3 | PCLK1 = 36 MHz | BRR 根据 36 MHz 计算 |
+| TIM2–7 | TIMCLK = 72 MHz | APB1=/2，因此定时器时钟为 2 × PCLK1 |
+| ADC1/2 | ADCCLK = 12 MHz | PCLK2/6 |
+| SysTick | HCLK = 72 MHz | 1 ms 使用 72000 tick |
 
-时钟改变后，所有**已经初始化**的波特率、定时器、ADC 分频和 SysTick 装载值都可能失效。安全流程是：切时钟 → `SystemCoreClockUpdate()` → 重新初始化依赖时钟的外设 → 验证。
+例如 TIM2 输入 72 MHz，要得到 1 kHz 更新事件，可以先用预分频器得到 1 MHz 计数时钟：
 
-## 5.5 验证：至少两种独立证据
+```text
+PSC = 71
+72 MHz / (71 + 1) = 1 MHz
+```
 
-不要用“LED 看起来差不多”验证 72MHz。推荐从下列独立证据中至少选两项：
+再设置：
 
-1. 将 TIMx 配为已知频率（例如 1kHz、50% PWM），用逻辑分析仪或示波器测量；
-2. 用经过确认的 USB-TTL，在设定波特率下稳定收发文本；
-3. GDB 读取 RCC/FLASH 寄存器，核对 HSE/PLL 就绪、SWS、APB 分频与 Flash latency；
-4. 用 `RCC_GetClocksFreq()` 输出记录值，并与定时器的实际波形对照。
+```text
+ARR = 999
+1 MHz / (999 + 1) = 1 kHz
+```
 
-| 现象 | 首先怀疑 | 下一步 |
-|---|---|---|
-| HSE/PLL 等待超时 | 晶振/旁路配置、板级硬件或配置不匹配 | 保持 HSI，检查原理图和 RCC 状态 |
-| UART 全乱码 | PCLK 与波特率计算不一致 | 核对具体 USART 所在 APB，而非只看 HCLK |
-| SysTick 比预期快 8 倍 | 误以为 `SysTick_Config` 使用 HCLK/8 | 改为 `SystemCoreClock / 1000U` |
-| PWM 正好差一倍 | 忘记 APB 定时器 ×2 规则 | 重新从 PCLK 与 APB 预分频计算 TIMCLK |
-| ADC 数值异常 | ADC 分频超过规格或模拟输入问题 | 先确认 ADCCLK ≤ 14MHz，再检查模拟电路 |
+STM32 定时器的 PSC 和 ARR 都按“寄存器值 + 1”参与这个基本计算，后面定时器章节会继续展开。
 
-## 5.6 本章验收与练习
+时钟一旦改变，已经初始化的 USART、定时器、ADC 和 SysTick 配置都可能失效。正确顺序是先完成系统时钟切换，再初始化依赖这些时钟的外设。
 
-- [ ] 时钟函数对 HSE、PLL 和 SWS 都有有限等待；失败时返回可检查状态；
-- [ ] `SystemCoreClockUpdate()` 位于成功和回退路径；
-- [ ] SysTick 使用 HCLK 装载值，`Timebase_NowMs()` 可被第 3、4 章的非阻塞代码复用；
-- [ ] 记录过一次 HCLK/PCLK1/PCLK2 与实测频率/串口结果；
-- [ ] 没有把“板上常见 8MHz 晶振”写成未经确认的事实。
+## 5.8 怎么验证实际频率
 
-练习：
+先把软件记录打印出来：
 
-1. 用 TIM2 输出 1kHz PWM，分别在 APB1=/1 和 /2 下计算 TIMCLK；
-2. 临时强制 HSE 等待失败，确认函数返回 HSI 而不是卡死（只在副本工程实验）；
-3. 把 `SysTick_Config(SystemCoreClock / 8 / 1000U)` 故意用于副本，预测并测量它为何约快 8 倍。
+```c
+RCC_ClocksTypeDef clocks;
+RCC_GetClocksFreq(&clocks);
+```
 
-## 5.7 本章要点
+然后至少再做一次外部验证。比较直接的方法是让一个定时器输出确定频率，例如 1 kHz PWM，再用逻辑分析仪或示波器测量。如果实际只有 500 Hz，先检查 APB 定时器的 ×2 规则和 PSC/ARR 的 `+1`。
 
-- 时钟配置是 SYSCLK、HCLK、PCLK、TIMCLK、ADCCLK 和 Flash latency 的共同合同。
-- 72MHz 不等于所有外设都 72MHz；尤其是 APB1=36MHz、定时器可能 ×2、ADC 必须再分频。
-- HSE/PLL 轮询必须有退出路径，失败时要有可验证的回退状态。
-- CMSIS `SysTick_Config()` 以 HCLK 为时钟源；1ms 用 `SystemCoreClock / 1000U`。
-- 正确时基仍不等于非阻塞程序；状态机和第 6 章的中断负责把等待与业务分开。
+UART 也可以作为辅助证据。USART1 按 PCLK2=72 MHz 配成 115200 后，如果在已确认的 USB-TTL 上持续稳定收发，说明时钟和波特率配置至少相互一致。它不如直接测量定时器波形那样独立，因为 UART 两边也可能同时存在配置问题。
 
----
+GDB 可以读取 RCC 和 FLASH 寄存器，确认 HSE/PLL ready、SWS、APB 分频和 Flash latency。它能证明寄存器配置是什么，但不能代替对板上实际晶振频率的测量。
+
+## 5.9 常见问题
+
+HSE 一直不 ready：先确认板卡是否真的有 HSE、频率是多少，以及使用的是晶体还是外部有源时钟。再检查原理图、焊接和 RCC 的 HSE 模式配置。
+
+PLL ready 但切换后频率不对：重新检查 PLL 输入源、倍频系数、HSE 实际频率和 SWS。不要只看 `SystemCoreClock` 的数值。
+
+UART 持续乱码：确认具体 USART 位于 APB1 还是 APB2，再检查实际 PCLK 和帧格式。USART1 和 USART2 在这套配置下不能使用同一个外设输入时钟数值。
+
+PWM 频率正好差两倍：优先检查 APB 预分频和定时器时钟 ×2 规则，然后检查 PSC、ARR 是否漏了 `+1`。
+
+SysTick 正好快约 8 倍：检查是不是在 `SysTick_Config(SystemCoreClock / 1000U)` 的基础上又按 HCLK/8 思路改了 reload，或者额外调用了 `SysTick_CLKSourceConfig()`。
+
+ADC 时钟超规格：先读 PCLK2 和 ADC 分频，确认 ADCCLK 不超过器件数据手册给出的上限，再继续查模拟输入和采样时间。
+
+## 5.10 验收和练习
+
+完成本章后确认这些结果：
+
+- HSE、PLL 和 SYSCLK 切换都有有限等待。
+- 失败路径能返回状态，不会永久停在等待循环。
+- 成功切换后 `SystemCoreClock`、PCLK1、PCLK2 和 ADCCLK 与预期一致。
+- SysTick 可以稳定提供 1 ms 计数。
+- 至少用逻辑分析仪、示波器或另一种独立方法验证过一个实际频率。
+
+做三个实验：
+
+1. 用 TIM2 输出 1 kHz 信号，写出 TIMCLK、PSC 和 ARR 的计算过程，再用仪器测量。
+2. 在副本工程中让 HSE 初始化故意失败，确认程序返回 HSI 路径，并记录此时 `SystemCoreClock`。
+3. 在副本工程里故意把 SysTick reload 再除以 8，先计算会发生什么，再观察毫秒计数和真实时间的差异。
+
+到这里，后面的 UART、定时器、PWM、ADC 和单线时序都有了统一的时间基准。下一章进入中断，处理硬件事件如何安全交给主循环。
 
 > **上一章**：[第 4 章 · C 语言的嵌入式边界](./04-chapter.md)
 >
-> **下一章**：[第 6 章 · 中断系统](./06-chapter.md)
+> **下一章**：[第 6 章 · 中断、事件与并发边界](./06-chapter.md)
