@@ -1,170 +1,133 @@
-# 第 23 章 · HTTP、响应解析与 cJSON（SPL版）
+# 第 23 章 · HTTP、响应解析与 cJSON（SPL 版）
 
-> **本章产出**：能用 WiFi AT 模块发送一条正确的 HTTP 请求；知道如何安全地从响应中分离 Body 并解析 JSON。
->
-> **前置知识**：第 20 章 TCP，以及第 22 章的配置管理。
->
-> **用在哪**：REST API、天气查询、设备配置拉取、调试云端接口。
->
-> **实验环境**：先用同一局域网内的教学 HTTP 服务；公网接口、DNS、HTTPS、证书和 Chunked 编码属于下一层复杂度，不能被“浏览器能打开”掩盖。
+第 21 章用 MQTT 做持续消息通信。本章换成 HTTP，完成一次请求—响应：STM32 通过 WiFi AT 模块发送 HTTP/1.1 GET，按字节流接收响应，确认 Body 完整后再交给 cJSON。
 
----
+第一轮实验只连接局域网内可控的 HTTP 服务。解析器明确支持 `Content-Length`，暂不实现 Chunked、压缩、重定向和持久连接。HTTPS 留到确认无线模块的 TLS、SNI、证书和时间能力之后。
 
-## 23.1 MQTT 和 HTTP，什么时候选哪个
+## 23.1 本章为什么用 HTTP
 
-| 需求 | 更适合 MQTT | 更适合 HTTP |
-|---|---|---|
-| 设备持续上报 | 是 | 不一定 |
-| 云端主动下发 | 是 | 需要轮询 |
-| 调试一个 Web API | 不方便 | 是 |
-| 请求一次天气或配置 | 可以 | 是 |
-| 浏览器直接访问 | 需要额外桥接 | 是 |
+HTTP 适合“发一个请求，拿一个结果”的场景，例如读取设备配置、调用 REST API 或查询一次数据。持续遥测和服务端主动下发更适合前面已经实现的 MQTT。
 
-两者都可以通过 TCP 运行。学习 HTTP 的价值是：它把一个网络请求的每一个文本字段都摆在你眼前，特别适合理解协议。
+两者最终都经过 TCP，因此第 20 章的规则仍然成立：TCP 只提供字节流，`read()`、UART 中断或 AT Payload 都不会替 HTTP 保留消息边界。
+
+本章只实现下面这条路径：
+
+```text
+BUILD_REQUEST
+    ↓
+TCP_CONNECT
+    ↓
+SEND_REQUEST
+    ↓
+READ_HEADERS
+    ↓
+READ_BODY
+    ↓
+PARSE_JSON
+    ↓
+DELIVER_RESULT
+```
+
+任一步发生超时、超长或格式错误，都关闭当前事务并记录原因。
 
 ## 23.2 一条最小 GET 请求
 
-HTTP 请求由“请求行、若干头部、空行、可选 Body”组成：
+HTTP/1.1 请求由请求行、头部、空行和可选 Body 组成。GET 示例：
 
-~~~text
-GET /api/v1/weather HTTP/1.1
-Host: api.example.com
-Connection: close
+```text
+GET /api/v1/config HTTP/1.1\r\n
+Host: 192.168.1.100:8080\r\n
+Connection: close\r\n
+\r\n
+```
 
-~~~
+协议在线路上使用 `\r\n`。最后一个空行表示请求头结束；少掉它，服务端可能继续等待后续头部。
 
-最后的空行很重要：它表示头部结束。
+`Host` 是 HTTP/1.1 请求的一部分。局域网实验如果使用非默认端口，可以把端口一起写入 Host；真实公网接口则按目标服务文档构造域名和路径。
 
-## 23.3 先组装请求，再计算长度
+## 23.3 请求先完整构造，再计算发送长度
 
-不要把 AT+CIPSEND=<len> 原样写进程序。正确顺序是：
+`AT+CIPSEND=<len>` 中的长度必须等于随后实际发送的 HTTP 字节数。先 `snprintf()`，检查是否截断，再把返回长度交给底层发送接口：
 
-1. 先用 snprintf 生成完整 HTTP 文本；
-2. 得到真实字节数；
-3. 再发送 AT+CIPSEND=真实长度；
-4. 等待模块提示符 >；
-5. 原样发送 HTTP 字节，不额外补回车换行。
+```c
+static bool Http_BuildGet(char *out, size_t cap,
+                          const char *host, const char *path,
+                          size_t *out_len)
+{
+    int n = snprintf(out, cap,
+                     "GET %s HTTP/1.1\r\n"
+                     "Host: %s\r\n"
+                     "Connection: close\r\n"
+                     "\r\n",
+                     path, host);
 
-~~~c
+    if (n < 0 || (size_t)n >= cap)
+        return false;
+
+    *out_len = (size_t)n;
+    return true;
+}
+```
+
+调用时：
+
+```c
 char request[256];
-char cmd[32];
+size_t request_len;
 
-int len = snprintf(request, sizeof(request),
-    "GET /api/v1/weather HTTP/1.1\r\n"
-    "Host: api.example.com\r\n"
-    "Connection: close\r\n"
-    "\r\n");
-
-if (len < 0 || len >= (int)sizeof(request)) {
-    return -1;                 /* 请求被截断，不能发送 */
+if (!Http_BuildGet(request, sizeof request,
+                   "192.168.1.100:8080", "/api/v1/config",
+                   &request_len)) {
+    return false;
 }
 
-snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d", len);
-AT_SendCmd(cmd);
-if (!AT_WaitResponse(">", 5000)) {
-    return -1;
+if (request_len > UINT16_MAX)
+    return false;
+
+if (TCP_SendRaw((const uint8_t *)request,
+                (uint16_t)request_len) != 0) {
+    return false;
 }
-if (TCP_SendRaw((const uint8_t *)request, (uint16_t)len) != 0) {
-    return -1;
-}
-~~~
+```
 
-这里的 TCP_SendRaw 指的是第 21 章中的“原始字节发送”能力；实际工程中只应保留一个发送入口，避免重复等待提示符。
+这里沿用第 21 章已经封装好的 `TCP_SendRaw()`。不要在 HTTP 层再次手写 `AT+CIPSEND` 和 `>` 等待，否则两个发送入口很容易重复执行 AT 事务。
 
-## 23.4 不要假设一次就能收到完整响应
+路径和 Host 如果来自配置，还要限制长度和允许的字符范围。不要把未经校验的网络输入直接拼成新的 HTTP 请求头。
 
-UART 中断收到的数据可能被分成多段，TCP 也没有“消息边界”。因此，下面这种写法只适合作为概念演示：
+## 23.4 第一版响应解析器只支持一个明确子集
 
-~~~c
-char *body = strstr(at_rx_buf, "\r\n\r\n");
-~~~
+本章约定服务端返回：
 
-真正的程序至少要做到：
+- HTTP/1.1；
+- 一个最终响应；
+- `Content-Length`；
+- `Connection: close`；
+- Body 不超过本地固定上限；
+- JSON 响应不使用 gzip 等内容编码。
 
-- 为接收缓冲区记录当前长度；
-- 确保缓冲区始终以零结尾；
-- 找到头部结束标志后，再检查 Content-Length 或连接关闭事件；
-- 限制最大响应尺寸，避免缓冲区溢出；
-- 超时后丢弃不完整响应，并回到可恢复状态。
+遇到 `Transfer-Encoding: chunked`、重定向或响应尺寸超限，第一版直接返回“不支持”。明确拒绝比把不完整 Body 交给 cJSON 更容易排错。
 
-## 23.5 从 HTTP 状态码开始判断
+响应示例：
 
-先判断状态行，再解析 JSON。200 只表示服务器成功处理了请求，不代表 Body 就一定符合你的格式。
+```text
+HTTP/1.1 200 OK\r\n
+Content-Type: application/json\r\n
+Content-Length: 54\r\n
+Connection: close\r\n
+\r\n
+{"sample_period_ms":1000,"upload_period_ms":10000}
+```
 
-~~~text
-HTTP/1.1 200 OK
-Content-Type: application/json
-Content-Length: 31
+状态码、头部和 Body 都可能跨多个 TCP/AT Payload 到达。解析器必须保存状态，不能在每次收到一段数据时重新从零开始找字符串。
 
-{"temperature_c":24.6}
-~~~
+## 23.5 用状态机收 Header 和 Body
 
-处理顺序：
+一个教学版响应对象可以使用固定缓冲区：
 
-1. 解析状态行，确认是 200、201 等预期状态；
-2. 查找头部结束的空行；
-3. 检查 Content-Type 是否是 JSON；
-4. 在完整 Body 到齐后调用 cJSON_Parse；
-5. 逐个验证字段类型和范围。
+```c
+#define HTTP_HEADER_MAX  512U
+#define HTTP_BODY_MAX   1024U
 
-## 23.6 cJSON 解析时要检查每一步
-
-~~~c
-cJSON *root = cJSON_Parse(body);
-if (root == NULL) {
-    return -1;
-}
-
-cJSON *temp = cJSON_GetObjectItemCaseSensitive(root, "temperature_c");
-if (!cJSON_IsNumber(temp)) {
-    cJSON_Delete(root);
-    return -1;
-}
-
-float temperature_c = (float)temp->valuedouble;
-cJSON_Delete(root);
-~~~
-
-任何来自网络的数据都不可信。字段缺失、字段类型错误、超出正常范围都应被当作可恢复错误，而不是继续使用未初始化的数据。
-
-## 23.7 在 RTOS 中安排 HTTP 任务
-
-HTTP 请求可能等待数秒，因此不要把它放在按键任务、显示刷新任务或 UART ISR 中。一个清晰的设计是：
-
-~~~text
-Task_ConfigFetch
-  ├─ 等待网络已连接
-  ├─ 发 HTTP 请求
-  ├─ 解析并校验配置
-  └─ 通过 Queue 把新配置发给业务任务
-~~~
-
-这样即使服务器不可用，传感器采样和 OLED 刷新仍能继续。
-
-## 23.8 本章练习
-
-1. 用 PC 上的本地 HTTP 服务端返回一个 JSON 文件；
-2. 故意返回 404、错误 JSON 和超长响应，验证错误处理；
-3. 把 weather 请求改成从配置 Topic 或本地文件读取；
-4. 在串口打印状态码和响应长度，但不要打印 WiFi 密码或密钥。
-
-## 23.9 DNS、HTTPS 与公网 API 的现实
-
-第一个 HTTP 实验可以连接局域网或教学服务器，但真实公网 API 通常要求 HTTPS：
-
-- DNS：先把域名解析为 IP；
-- TLS：需要证书校验、加密和更多 RAM；
-- 模块能力：确认 AT 模块是否支持 SSL/TLS、SNI 和证书配置；
-- 时间：证书校验通常依赖正确系统时间；
-- 响应：可能使用 Chunked 编码，而不一定给 Content-Length。
-
-因此，先用本地 HTTP 服务理解协议，再根据模块文档评估 HTTPS。不能因为电脑浏览器能访问，就假定小型 AT 模块也能直接访问。
-
-## 23.10 用状态机接收 HTTP：头与 Body 可以被拆开
-
-HTTP 响应的 `\r\n\r\n` 分隔符、状态行和 Content-Length 都可能跨多个 TCP/UART 片段到达。第一版解析器应只支持自己能明确验证的子集：`HTTP/1.1` + `Content-Length`；若检测到 `Transfer-Encoding: chunked`，记录并拒绝，而不是假装 body 已完整。
-
-~~~c
 typedef enum {
     HTTP_RX_HEADERS,
     HTTP_RX_BODY,
@@ -174,159 +137,205 @@ typedef enum {
 
 typedef struct {
     HttpRxState state;
-    char headers[512];
+
+    uint8_t headers[HTTP_HEADER_MAX];
     size_t header_len;
+
+    int status_code;
     size_t content_length;
+
+    uint8_t body[HTTP_BODY_MAX];
     size_t body_len;
-    char body[1024];
 } HttpResponse;
+```
 
-/* 每收到一段字节就追加；找到 \r\n\r\n 后解析状态码和 Content-Length。
-   任何缓冲区不足、长度缺失或不支持的编码都进入 HTTP_RX_ERROR。 */
-~~~
+接收流程分两段：
 
-实现时注意四条边界：
+```text
+HTTP_RX_HEADERS
+  ├─ 逐字节追加，并寻找 \r\n\r\n
+  ├─ 头部超限 → ERROR
+  └─ 找到完整头部
+        ↓
+      解析状态码和 Content-Length
+        ↓
+      HTTP_RX_BODY
+        ├─ 累计到 content_length → DONE
+        └─ 超限/超时 → ERROR
+```
 
-1. 所有追加都先检查缓冲区上限；
-2. `Content-Length` 只在完整头部后解析；
-3. body 可能有二进制 `\0`，不要只用 `strstr` 处理所有内容；
-4. 只有 `body_len == content_length` 时才把数据交给 JSON 层。
+Header 分隔符可能正好跨两个输入片段，因此搜索范围必须包含上一次结尾留下的字节。找到 `\r\n\r\n` 时，同一个输入片段后面可能已经带着一部分 Body，这部分字节要立即转入 Body，不能丢掉。
 
-### cJSON 的最小安全用法
+所有长度都用显式计数管理。Body 可能包含 `0x00`，HTTP 层不要把它当 C 字符串处理。
 
-~~~c
-cJSON *root = cJSON_ParseWithLength(resp.body, resp.body_len);
-if (root == NULL) {
-    /* 记录解析失败和前若干字节，不打印敏感完整响应 */
-    return false;
+## 23.6 Header 解析需要边界检查
+
+只有完整 Header 到齐后才解析状态行和字段。第一版至少检查：
+
+1. 状态行格式能解析出三位状态码；
+2. 只有一个可接受的 `Content-Length` 值；
+3. `Content-Length <= HTTP_BODY_MAX`；
+4. 没有本实现不支持的 `Transfer-Encoding: chunked`；
+5. 如果业务要求 JSON，再检查 `Content-Type` 是否为预期媒体类型。
+
+Header 名称在 HTTP 中大小写不敏感。自己写查找函数时不能只接受 `Content-Length` 这一种大小写。
+
+`Content-Length` 也不能直接交给 `atoi()` 后就相信结果。解析时要拒绝负号、非十进制字符、整数溢出和超过本地上限的值。
+
+本章使用 `Connection: close` 简化连接生命周期，但 Body 的完成条件仍以已经验证的 `Content-Length` 为准。服务器提前关闭连接且 Body 尚未收满时，这次响应失败。
+
+## 23.7 状态码成功后，业务数据还要继续验证
+
+HTTP 状态码说明 HTTP 请求的处理结果，不说明 JSON 一定满足固件的数据模型。例如 `200 OK` 的 Body 仍可能缺字段、字段类型变化或数值越界。
+
+配置接口可以约定：
+
+```json
+{
+  "sample_period_ms": 1000,
+  "upload_period_ms": 10000
 }
+```
 
-cJSON *temperature = cJSON_GetObjectItemCaseSensitive(root, "temperature");
-if (!cJSON_IsNumber(temperature)) {
+只有完整 Body 到齐后才调用 cJSON：
+
+```c
+static bool Config_Parse(const uint8_t *body, size_t body_len,
+                         uint32_t *sample_ms,
+                         uint32_t *upload_ms)
+{
+    cJSON *root;
+    cJSON *sample;
+    cJSON *upload;
+    bool ok = false;
+
+    root = cJSON_ParseWithLength((const char *)body, body_len);
+    if (root == NULL)
+        return false;
+
+    sample = cJSON_GetObjectItemCaseSensitive(root, "sample_period_ms");
+    upload = cJSON_GetObjectItemCaseSensitive(root, "upload_period_ms");
+
+    if (!cJSON_IsNumber(sample) || !cJSON_IsNumber(upload))
+        goto out;
+
+    if (sample->valuedouble < 100.0 || sample->valuedouble > 3600000.0)
+        goto out;
+    if (upload->valuedouble < sample->valuedouble ||
+        upload->valuedouble > 86400000.0)
+        goto out;
+
+    *sample_ms = (uint32_t)sample->valuedouble;
+    *upload_ms = (uint32_t)upload->valuedouble;
+    ok = true;
+
+out:
     cJSON_Delete(root);
-    return false;
+    return ok;
 }
+```
 
-double value = temperature->valuedouble;
-cJSON_Delete(root);  /* 释放整棵树；不要保留其内部指针 */
-~~~
+这里的 100 ms、1 h 和 24 h 是示例项目的配置边界，不是 HTTP 或 cJSON 的规定。实际产品应按传感器采样能力、功耗和服务端限制确定范围。
 
-必须同时检查“HTTP 成功”和“业务字段有效”。`200 OK` 也可能返回错误 JSON、旧配置或不是你期望的 Content-Type。
+如果项目要求配置必须是整数，还应额外验证 JSON 数值没有小数部分，避免 `1000.9` 被强制转换成 `1000` 后悄悄通过。
 
-### 本地 HTTP 实验
+## 23.8 cJSON 的内存边界
 
-1. 先让 PC 服务返回一个很短、固定 Content-Length 的 JSON；
-2. 在服务端故意把响应分两次写出，验证 STM32 不会半包解析；
-3. 改一个字段的类型（数字改字符串），确认 cJSON 校验会拒绝；
-4. 改为 Chunked 响应，确认第一版解析器明确报“不支持”，而不是读错。
+cJSON 会为解析树分配内存。STM32F103ZET6 的 SRAM 有限，本章已经用 `HTTP_BODY_MAX` 限制输入大小，还需要检查连续错误响应是否造成 heap 持续下降。
 
-| 现象 | 优先检查 |
-|---|---|
-| 请求发不出去 | AT 发送长度、Host、连接状态、CRLF |
-| 状态行不完整 | TCP/UART 分段处理、接收缓存、超时 |
-| JSON 偶发失败 | body 未收全、Content-Length、缓冲区截断 |
-| 堆逐渐下降 | 忘记 `cJSON_Delete`、反复分配、错误路径没有释放 |
-| 公网可用本地失败 | DNS/TLS/证书与纯 HTTP 是不同问题 |
+每个成功 `cJSON_Parse...()` 的返回值最终都要对应一次 `cJSON_Delete()`。错误路径也一样，不能只在正常分支释放。
 
-## 23.11 用一个故意分段的教学服务验证解析器
+业务层不要保存 `cJSON` 树内部的字符串指针后再删除根节点。需要长期保存的配置应复制到自己的固定结构体，再释放整棵 JSON 树。
 
-浏览器通常替你处理了分段、连接和 TLS；为了证明 STM32 解析器真的正确，使用一个故意把响应拆开的最小服务。它仅供局域网教学：
+如果项目通过 `cJSON_InitHooks()` 更换 allocator，应在并发解析开始前完成初始化，并确认所用 allocator 的线程安全和失败行为。本章先保持单个配置任务解析 JSON。
 
-~~~python
-# split_http_server.py
-import socket, time
+## 23.9 在 FreeRTOS 中隔离 HTTP 事务
 
-body = b'{"temperature":2534,"unit":"centi"}'
-head = (b"HTTP/1.1 200 OK\r\n"
-        b"Content-Type: application/json\r\n"
-        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-        b"Connection: close\r\n\r\n")
+HTTP 请求可能等待 TCP、服务端响应和重连。把完整事务放进独立任务：
 
-with socket.socket() as s:
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", 8080))
-    s.listen(1)
-    conn, addr = s.accept()
+```text
+ConfigTask
+  ↓ 等待网络可用
+BUILD_REQUEST
+  ↓
+SEND / RECEIVE
+  ↓
+VALIDATE HTTP
+  ↓
+PARSE JSON
+  ↓
+Queue 发送已验证的 Config
+```
+
+SensorTask 和 DisplayTask 不等待 HTTP。ConfigTask 只在得到一份完整、范围合法的新配置后才通过 Queue 交给业务任务；解析失败时继续使用上一份已验证配置，并记录失败原因。
+
+如果 WiFi、MQTT 和 HTTP 共用同一个 AT 模块 UART，还要继续遵守第 17、18 章的单一所有者规则。ConfigTask 可以向通信任务提交请求，但不要与 MQTT 任务同时直接发送 AT 命令。
+
+## 23.10 用故意分段的服务测试解析器
+
+下面的 PC 服务把 Header 和 Body 故意拆成几次发送。它只用于受控局域网实验：
+
+```python
+import socket
+import time
+
+body = b'{"sample_period_ms":1000,"upload_period_ms":10000}'
+head = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Type: application/json\r\n"
+    b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+    b"Connection: close\r\n"
+    b"\r\n"
+)
+
+with socket.socket() as server:
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", 8080))
+    server.listen(1)
+
+    conn, addr = server.accept()
     with conn:
-        conn.recv(1024)       # 教学示例：忽略请求内容
+        conn.recv(1024)  # 教学服务暂不解析请求
         conn.sendall(head[:23])
         time.sleep(0.2)
         conn.sendall(head[23:] + body[:7])
         time.sleep(0.2)
         conn.sendall(body[7:])
-~~~
+```
 
-设备端必须在每个分段后保持 `HTTP_RX_HEADERS` 或 `HTTP_RX_BODY`，直到条件满足；如果只在 `read()` 后直接调用 cJSON，这个服务会稳定暴露 bug。
+设备应在前两次输入后继续保持 `HTTP_RX_HEADERS` 或 `HTTP_RX_BODY`，直到 `body_len == content_length` 才产生完整响应事件。这个测试能稳定暴露“每收到一段就直接 `strstr()` / `cJSON_Parse()`”的问题。
 
-### 请求构造也要检查边界
+再增加几组故障输入：Header 超过 512 字节、`Content-Length` 大于 1024、Body 提前断开、404 + JSON、错误 JSON、字段类型错误，以及 Chunked 响应。每一种都应得到明确错误，不越界，也不更新当前配置。
 
-~~~c
-int n = snprintf(request, sizeof(request),
-    "GET /config HTTP/1.1\r\n"
-    "Host: %s\r\n"
-    "Connection: close\r\n\r\n", host);
+## 23.11 HTTPS 和公网接口
 
-if (n < 0 || (size_t)n >= sizeof(request)) {
-    /* Host 或路径太长；不要把截断请求发出去。 */
-    return false;
-}
-~~~
+公网 API 通常使用 HTTPS。浏览器能访问某个地址，不能证明当前 AT 模块能完成相同连接；浏览器已经替你处理了 DNS、TLS、证书、SNI、时间、重定向、压缩和更复杂的 HTTP 响应。
 
-长度检查、CRLF、Host 和 AT 发送字节数都属于同一个端到端契约。HTTP 请求文本“看起来像对的”不等于 TCP 实际发出的长度正确。
+接入公网前逐项确认：
 
-### 回归用例
+- AT 模块固件是否支持目标 TLS 版本；
+- 是否支持目标域名需要的 SNI；
+- 根证书或服务器证书如何配置、更新和校验；
+- 设备时间从哪里来；
+- TLS 握手期间的 RAM 和供电是否满足要求；
+- 服务端是否可能返回 Chunked、重定向或压缩内容。
 
-| 用例 | 期望 |
-|---|---|
-| 头部分三段 | 不解析 JSON，直到头完整 |
-| Body 分五段 | 只在收满 Content-Length 后交给 cJSON |
-| Content-Length 大于缓冲区 | 明确报错，不越界 |
-| 返回 404 + JSON | 记录状态码，业务层不当成功 |
-| Chunked | 第一版明确拒绝或走专门实现 |
-| 字段类型变化 | `cJSON_IsNumber/String` 拒绝不匹配字段 |
+这些条件没有验证时，本章的代码只声称支持受控局域网 HTTP 子集，不把它描述成通用 Web 客户端。
 
-练习：把服务端 body 的温度字段依次改成缺失、字符串、负数和超长 JSON，记录固件的状态码、解析错误和内存行为。
+## 23.12 本章完成标准
 
-## 23.12 先冻结一个 HTTP 子集，解析器才有可验证的边界
+完成下面这些测试后再继续下一章：
 
-HTTP 很大；第一轮 ZET6 实验只支持一个明确子集，比声称“支持 HTTP”安全得多。下面是推荐的教学契约：
+- 能构造 GET，并确认 `CIPSEND` 长度与实际 HTTP 请求字节数一致；
+- Header 被拆成多段时仍能找到完整 `\r\n\r\n`；
+- Header 和第一段 Body 粘在一起时不丢 Body；
+- 只在收满 `Content-Length` 后解析 JSON；
+- 404、超长响应、提前断开和 Chunked 都进入明确错误路径；
+- JSON 字段缺失、类型错误和范围错误不会更新当前配置；
+- 连续错误响应不会造成可观察的 heap 持续下降。
 
-| 项目 | 第一轮支持 | 明确不支持/需另写状态机 |
-|---|---|---|
-| 方法 | `GET`；需要时再单独加入小 Body 的 `POST` | 复杂上传、流式请求 |
-| 协议 | HTTP/1.1，显式 `Connection: close` | 持久连接复用、HTTP/2 |
-| 响应边界 | `Content-Length`；或连接关闭作为最后边界 | Chunked 编码、无限流 |
-| 头部/Body 上限 | 编译期常量，超出即拒绝并计数 | 按服务器输入无限扩容 |
-| 重定向/压缩 | 直接报告“不支持” | 自动跳转、gzip 解压 |
-| JSON | 完整 Body 到齐后解析 | 半包、超长、类型不符时继续使用旧数据 |
+最后再检查一次任务边界：网络失败只能影响 ConfigTask/通信任务，不能拖住传感器采样和显示刷新。
 
-这样 `HTTP 任务` 的状态机就能写得很小且可回放：
-
-~~~text
-IDLE → BUILD_REQUEST → TCP_CONNECT → SEND
-  → READ_HEADERS → CHECK_STATUS_AND_LENGTH → READ_BODY
-  → PARSE_JSON → DELIVER_CONFIG → CLOSE → IDLE
-                       └─ 任意超时/超长/格式错 → CLOSE + ERROR + 退避
-~~~
-
-只有在 `Content-Length` 已验证且所有 Body 字节到齐时，才允许调用 `cJSON_Parse`。若选择依赖连接关闭作为边界，就必须给总响应长度和等待时间上限，避免一台异常服务永远占住任务。
-
-### 内存与 HTTPS 的明确取舍
-
-cJSON 的分配来源、解析最大尺寸和错误释放策略都应写在项目配置中。若使用动态内存，测试连续错误 JSON 是否导致 heap 持续下降；若改用自定义 allocator，`cJSON_InitHooks` 的初始化时机和线程安全也要说明。
-
-公网服务通常要求 HTTPS。选择路线前依次确认：AT 模块是否真支持目标 TLS 版本、域名/SNI、证书存储与校验；系统时间从何而来；握手时 RAM/供电是否足够。任意一项未验证时，只把实验限定在受控的局域网 HTTP 服务，不要通过“浏览器可以访问”来推断 MCU 的连接安全。
-
-## 23.13 本章要点
-
-- HTTP 请求先组装，再根据真实长度发送 AT+CIPSEND；
-- TCP/UART 收包不保证一次收到完整 HTTP 响应；
-- 解析 JSON 前必须验证状态码、边界、长度和字段类型；
-- 网络请求应放在独立任务中；
-- HTTP 很适合学习和调试 REST 接口，持续设备消息通常更适合 MQTT。
-
----
-
-[上一章：第 22 章 · 云平台接入、设备身份与 HMAC](./22-chapter.md)
-
-[下一章：第 24 章 · 网关架构与 UART 接收通路](./24-chapter.md)
+> **上一章**：[第 22 章 · 云平台接入、设备身份与 HMAC](./22-chapter.md)
+>
+> **下一章**：[第 24 章 · 网关架构与 UART 接收通路](./24-chapter.md)
