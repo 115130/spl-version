@@ -1,32 +1,28 @@
 # 第 22 章 · 云平台接入、设备身份与 HMAC（SPL 版）
 
-第 21 章已经能连接 MQTT Broker。本章继续处理真实平台接入时最容易出错的一层：设备身份、待签名字符串、HMAC、时间戳以及密钥配置。
+第 21 章已经能连接 MQTT Broker。本章处理真实平台接入时经常出错的认证链路：设备身份、待签名字节、HMAC、时间和密钥配置。
 
-这里不绑定某一家云平台。字段名、排序、编码、签名算法、TLS 和认证参数都必须以实际平台文档为准。本章先建立一套能离线验证的做法。
+这里不绑定具体云平台。Product Key、Client ID、签名字段、编码方式、TLS 参数都以目标平台当前文档为准。本章先把认证过程拆成可离线验证的几个步骤。
 
-## 22.1 设备身份包含哪些东西
+## 22.1 先区分标识和凭据
 
-很多 IoT 平台会给每台设备分配一组身份字段。常见形式包括 Product ID、Device Name 和 Device Secret，也有平台使用 Client ID、Access Key、Token 或证书。
+IoT 平台通常会给设备分配公开标识和秘密凭据。名称各不相同，例如 Product ID、Device Name、Client ID、Access Key、Device Secret、Token 或私钥。
 
-其中公开标识和 Secret 的角色不同：
+Product ID、Device ID 这类字段通常用于说明设备身份；Secret 或私钥用于证明设备持有凭据。具体哪些字段需要保密，由平台定义。Secret 不应出现在普通日志、MQTT Topic 或代码仓库中。
 
-- Product ID / Product Key：标识产品或设备组，通常不是秘密。
-- Device Name / Device ID：标识具体设备，通常也不是秘密。
-- Device Secret / private key：用于证明身份，必须保密。
+设备认证可以抽象成两部分：设备提交身份字段，同时根据平台规则生成认证数据。服务器验证认证数据以后，才接受对应身份。
 
-平台接入时，设备先告诉服务器“我是谁”，再用 Secret 生成签名证明自己持有对应密钥。Secret 本身不应该直接出现在 MQTT Topic、普通日志或仓库里。
+## 22.2 HMAC 的输入必须逐字节一致
 
-## 22.2 HMAC 验证的是一串确定的字节
-
-HMAC 可以表示成：
+如果平台规定 HMAC-SHA256，可以先写成：
 
 ```text
-signature = HMAC(secret, message)
+signature = HMAC-SHA256(secret, message)
 ```
 
-真正容易错的往往是 `message`。平台可能要求把 client ID、设备名、时间戳、nonce 等字段按固定顺序拼接，再做 URL 编码、大小写转换或 Base64。少一个 `&`、字段顺序不同、换行不同，HMAC 都会完全变化。
+HMAC 算法固定以后，最常见的问题在 `message`。字段顺序、分隔符、大小写、UTF-8 编码、URL 编码和末尾换行只要有一个字节不同，结果就会不同。
 
-先把平台规则单独封装成 canonical string 生成函数：
+把平台的待签名规则单独封装：
 
 ```c
 typedef struct {
@@ -41,21 +37,19 @@ int Cloud_BuildCanonical(const CloudAuthInput *in,
                          char *out, size_t out_size);
 ```
 
-这个函数只负责生成平台规定的待签名字节，不读取 Secret，也不访问网络。调试时可以安全输出 canonical 的长度和十六进制内容，只要其中没有敏感字段。
+这个函数只生成待签名字节，不读取 Secret，也不访问网络。调试时可以输出长度和十六进制内容，但要先确认待签名字段本身没有平台定义的敏感信息。
 
-例如某个平台的演示规则可能要求：
+例如教学规则可以规定：
 
 ```text
 clientId=zet6-01&deviceName=room-01&timestamp=1700000000
 ```
 
-这只是示例。字段顺序、分隔符和编码必须跟实际平台文档一致。
+这里只演示“固定字段 + 固定顺序 + 固定分隔符”。接真实平台时，照平台文档逐项实现，不从这个示例推断实际格式。
 
-## 22.3 HMAC 不要自己临时手写
+## 22.3 HMAC 实现要有已知测试向量
 
-如果平台要求 HMAC-SHA256，可以使用经过审查并有明确版本的密码学实现，或者使用无线模块已经提供并且文档完整的安全能力。本书不把自写 SHA-256/HMAC 当作入门路线。
-
-设备侧接口可以保持简单：
+本章不手写 SHA-256 或 HMAC。使用有明确来源和版本的密码学实现，或者使用无线模块提供且文档完整的安全能力。设备侧只保留稳定接口：
 
 ```c
 typedef enum {
@@ -72,66 +66,70 @@ CloudAuthResult Cloud_HmacSha256(const uint8_t *secret,
                                  uint8_t out[32]);
 ```
 
-签名结果后续可能需要转成十六进制、Base64 或 URL 编码。输出格式同样属于平台协议，不能只算出 32 字节 HMAC 就认为认证字符串已经完成。
+HMAC-SHA256 输出 32 字节。平台可能要求再编码成小写 Hex、大写 Hex、Base64 或其他形式；这些转换属于认证协议的一部分。
 
-HMAC 只证明消息由持有 Secret 的一方生成，并保护消息完整性。它不会加密内容；canonical string、设备 ID 和 signature 仍可能在链路上可见。真实公网连接还需要评估 TLS。
+接网络前，先让 PC 和 STM32 对同一组公开测试数据得到相同结果。例如 PC 可以生成一组项目自己的回归向量：
 
-## 22.4 时间戳和 nonce 解决什么问题
+```python
+import hashlib
+import hmac
 
-很多平台会把 timestamp 或 nonce 放进签名。它们主要用于限制旧签名被重复使用。
+message = b"clientId=zet6-01&timestamp=1700000000"
+secret = b"demo-secret-not-for-production"
 
-设备若签名：
-
-```text
-clientId=zet6-01&timestamp=1700000000&nonce=4f8c...
+digest = hmac.new(secret, message, hashlib.sha256).digest()
+print(digest.hex())
 ```
 
-平台可以检查 timestamp 是否在允许时间窗口内，并拒绝已经使用过或不符合规则的 nonce。具体窗口大小和 nonce 要求由平台决定。
+保存 `message` 的长度、十六进制、公开测试 Secret 和期望 HMAC。STM32 测试同一组字节。结果不一致时先比较输入字节，再检查算法和输出编码，暂时不要碰网络。
 
-F103 自己没有网络时间来源。设备必须明确时间从哪里来，例如：
+HMAC 提供消息认证和完整性校验，不负责加密。Client ID、canonical string、signature 等字段是否能被链路观察者看到，取决于外层传输保护；公网连接通常还需要 TLS。
 
-- 外部 RTC；
-- WiFi 模块提供的 SNTP/NTP；
-- 受控配网阶段写入时间；
-- 平台协议允许的其他时间同步机制。
+## 22.4 timestamp 和 nonce 按平台规则生成
 
-如果时间未知，依赖绝对时间戳的签名和证书有效期检查都可能失败。不要在启动代码里随便填一个 Unix 时间让认证“先跑起来”。
+平台可能把 timestamp、nonce 或两者一起放进签名，用于限制旧认证数据被重复使用。服务器怎样检查时间窗口、nonce 是否允许重复、nonce 需要多少随机性，都属于平台协议。
 
-## 22.5 配置文件和 Secret 分开管理
+如果认证依赖 Unix 时间，设备必须先有可信时间来源。F103 不会自行获得网络时间，可以使用外部 RTC、WiFi 模块提供的 SNTP/NTP 能力，或者项目定义的受控校时流程。
 
-仓库可以提交模板：
+这里还要区分“有一个递增计数器”和“知道当前 UTC 时间”。系统运行了 300 秒，并不能推出当前 Unix timestamp。时间未同步时，状态机应停在等待时间或配置错误状态，不要填一个固定时间继续认证。
+
+TLS 证书验证也可能依赖正确时间。如果 TLS 由 WiFi 模块完成，还要查模块的证书验证方式和时间来源，不能默认 MCU 的时间设置会自动传给模块。
+
+## 22.5 Secret 不进入仓库
+
+仓库可以提交非敏感配置模板：
 
 ```c
 /* device_config.example.h */
-#define DEVICE_PRODUCT_ID  "replace-me"
-#define DEVICE_NAME        "replace-me"
-#define DEVICE_CONFIG_VERSION 1U
+#define DEVICE_PRODUCT_ID      "replace-me"
+#define DEVICE_NAME            "replace-me"
+#define DEVICE_CONFIG_VERSION  1U
 ```
 
-真实配置放在被 Git 忽略的文件中：
+本地真实配置放在被 Git 忽略的文件中：
 
 ```c
 /* device_config.h */
-#define DEVICE_PRODUCT_ID  "demo-product"
-#define DEVICE_NAME        "room-01"
-#define DEVICE_SECRET      "local-only-secret"
-#define DEVICE_CONFIG_VERSION 1U
+#define DEVICE_PRODUCT_ID      "demo-product"
+#define DEVICE_NAME            "room-01"
+#define DEVICE_SECRET          "local-only-secret"
+#define DEVICE_CONFIG_VERSION  1U
 ```
 
-`.gitignore` 至少加入：
+`.gitignore` 加入对应文件：
 
 ```text
 device_config.h
 wifi_credentials.h
 ```
 
-如果 Secret 已经提交进 Git，再从最新文件中删除并不等于泄露已经消失。旧 commit 仍可能保留它，这时应撤销旧凭据并重新签发，而不是只做一次“清理历史”。
+如果真实 Secret 已经进入 Git 历史，只删除当前版本还不够。旧 commit、fork、缓存或 CI 日志可能已经留下副本。先在平台侧吊销或轮换该凭据，再根据仓库实际暴露范围决定是否需要清理历史。
 
-量产设备也不应该共用同一个 Device Secret。更合理的流程是每台设备拥有独立身份和密钥，并在生产或受控配置阶段写入。
+量产时也要避免所有设备共用一个长期 Secret。每台设备独立凭据后，单台设备泄露时可以单独吊销，不必同时替换整个产品的认证信息。
 
-## 22.6 给身份配置定义明确接口
+## 22.6 业务代码只拿凭据接口
 
-业务代码不要到处直接引用宏。可以把身份和 Secret 统一暴露成结构体：
+不要让 MQTT、HTTP、日志模块分别引用一组 Secret 宏。统一通过凭据接口取得配置：
 
 ```c
 typedef struct {
@@ -145,7 +143,7 @@ typedef struct {
 const CloudCredentials *CloudCredentials_Get(void);
 ```
 
-启动时只打印非敏感信息：
+启动日志只输出排错需要的非敏感字段：
 
 ```c
 void Cloud_LogIdentity(const CloudCredentials *c)
@@ -158,49 +156,11 @@ void Cloud_LogIdentity(const CloudCredentials *c)
 }
 ```
 
-不要打印 Secret、完整 Authorization、包含 Secret 的 AT 命令，也不要把完整签名输入和 Secret 同时写进日志。
+完整 Secret、Authorization、带凭据的 AT 命令都不应进入普通日志。签名值是否允许记录也要看平台威胁模型；生产固件通常没有长期记录完整认证材料的必要。
 
-## 22.7 先做离线测试向量
+## 22.7 认证状态机把错误分层
 
-接云平台之前，先在 PC 和 MCU 上对同一组公开演示数据计算 HMAC。这样可以把“密码学输入是否一致”和“网络认证是否成功”分开。
-
-例如 PC 上：
-
-```python
-import hmac
-import hashlib
-
-message = b"clientId=zet6-01&timestamp=1700000000"
-secret = b"demo-secret-not-for-production"
-
-print(hmac.new(secret, message, hashlib.sha256).hexdigest())
-```
-
-把输出保存成测试向量：
-
-```text
-algorithm: HMAC-SHA256
-message length: ...
-message hex: ...
-secret: demo-secret-not-for-production
-expected hmac hex: ...
-```
-
-STM32 使用同样的公开 Secret 和同样的 message 字节计算。两边不一致时，先比较 message 的长度和逐字节十六进制，再检查算法和输出编码。
-
-测试至少覆盖：
-
-- 正常 ASCII 输入；
-- 空字符串字段；
-- 含 UTF-8 字符的字段；
-- 只改变一个字符后的 HMAC；
-- 输出十六进制大小写或 Base64 规则。
-
-真实 Secret 不参与这些可提交的测试向量。
-
-## 22.8 上云连接的状态顺序
-
-认证逻辑进入网络任务以后，顺序可以写成：
+把认证接入第 21 章的通信任务后，可以使用下面的顺序：
 
 ```text
 LOAD_CONFIG
@@ -211,36 +171,36 @@ BUILD_CANONICAL
     ↓
 CALCULATE_SIGNATURE
     ↓
-TCP/TLS CONNECT
+TCP/TLS_CONNECT
     ↓
-MQTT CONNECT WITH AUTH
+MQTT_CONNECT_WITH_AUTH
     ↓
-CONNACK
+WAIT_CONNACK
     ↓
 ONLINE
 ```
 
-每个阶段都要有独立错误码。`Cloud_BuildCanonical()` 失败和 Broker 拒绝认证是两种问题；TLS 握手失败也不应该统一归成“MQTT 连接失败”。
+每个阶段保留独立错误原因。例如 canonical 缓冲区不足、HMAC 失败、DNS 失败、TLS 证书错误、TCP 超时和 MQTT CONNACK 拒绝，不要统一压成 `connect failed`。
 
-认证失败时不要高速无限重试。如果平台返回“凭据错误”“设备被禁用”这类稳定错误，继续每秒重连不会自行恢复，还会制造大量日志和流量。网络波动可以进入退避；配置错误则应进入等待人工处理或受控重新配置状态。
+重试策略也取决于错误类型。无线暂时断开、DNS 超时等问题可以进入有上限的退避；凭据被拒绝、设备被禁用或本地配置缺失通常不会靠每秒重连恢复，应停止快速重试并等待配置修复。
 
-## 22.9 TLS 由谁负责要先确定
+## 22.8 TLS 放在哪一层
 
-STM32F103ZET6 有 64 KB SRAM，本书又通过 AT 模块联网。真实云平台是否可接，首先取决于 TLS 放在哪里。
+STM32F103ZET6 有 64 KB SRAM，本书的网络链路又经过 AT 模块。接入真实 HTTPS/MQTT TLS 平台前，先确认 TLS 由谁实现。
 
-常见方案有三种：
+常见结构包括：
 
-- **无线模块负责 TLS**：模块必须支持目标 TLS 版本、SNI、证书验证、服务器名和对应错误码。
-- **MCU 负责 HMAC，模块负责 TLS**：F103 只生成认证字段，TLS 会话仍在模块里完成。
-- **隔离局域网明文实验**：只用于教学和公开演示数据，不当作真实公网安全方案。
+- MCU 生成 HMAC 等认证字段，WiFi 模块建立 TLS 连接；
+- 模块同时提供 TLS 和平台相关认证命令；
+- 隔离局域网内使用明文 TCP 做协议实验，只传公开测试数据。
 
-如果模块只支持“能建立 TLS socket”但无法正确校验证书，仍然不能把它当成完整的服务器身份验证。需要查模块固件手册并实测证书加载、服务器名校验和失败路径。
+如果 TLS 由模块处理，要检查目标 TLS 版本、SNI、CA/证书加载、服务器名验证、证书有效期检查和错误码。模块能够建立一个加密 socket，不代表它已经正确验证服务器身份。
 
-不要用“连通一次”判断 TLS 方案可用。至少记录模块固件版本、握手错误码、证书配置方法、峰值供电情况和断线恢复行为。
+还要验证失败路径：错误 CA、错误服务器名、过期或时间无效的证书应该怎样报错。记录模块型号和固件版本，因为同一硬件的不同 AT 固件可能支持不同的 TLS 功能。
 
-## 22.10 数据模型继续沿用前面的字段
+## 22.9 数据模型沿用前面的单位
 
-云平台 Payload 不需要重新发明一套温度单位。可以继续使用前面章节的定点数据，在 JSON 边界再转换成需要的表示：
+云端 Payload 继续使用前面章节定义的定点单位，例如：
 
 ```json
 {
@@ -252,47 +212,44 @@ STM32F103ZET6 有 64 KB SRAM，本书又通过 AT 模块联网。真实云平台
 }
 ```
 
-字段名、单位和无效值规则固定下来后，MQTT、HTTP 和本地日志都可以复用。同一个物理量不要在不同章节分别叫 `temp`、`temperature`、`t`，也不要一处用摄氏度浮点、一处用摄氏度百分之一整数却没有说明。
+`temperature_centi=2460` 表示 24.60 °C，`humidity_permille=580` 表示 58.0% RH。状态无效时不要伪造一个正常数值，继续携带传感器状态字段或使用平台数据模型规定的无效表示。
 
-平台如果要求特定数据模型，再在云适配层做转换，不要反向修改传感器驱动的内部数据结构。
+平台要求另一套字段名或单位时，在云适配层转换。传感器驱动和内部 `EnvSample` 保持原来的定义，避免 MQTT、HTTP、本地日志各自维护一套物理量语义。
 
-## 22.11 密钥有完整生命周期
+## 22.10 凭据需要能轮换和吊销
 
-Secret 需要考虑创建、写入、使用、轮换、吊销和退役。至少把这些状态记录清楚：
+设备身份至少要能关联这些信息：设备 ID、固件版本、配置版本和当前凭据状态。平台侧还要知道某个旧凭据是否已经吊销。
 
-- 设备 ID；
-- 固件版本；
-- 配置版本；
-- 当前凭据是否有效；
-- 平台是否已吊销旧凭据。
+STM32F1 的读保护可以提高直接读取 Flash 的门槛，但不要把普通 MCU Flash 当作专用硬件安全根。产品的攻击成本较高时，需要根据威胁模型评估安全元件、受控烧录、调试接口策略和平台最小权限。
 
-F103 的读保护和封装可以增加读取难度，但不应被描述成硬件安全根。高价值设备要根据威胁模型评估安全芯片、受保护烧录、调试口策略和平台侧最小权限。
+设备丢失或 Secret 泄露后，应在平台侧吊销旧凭据并配置新凭据。轮换流程本身也要能识别版本，避免设备继续使用已经失效的旧 Secret 无限重试。
 
-设备丢失或 Secret 泄露后，正确动作是平台侧吊销旧身份并配置新凭据。旧 Secret 不应长期留作“备用密码”。
+## 22.11 排错按数据流向走
 
-## 22.12 排错顺序
+认证失败时按下面的顺序检查：
 
-云端认证失败时按这个顺序查：
+1. 用公开测试向量确认 MCU 的 HMAC 与 PC 一致；
+2. 比较 canonical string 的长度和逐字节内容；
+3. 核对字段顺序、大小写、UTF-8、URL/百分号编码和 Hex/Base64 规则；
+4. 检查 timestamp、nonce、Client ID、Device ID 和配置版本；
+5. 检查 DNS、TCP/TLS 的具体错误；
+6. 检查 MQTT CONNACK 或平台返回的认证错误码。
 
-1. 用公开测试向量确认 MCU 的 HMAC 实现与 PC 一致。
-2. 比较 canonical string 的长度和逐字节内容。
-3. 核对字段顺序、大小写、UTF-8、百分号编码、Hex/Base64 规则。
-4. 检查 timestamp、nonce、Client ID、设备 ID 和配置版本。
-5. 查看 MQTT CONNACK、HTTP 状态码或平台认证错误码。
-6. 最后再查 TLS、证书、DNS、模块固件和网络。
+如果 canonical string 已经不同，换 Secret 或反复重连不会解决问题。先让待签名字节和平台示例一致，再进入下一层。
 
-如果第 2 步字节已经不同，继续换 Secret 或重试网络没有意义。先把签名输入统一。
+## 22.12 本章完成标准
 
-## 22.13 练习
+完成下面几项即可结束本章：
 
-1. 提交一份 `device_config.example.h`，并确认真实 `device_config.h` 被 Git 忽略。
-2. 选择一组公开 HMAC-SHA256 测试向量，在 PC 和 STM32 上得到相同结果。
-3. 故意改变 canonical string 中一个字符，比较 HMAC 输出。
-4. 模拟时间未同步，确认认证状态机不会继续使用伪造 timestamp 连接平台。
-5. 模拟平台返回“凭据无效”，让网络任务停止快速重试并留下明确错误状态。
-6. 给配置增加 `config_version`，启动日志只打印设备 ID、配置版本和 Secret 长度。
+- `device_config.example.h` 可以提交，真实凭据文件被 Git 忽略；
+- PC 和 STM32 对同一组公开 HMAC-SHA256 测试向量得到相同结果；
+- 改变 canonical string 中一个字节后，测试能发现签名变化；
+- 时间未同步时，认证状态机不会生成伪造 timestamp 继续连接；
+- 凭据被拒绝时停止快速重试，并留下明确错误状态；
+- 启动日志只包含排错需要的非敏感身份和配置版本；
+- 网络任务能区分配置、时间、签名、TCP/TLS 和 Broker 认证错误。
 
-完成这一章后，设备接云平台时应能把失败明确定位到配置、时间、canonical string、HMAC、TLS 或 Broker 认证中的某一层，而不是统一显示一个“连接失败”。
+这些边界明确以后，再针对具体云平台实现字段拼接、认证参数和 TLS 配置。平台文档变化时，只需要修改云适配层和对应测试向量。
 
 > **上一章**：[第 21 章 · MQTT](./21-chapter.md)
 >
