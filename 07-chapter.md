@@ -1,63 +1,90 @@
 # 第 7 章 · 定时器：从公式到波形（SPL 版）
 
-> **本章产出**：能从当前时钟树算出 TIMCLK、配置周期/PWM/输入捕获，并用回环波形而不是肉眼猜测验证结果。
->
-> **前置知识**：第 5 章时钟与时基、第 6 章中断、第 3 章 GPIO。
->
-> **通过标准**：写出 `TIMCLK`、PSC、ARR、CCR 的计算；实测 PWM 频率与占空比；输入捕获得到与已知回环频率相符的周期。
+这一章用 TIM2 和 TIM3 完成三件事：周期中断、PWM 输出和输入捕获。重点不是记配置结构体，而是从当前时钟树算出 TIMCLK、PSC、ARR、CCR，再用实际波形验证结果。
 
----
+前面已经配置过时钟、中断和 GPIO。本章所有示例都沿用第 5 章的时钟配置；如果系统时钟或 APB 分频发生变化，定时器参数也要重新计算。
 
-## 7.1 定时器资源先于代码
+## 7.1 先确认定时器资源
 
-ZET6 有高级控制、通用和基本定时器。不同实例的通道/引脚、总线和功能不同；一个定时器一次只能承担一个清晰角色（例如 PWM 或 1MHz 输入捕获），不要把教材片段直接拼在同一实例上。
+STM32F103ZET6 有多类定时器。TIM1、TIM8 属于高级控制定时器；TIM2–TIM5 是通用定时器；TIM6、TIM7 是基本定时器，没有外部输入输出通道。SysTick 属于 Cortex-M3 内核，继续作为本书的 1 ms 系统时基。
 
-| 类别 | 实例 | 本章用法 |
-|---|---|---|
-| 高级控制 | TIM1、TIM8 | 互补 PWM、死区、刹车等高级电机用途（本章不展开） |
-| 通用 | TIM2–TIM5 | 周期中断、PWM、输入捕获 |
-| 基本 | TIM6、TIM7 | 无外部通道的时基/DAC 触发 |
-| 内核 | SysTick | 1ms 系统时基，不替代微秒协议计时 |
+本章使用：
 
-使用前在资源表登记：定时器实例、通道、GPIO 复用、该 GPIO 是否与按键/ADC/传感器冲突、所处 APB。PB0 的 TIM3_CH3、PA0 的 TIM2_CH1 都是外接实验默认映射，且会与前面章节的默认实验冲突。
+- TIM2：周期中断或输入捕获。
+- TIM3_CH3：PWM 输出，默认引脚 PB0。
+- PA0：TIM2_CH1 输入捕获。
 
-## 7.2 第一步永远是求 TIMCLK
+PB0、PA0 在前面章节已经被其他实验使用过，做本章实验时要断开冲突模块。一个定时器实例也不要同时拿来做两套互相冲突的实验配置。
 
-向上计数定时器的基本关系是：
+## 7.2 先算 TIMCLK
+
+向上计数时，最基本的公式是：
 
 ```text
 counter_tick = TIMCLK / (PSC + 1)
 update_freq  = TIMCLK / ((PSC + 1) × (ARR + 1))
-PWM_freq     = update_freq
 ```
 
-TIMCLK 不能硬编码为 72MHz。APB 预分频为 /1 时，TIMCLK=PCLK；为 /2、/4、/8、/16 时，TIMCLK=2×PCLK。可以从 RCC 当前状态推导：
+PWM 的周期同样由 PSC 和 ARR 决定。
+
+STM32F1 的 APB 定时器有一条特殊规则：APB 预分频为 `/1` 时，定时器时钟等于 PCLK；APB 预分频大于 1 时，定时器时钟等于 `2 × PCLK`。
+
+可以从当前 RCC 配置计算：
 
 ```c
 static uint32_t APB1_TimerClockHz(void)
 {
     RCC_ClocksTypeDef clocks;
     RCC_GetClocksFreq(&clocks);
-    return (RCC->CFGR & RCC_CFGR_PPRE1) == 0U
-         ? clocks.PCLK1_Frequency
-         : clocks.PCLK1_Frequency * 2U;
+
+    if ((RCC->CFGR & RCC_CFGR_PPRE1) == 0U)
+        return clocks.PCLK1_Frequency;
+
+    return clocks.PCLK1_Frequency * 2U;
 }
 
 static uint32_t APB2_TimerClockHz(void)
 {
     RCC_ClocksTypeDef clocks;
     RCC_GetClocksFreq(&clocks);
-    return (RCC->CFGR & RCC_CFGR_PPRE2) == 0U
-         ? clocks.PCLK2_Frequency
-         : clocks.PCLK2_Frequency * 2U;
+
+    if ((RCC->CFGR & RCC_CFGR_PPRE2) == 0U)
+        return clocks.PCLK2_Frequency;
+
+    return clocks.PCLK2_Frequency * 2U;
 }
 ```
 
-在第 5 章的典型配置中，PCLK1=36MHz、APB1=/2，因此 TIM2–7 的 TIMCLK=72MHz；这只是**该配置下的推导结果**。若系统回退到 HSI、或你改变 APB 分频，下面的 PSC/ARR 必须重算。
+第 5 章的 72 MHz 配置中：
 
-## 7.3 周期中断：短 ISR，明确时基
+```text
+HCLK  = 72 MHz
+PCLK1 = 36 MHz，APB1=/2
+PCLK2 = 72 MHz，APB2=/1
 
-若 TIM2 的 TIMCLK 已确认为 72MHz，要得到 1kHz 更新事件：`PSC=71` 先得到 1MHz tick，`ARR=999` 再得到 1ms。NVIC 分组在第 6 章启动时已统一配置；这里只分配优先级。
+TIM2–TIM7 TIMCLK = 72 MHz
+TIM1/TIM8 TIMCLK = 72 MHz
+```
+
+这里得到 72 MHz 是当前配置的结果。系统回退到 HSI 或修改 APB 分频后，不能继续照搬 `PSC=71`。
+
+## 7.3 周期中断
+
+假设 TIM2 的 TIMCLK 已确认是 72 MHz，要产生 1 kHz 更新事件，可以先把计数频率降到 1 MHz：
+
+```text
+PSC = 71
+72 MHz / (71 + 1) = 1 MHz
+```
+
+再让计数器数 1000 个 tick：
+
+```text
+ARR = 999
+1 MHz / (999 + 1) = 1 kHz
+```
+
+对应代码：
 
 ```c
 static void TIM2_Update1kHz_Init(void)
@@ -66,6 +93,7 @@ static void TIM2_Update1kHz_Init(void)
     NVIC_InitTypeDef nvic;
 
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
+
     TIM_TimeBaseStructInit(&tim);
     tim.TIM_Prescaler = 71U;
     tim.TIM_Period = 999U;
@@ -74,11 +102,13 @@ static void TIM2_Update1kHz_Init(void)
 
     TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
     TIM_ITConfig(TIM2, TIM_IT_Update, ENABLE);
+
     nvic.NVIC_IRQChannel = TIM2_IRQn;
     nvic.NVIC_IRQChannelPreemptionPriority = 1U;
     nvic.NVIC_IRQChannelSubPriority = 0U;
     nvic.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&nvic);
+
     TIM_Cmd(TIM2, ENABLE);
 }
 
@@ -86,27 +116,31 @@ void TIM2_IRQHandler(void)
 {
     if (TIM_GetITStatus(TIM2, TIM_IT_Update) != RESET) {
         TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
-        /* 最多置标志/递增轻量计数；不要做 printf、Delay 或轮询。 */
+
+        /* 置事件、递增轻量计数等。 */
     }
 }
 ```
 
-不要为了“我需要 1ms”同时让 SysTick 和 TIM2 各自跑一套无主的系统时基。第 0 章以 SysTick 为公共毫秒时间；TIM2 只在你确有独立周期任务、PWM 或捕获需求时使用。
+本书已经用 SysTick 提供公共 1 ms 时间，不需要再让 TIM2 维护另一套全局毫秒计数。TIM2 更适合留给独立周期任务、PWM、输入捕获或后面的微秒时基。
 
-## 7.4 PWM：CCR 是占空比，不是“亮度百分比”
+## 7.4 PWM
 
-PWM 模式 1、有效高时，通常 `CNT < CCR` 输出有效。对 `ARR=999`：
+PWM 模式 1、有效高、向上计数时，通常在 `CNT < CCR` 时输出有效。假设 `ARR=999`，计数器每周期经过 0–999 共 1000 个计数值。
+
+对应占空比约为：
 
 ```text
-CCR=0    → 0%
-CCR=250  → 约 25%
-CCR=500  → 约 50%
-CCR=999  → 接近 100%
+CCR = 0     → 0%
+CCR = 250   → 25%
+CCR = 500   → 50%
+CCR = 750   → 75%
+CCR = 1000  → 100%
 ```
 
-极性、外接 LED 的接法和通道模式都会改变“高电平是否等于亮”。先用逻辑分析仪验证波形，再谈视觉亮度；人眼感知也不是线性响应。
+`CCR=999` 时实际是 999/1000，约 99.9%。这一点在做精确 PWM 时要分清。
 
-下面使用外接 PB0/TIM3_CH3 生成 1kHz PWM。开始前断开 DS18B20，并确认没有把板载 LED 假定在 PB0：
+下面用 PB0 / TIM3_CH3 输出 1 kHz PWM。实验前先确认 PB0 没有连接前面章节的 DS18B20 或其他模块。
 
 ```c
 static void TIM3_CH3_PWM_Init(void)
@@ -119,12 +153,12 @@ static void TIM3_CH3_PWM_Init(void)
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
 
     GPIO_StructInit(&gpio);
-    gpio.GPIO_Pin = GPIO_Pin_0;          /* TIM3_CH3 默认复用 */
+    gpio.GPIO_Pin = GPIO_Pin_0;
     gpio.GPIO_Mode = GPIO_Mode_AF_PP;
-    gpio.GPIO_Speed = GPIO_Speed_2MHz;    /* 1kHz 不需要 50MHz 边沿 */
+    gpio.GPIO_Speed = GPIO_Speed_2MHz;
     GPIO_Init(GPIOB, &gpio);
 
-    /* 仅当 APB1_TimerClockHz()==72MHz 时，PSC/ARR 如下。 */
+    /* 仅适用于 TIMCLK = 72 MHz。 */
     TIM_TimeBaseStructInit(&tim);
     tim.TIM_Prescaler = 71U;
     tim.TIM_Period = 999U;
@@ -137,25 +171,42 @@ static void TIM3_CH3_PWM_Init(void)
     oc.TIM_Pulse = 0U;
     oc.TIM_OCPolarity = TIM_OCPolarity_High;
     TIM_OC3Init(TIM3, &oc);
+
     TIM_OC3PreloadConfig(TIM3, TIM_OCPreload_Enable);
     TIM_ARRPreloadConfig(TIM3, ENABLE);
+
     TIM_Cmd(TIM3, ENABLE);
 }
+```
 
+用千分比设置占空比：
+
+```c
 static void PWM_SetPermille(uint16_t permille)
 {
     if (permille > 1000U)
         permille = 1000U;
-    /* ARR=999: 1000‰ 映射到 999，避免写出本例的计数范围。 */
-    TIM_SetCompare3(TIM3, (uint32_t)permille * 999U / 1000U);
+
+    /* ARR=999，因此一周期有 1000 个计数值。 */
+    TIM_SetCompare3(TIM3, permille);
 }
 ```
 
-`TIM_OCxPreloadConfig` 让 CCR 更新在下一个更新事件生效，减少周期中间改占空比带来的毛刺。PWM 参数变更后应重新实测频率和占空比。
+这里 `permille=1000` 时 CCR=1000，大于 ARR，整个周期都满足 `CNT < CCR`，得到持续有效输出。
 
-### 不会回绕的呼吸步进
+如果以后 ARR 不再是 999，可以按周期计数数目计算：
 
-不要让 `uint16_t duty += int8_t dir`：当 `dir=-1` 且 duty=0 时会下溢到 65535。使用有符号临时变量并夹紧：
+```c
+uint32_t period_counts = (uint32_t)TIM3->ARR + 1U;
+uint32_t ccr = (period_counts * permille) / 1000U;
+TIM_SetCompare3(TIM3, ccr);
+```
+
+CCR 和 ARR 开启 preload 后，更新通常会在下一个更新事件装入有效寄存器，避免在周期中间直接改变比较值造成不完整周期。
+
+### 呼吸灯步进
+
+PWM 占空比可以在主循环里按固定时间间隔修改，不需要再开一个专门的高频 ISR。
 
 ```c
 static uint16_t duty;
@@ -164,6 +215,7 @@ static int8_t direction = 1;
 static void Breath_Step(void)
 {
     int32_t next = (int32_t)duty + direction * 5;
+
     if (next >= 1000) {
         next = 1000;
         direction = -1;
@@ -171,18 +223,21 @@ static void Breath_Step(void)
         next = 0;
         direction = 1;
     }
+
     duty = (uint16_t)next;
     PWM_SetPermille(duty);
 }
 ```
 
-用第 5 章毫秒状态机每 10–20ms 调一次 `Breath_Step()`，不必为呼吸灯再开一个 50Hz ISR。
+用第 5 章的毫秒时基每约 10–20 ms 调一次即可。视觉上的“均匀变亮”还会受到 LED 和人眼非线性响应影响，这里先只验证 PWM 占空比本身。
 
-## 7.5 输入捕获：先测可控波形，再测未知信号
+## 7.5 输入捕获
 
-输入捕获把边沿到来时的 CNT 硬件锁存到 CCR。最小可验证实验是把上面的 PB0/TIM3_CH3 用一根杜邦线接到 PA0/TIM2_CH1，测两个上升沿间隔。此时 PA0 不能同时接按键或 ADC。
+输入捕获会在指定边沿到来时，把当前 CNT 的值锁存进 CCR。这样软件不需要恰好在边沿出现的那个时刻读取计数器。
 
-为避免“1MHz、16 位计数器只能测 65.536ms，却拿去测两秒按键”的矛盾，本实验测 1kHz 回环：周期约 1000 tick，远小于一次回绕。代码用无符号 16 位差值自动处理最多一次回绕：
+本章把 PB0 / TIM3_CH3 的 1 kHz PWM 用杜邦线接到 PA0 / TIM2_CH1，再测两个上升沿之间的计数差。PA0 此时不能继续接按键。
+
+TIM2 仍配置成 1 MHz tick：
 
 ```c
 static volatile uint16_t g_period_ticks;
@@ -200,11 +255,11 @@ static void TIM2_CH1_Capture_Init(void)
 
     GPIO_StructInit(&gpio);
     gpio.GPIO_Pin = GPIO_Pin_0;
-    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING; /* 外部 PWM 主动驱动 */
+    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
     GPIO_Init(GPIOA, &gpio);
 
     TIM_TimeBaseStructInit(&tim);
-    tim.TIM_Prescaler = 71U;     /* TIMCLK=72MHz 时：1MHz tick */
+    tim.TIM_Prescaler = 71U;
     tim.TIM_Period = 0xFFFFU;
     TIM_TimeBaseInit(TIM2, &tim);
 
@@ -213,80 +268,140 @@ static void TIM2_CH1_Capture_Init(void)
     ic.TIM_ICPolarity = TIM_ICPolarity_Rising;
     ic.TIM_ICSelection = TIM_ICSelection_DirectTI;
     ic.TIM_ICPrescaler = TIM_ICPSC_DIV1;
-    ic.TIM_ICFilter = 0U;        /* 仅对已知干净的回环波形使用 0 */
+    ic.TIM_ICFilter = 0U;
     TIM_ICInit(TIM2, &ic);
 
     TIM_ClearITPendingBit(TIM2, TIM_IT_CC1);
     TIM_ITConfig(TIM2, TIM_IT_CC1, ENABLE);
+
     nvic.NVIC_IRQChannel = TIM2_IRQn;
     nvic.NVIC_IRQChannelPreemptionPriority = 1U;
     nvic.NVIC_IRQChannelSubPriority = 1U;
     nvic.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&nvic);
+
     TIM_Cmd(TIM2, ENABLE);
 }
+```
 
+ISR 保存相邻两次捕获值：
+
+```c
 void TIM2_IRQHandler(void)
 {
     static uint16_t previous;
     static uint8_t have_previous;
+
     if (TIM_GetITStatus(TIM2, TIM_IT_CC1) != RESET) {
         uint16_t captured = TIM_GetCapture1(TIM2);
         TIM_ClearITPendingBit(TIM2, TIM_IT_CC1);
+
         if (have_previous != 0U) {
             g_period_ticks = (uint16_t)(captured - previous);
             g_period_ready = 1U;
         }
+
         previous = captured;
         have_previous = 1U;
     }
 }
 ```
 
-主循环先用第 6 章的临界区模式取走 `g_period_ticks`，再计算：`freq_hz = 1000000 / period_ticks`。本例只能可靠测量小于一个 16 位回绕周期的信号；更低频/更长脉冲需要降低 tick 频率、统计更新溢出，或选合适的定时器/输入方案。
-
-机械按键不是干净的输入捕获源。若你必须测按键时长，先做硬件/软件消抖，再按期望最大时长选择 tick 与溢出计数；不要把“ICFilter=0”与两秒长按混在同一示例。
-
-### 输入电压安全
-
-若扩展到 HC-SR04，Echo 常见为 5V。未确认目标 GPIO 的电气容限前，使用分压/电平转换到 3.3V；绝不因为“输入捕获能读边沿”就把未知电压直接接 PA0。
-
-## 7.6 验收、排错与练习
-
-每次实验先写出完整等式和资源占用，例如：
+1 MHz tick 下，1 kHz 输入的周期应接近 1000 tick：
 
 ```text
-PCLK1 = 36MHz, APB1=/2 → TIMCLK=72MHz
-PSC=71 → counter_tick=1MHz
-ARR=999 → PWM=1kHz
-CCR=250 → 有效高约25%
+period_us ≈ g_period_ticks
+freq_hz   ≈ 1 000 000 / g_period_ticks
 ```
 
-| 现象 | 优先检查 |
-|---|---|
-| PWM 频率差一倍 | APB 预分频与 TIMCLK ×2 规则；不是先改 ARR |
-| PWM 没有引脚波形 | RCC、通道/引脚复用、冲突、是否选择了正确实例/通道 |
-| 占空比反向 | 有效极性和 LED 接法，不要只看软件的“高” |
-| 更新 ISR 不进 | pending 清除、TIM_ITConfig、NVIC 分组/优先级、Handler 名称 |
-| 捕获数值跳动 | 输入电平、接地、边沿、滤波、噪声与计数回绕范围 |
-| 长脉冲数值错误 | 16 位范围不够；重新选 tick 或加更新溢出计数 |
+`uint16_t` 减法经过强制转换后按 16 位模运算得到差值，因此允许两个边沿之间跨过一次计数器回绕点。前提是实际间隔小于 65536 tick；在 1 MHz 下就是小于约 65.536 ms。
 
-练习：
+更低频的输入需要降低计数频率、统计更新溢出次数，或者改用更宽的计数方案。不能拿当前配置直接测几秒钟的脉冲。
 
-1. 在运行 72MHz 与 HSI 回退两种状态下，重新计算而不是复用 `PSC=71`；
-2. 把 PB0 的 1kHz PWM 回接 PA0，用捕获值算出频率并与逻辑分析仪对照；
-3. 把 `PWM_SetPermille(0/250/500/750/1000)` 逐项测量高电平宽度；
-4. 为一个最长 2 秒的脉冲选择 10kHz tick，算出分辨率、一次回绕范围，以及是否还需要溢出计数。
+`TIM_ICFilter=0` 适合本章这种板内回环的干净数字波形。测长线、机械触点或噪声较大的输入时，需要根据输入特性选择滤波和前级电路。
 
-## 7.7 本章要点
+## 7.6 做一个 1 MHz 微秒计时器
 
-- PSC、ARR、CCR 都要从实际 TIMCLK 推导；TIMCLK 由 PCLK 和 APB 预分频决定。
-- PWM 的可见效果不能替代频率/占空比测量；先测波形，再调整极性与负载。
-- 同一 GPIO/定时器的不同教材实验互斥，先登记资源再组合。
-- 输入捕获适合硬件锁存边沿；测量范围由 tick 频率、ARR 和溢出处理共同决定。
-- 机械按键、未知电压、长脉冲都不是“复制一个 ICFilter=0 示例”就能安全处理的信号。
+第 4 章的 DS18B20、DHT11 需要微秒级时间。与其用空循环估算指令时间，可以把一个空闲通用定时器配置成 1 MHz 自由运行计数器。
 
----
+例如 TIM4 的 TIMCLK 为 72 MHz 时：
+
+```c
+static void TimerUs_Init(void)
+{
+    TIM_TimeBaseInitTypeDef tim;
+
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4, ENABLE);
+
+    TIM_TimeBaseStructInit(&tim);
+    tim.TIM_Prescaler = 71U;
+    tim.TIM_Period = 0xFFFFU;
+    tim.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM4, &tim);
+
+    TIM_Cmd(TIM4, ENABLE);
+}
+
+static uint16_t TimerUs_Now16(void)
+{
+    return TIM_GetCounter(TIM4);
+}
+
+static void TimerUs_Delay(uint16_t us)
+{
+    uint16_t start = TimerUs_Now16();
+
+    while ((uint16_t)(TimerUs_Now16() - start) < us) {
+    }
+}
+```
+
+这个实现适用于小于 65536 us 的单次等待，足够覆盖本书单线协议里的短时隙。它仍是忙等，只是时间来源由硬件定时器提供，精度和编译优化无关得多。
+
+如果系统时钟发生变化，TIM4 的 PSC 也必须按新的 TIMCLK 重算。需要更长的微秒时间戳时，可以结合更新中断扩展成 32 位计数。
+
+## 7.7 输入电压仍然要先确认
+
+定时器输入捕获只是数字输入功能，不会自动处理电压转换。把外部模块信号接到 PA0 前，先查 STM32F103ZET6 数据手册中的该引脚电气规格和模块输出电平。
+
+例如某些超声波模块的 Echo 可能输出接近其供电电压。如果信号超出目标引脚允许范围，应使用合适的分压或电平转换电路，再接入 MCU。
+
+## 7.8 验证和排错
+
+每次配置定时器前，先把计算过程写出来：
+
+```text
+PCLK1 = 36 MHz
+APB1  = /2
+TIMCLK = 72 MHz
+
+PSC = 71
+counter_tick = 1 MHz
+
+ARR = 999
+period = 1000 us
+frequency = 1 kHz
+```
+
+然后用逻辑分析仪或示波器测实际输出。PWM 的高电平宽度和周期都应该能直接量出来，输入捕获计算出的频率也应该和输出波形一致。
+
+常见问题：
+
+- PWM 频率正好差约一倍：先查 APB 分频和定时器 ×2 规则。
+- PWM 没有波形：查 TIM/GPIO 时钟、通道、引脚复用和资源冲突。
+- 占空比方向反了：查 PWM 极性和外部负载接法。
+- 更新中断不进：查 TIM 中断使能、pending、NVIC 和 Handler 名称。
+- 捕获值跳动：查输入电平、共地、噪声、边沿设置和滤波。
+- 低频测量错误：确认计数器是否在两个有效边沿之间回绕超过一个完整周期。
+
+## 7.9 练习
+
+1. 分别在 72 MHz 正常启动和 HSI 回退状态下计算 TIM2 的 PSC，使计数 tick 都保持 1 MHz。
+2. 把 PB0 的 1 kHz PWM 回接 PA0，用 TIM2 捕获周期，再和逻辑分析仪实测结果比较。
+3. 分别设置 0%、25%、50%、75%、100% 占空比，测量一个完整周期内的高电平时间。
+4. 要测最长 2 s 的脉冲，如果使用 10 kHz tick，计算计数分辨率和 16 位定时器一次回绕时间，并判断是否需要溢出计数。
+
+完成这一章后，PSC、ARR 和 CCR 都应该来自实际 TIMCLK 和目标时间，不再靠复制固定数字。下一章 UART 的波特率计算也使用同样的方法：先确认输入时钟，再配置分频。
 
 > **上一章**：[第 6 章 · 中断、事件与并发边界](./06-chapter.md)
 >
