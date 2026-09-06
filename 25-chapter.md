@@ -1,298 +1,289 @@
-# 第 25 章 · 综合项目一：智能环境监测节点（SPL版）
+# 第 25 章 · 综合项目一：智能环境监测节点（SPL 版）
 
-> **本章产出**：把前面学过的 ADC、I2C、SPI、UART、FreeRTOS 和 MQTT 组织成一个可分阶段完成的环境监测节点。
->
-> **前置知识**：第 9–16 章外设与 FreeRTOS，以及第 21 章 MQTT。
->
-> **项目目标**：采集环境数据、在 OLED 显示、记录到 SD 卡，并定时上报云端。
+这一章把前面已经验证过的传感器、OLED、SD 卡、FreeRTOS 和 MQTT 接成一个完整节点。重点是任务边界和故障隔离：网络断开、SD 卡拔出或某个传感器超时，都不能让采样任务一起停掉。
 
----
+项目分四步完成：
 
-## 25.1 不要一上来就做“全功能设备”
+1. **M1 本地采样**：串口持续输出带状态的环境样本；
+2. **M2 本地显示**：OLED 显示最新样本，显示故障不影响采样；
+3. **M3 本地存储**：SD 卡按顺序记录样本，拔卡后系统继续运行；
+4. **M4 网络上报**：MQTT 发布遥测，断网后按既定缓存策略处理。
 
-综合项目最常见的失败方式是：第一天同时接传感器、OLED、SD 卡、WiFi 和云平台，最后不知道是哪一层坏了。
+每一步都先留下可重复的测试结果，再接下一块硬件。
 
-本项目按四个可验证里程碑推进：
+## 25.1 先固定硬件资源
 
-| 里程碑 | 完成标准 |
-|---|---|
-| M1：本地采样 | 串口每秒打印温湿度和电池电压 |
-| M2：本地显示 | OLED 每秒更新一次，按键可切换页面 |
-| M3：本地存储 | SD 卡生成按行记录的数据文件 |
-| M4：云端上报 | MQTT 每分钟发布一次完整数据 |
+本书 MCU 是 STM32F103ZET6。下面是一套教学映射，实际接线仍以手里的开发板原理图为准，尤其要确认板载 Flash、LED、按键或其他外设有没有占用相同引脚。
 
-只有当前一项稳定后，再进入下一项。
+| 功能 | 默认资源 | 接线前检查 |
+|---|---|---|
+| 调试串口 | USART1：PA9/PA10 | USB-TTL 电平、TX/RX 交叉、共地 |
+| WiFi AT | USART2：PA2/PA3 | 模块供电、UART 电平、AT 固件能力 |
+| OLED + BH1750 | I2C1：PB6/PB7 | 地址、上拉、电气连接、总线恢复 |
+| SD 卡 | SPI1：PA4/PA5/PA6/PA7 | CS 默认高、初始化时钟、供电 |
+| 电池采样 | ADC1，例如 PA1 | 分压范围、源阻抗、采样时间 |
+| 温湿度 | 选定一种已验证传感器 | 复用前面章节已经通过测试的驱动 |
 
-## 25.2 硬件清单与接口规划
+不要为了综合项目同时换一批新器件。M1 先选一个已经单独验证过的温湿度方案；BH1750、电池 ADC 等数据源再逐个加入。
 
-| 功能 | 建议器件 | 接口 | 备注 |
-|---|---|---|---|
-| 温湿度 | DHT11 / DHT22 或 NTC | 单线 / ADC | 先选择一种 |
-| 光照 | BH1750 | I2C1 | 可与 OLED 共线 |
-| 显示 | SSD1306 OLED | I2C1 | 需要上拉电阻 |
-| 存储 | MicroSD | SPI1 | 初始化阶段低速 |
-| 网络 | ESP8266 AT 或兼容模块 | USART2 | 需独立供电与共地 |
-| 调试 | USB-TTL | USART1 | 不要与网络串口混用 |
-| 电池检测 | 分压电路 | ADC1 | 注意电压范围 |
+## 25.2 数据结构先稳定下来
 
-本书固定使用 STM32F103ZET6：Flash 512KB、SRAM 64KB、High Density 启动文件和 STM32F10X_HD 宏。项目中的链接脚本、引脚表和构建参数都以这套配置为准。
+所有消费者都使用同一份值类型样本：
 
-## 25.3 任务架构
+```c
+typedef enum {
+    ENV_STATUS_TEMP_ERROR = 1U << 0,
+    ENV_STATUS_HUM_ERROR  = 1U << 1,
+    ENV_STATUS_LIGHT_ERROR = 1U << 2,
+    ENV_STATUS_BATT_ERROR = 1U << 3
+} EnvStatus;
 
-~~~text
-Task_Sensor (prio 3)
-  └─ 采样 → Queue_Sample
-
-Task_Display (prio 2)
-  └─ 读取最新样本 → OLED
-
-Task_SDLog (prio 2)
-  └─ Queue_Sample → CSV / JSONL 文件
-
-Task_MQTT (prio 3)
-  └─ Queue_Sample → WiFi → Broker
-
-Button ISR
-  └─ 二值信号量 → Task_UI
-~~~
-
-先让采样任务产生统一的数据结构，其余任务只消费它：
-
-~~~c
 typedef struct {
     uint32_t seq;
+    uint32_t tick;
     int16_t  temperature_centi;
-    uint16_t humidity_centi;
+    uint16_t humidity_permille;
     uint16_t light_lux;
     uint16_t battery_mv;
+    uint16_t status;
 } EnvSample;
-~~~
+```
 
-使用整数保存 24.63°C 为 2463，可以避免在没有硬件 FPU 的 Cortex-M3 上到处使用浮点格式化。
+这里继续沿用前文的定点单位：`temperature_centi = 2463` 表示 24.63 °C，`humidity_permille = 583` 表示 58.3 %RH。传感器读取失败时设置对应状态位，不用一个看起来正常的数值代替错误。
 
-## 25.4 初始化顺序
+`seq` 每产生一份样本递增一次。日志和云端都保留它，后面看到跳号时可以判断中间发生过丢弃。
 
-推荐的启动顺序：
+## 25.3 一份样本要扇出到不同消费者
 
-1. 时钟、GPIO、USART1 调试输出；
-2. 创建日志接口，确认每一步失败都可见；
-3. ADC、I2C、SPI 等本地外设；
-4. UART2 与接收中断；
-5. 创建 Queue、Semaphore、FreeRTOS 任务；
-6. 启动调度器；
-7. 在网络任务中异步配网和连接 MQTT。
+显示、日志和网络对数据的要求不同，不能让三个任务竞争同一个 Queue：FreeRTOS Queue 中的一条消息被一个消费者取走后就没有了。
 
-UART 接收中断不仅要调用 USART_ITConfig，还必须初始化 NVIC：
+本项目使用三条通路：
 
-~~~c
-static void USART2_IRQ_Init(void)
+```text
+                    ┌→ latest_display_q ─→ DisplayTask
+SensorTask ─ sample ├→ log_q ────────────→ LogTask
+                    └→ cloud_q ──────────→ NetworkTask
+```
+
+`latest_display_q` 长度为 1，使用 `xQueueOverwrite()`，因为屏幕只关心最新状态。`log_q` 和 `cloud_q` 是有容量的顺序队列，满时分别增加 `log_drop` 和 `cloud_drop`；第一版不允许 SensorTask 等待它们腾出空间。
+
+如果项目要求断网期间每一条样本都最终上传，RAM Queue 不够，需要把持久日志作为离线缓存，并设计确认、回放和删除规则。本章 M4 先把这一策略写清楚，再决定是否实现补传。
+
+## 25.4 任务边界
+
+项目使用五个任务：
+
+```text
+SensorTask
+  └─ 周期采样并扇出 EnvSample
+
+DisplayTask
+  └─ 显示 latest_display_q 中的最新样本
+
+LogTask
+  └─ 顺序写入 SD/FatFs
+
+NetworkTask
+  └─ 独占 WiFi AT 模块，维护 TCP/MQTT 和重连
+
+HealthTask
+  └─ 汇总队列、栈、驱动和网络计数器
+```
+
+按键如果只切换页面，可以由 EXTI ISR 使用 Task Notification 唤醒 UI/Display 逻辑。ISR 不直接刷 OLED，也不访问 FatFs 或 WiFi。
+
+任务优先级不在这一章硬编码成“传感器一定比显示高几级”。先保证所有驱动都有有限超时，再用实际周期、阻塞时间和压力测试调整优先级。
+
+## 25.5 SensorTask 只负责产生样本
+
+```c
+static void SensorTask(void *arg)
 {
-    NVIC_InitTypeDef nvic;
-
-    USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
-
-    nvic.NVIC_IRQChannel = USART2_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 2;
-    nvic.NVIC_IRQChannelSubPriority = 0;
-    nvic.NVIC_IRQChannelCmd = ENABLE;
-    NVIC_Init(&nvic);
-}
-~~~
-
-把“网络没有连接”当作正常状态，而不是系统启动失败。这样传感器、显示与本地存储仍可以继续工作。
-
-## 25.5 采样任务
-
-采样任务不应直接调用 MQTT 或 FatFs。它只做“得到一份可信样本，然后送到队列”。
-
-~~~c
-static void Task_Sensor(void *arg)
-{
+    TickType_t wake = xTaskGetTickCount();
     EnvSample sample = {0};
 
     for (;;) {
         sample.seq++;
-        sample.temperature_centi = NTC_ReadCentiC();
-        sample.humidity_centi = DHT_ReadHumidityCenti();
-        sample.light_lux = BH1750_ReadLux();
-        sample.battery_mv = Battery_ReadMilliVolt();
+        sample.tick = xTaskGetTickCount();
+        sample.status = 0U;
 
-        xQueueOverwrite(q_latest_sample, &sample);
-        xQueueSend(q_log_sample, &sample, 0);
-        xQueueSend(q_cloud_sample, &sample, 0);
+        if (!Temp_ReadCenti(&sample.temperature_centi))
+            sample.status |= ENV_STATUS_TEMP_ERROR;
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!Humidity_ReadPermille(&sample.humidity_permille))
+            sample.status |= ENV_STATUS_HUM_ERROR;
+
+        if (!BH1750_ReadLux(&sample.light_lux))
+            sample.status |= ENV_STATUS_LIGHT_ERROR;
+
+        if (!Battery_ReadMilliVolt(&sample.battery_mv))
+            sample.status |= ENV_STATUS_BATT_ERROR;
+
+        xQueueOverwrite(latest_display_q, &sample);
+
+        if (xQueueSend(log_q, &sample, 0U) != pdPASS)
+            health.log_drop++;
+
+        if (xQueueSend(cloud_q, &sample, 0U) != pdPASS)
+            health.cloud_drop++;
+
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000U));
     }
 }
-~~~
+```
 
-这里使用三个队列只是为了说明“最新显示、完整日志、云端发送”的需求不同。实际项目可根据 RAM 选择更小的队列或共享最新样本。
+1 s 是本项目的初始采样周期。它成立的前提是一次完整采样的最坏执行时间小于周期，并且每个设备驱动都有超时。若 DS18B20 等器件的转换时间占据周期的大部分，应使用“启动转换—稍后读取”的状态机，或调整采样周期。
 
-## 25.6 验证计划
+SensorTask 不调用 MQTT、FatFs，也不等待网络恢复。某个传感器失败时，这一周期仍然产生带错误位的样本，让显示、日志和 HealthTask 能看到故障。
 
-| 测试 | 预期结果 |
-|---|---|
-| 拔掉 WiFi 模块 | 显示和 SD 卡仍正常 |
-| 拔掉 SD 卡 | 传感器和云端上报仍正常，日志任务报错后重试 |
-| 模拟 I2C 设备未响应 | 任务超时返回，不永久卡住 |
-| 断开 Broker | 网络任务退避重连，不阻塞采样 |
-| 连续运行 8 小时 | seq 持续递增，无队列溢出和栈水位异常 |
+## 25.6 LogTask 明确持久化边界
 
-先做故障测试，才能确认各个任务真的解耦。
+日志至少保存版本、`seq`、时间基准、状态和传感器字段。CSV/JSONL 便于人工查看；二进制记录更节省空间。无论选哪一种，都要规定最大文件尺寸、轮换方式和写失败策略。
 
-## 25.7 本章练习
+第一版可以按批次 `f_write()`，在明确的同步点执行 `f_sync()`。每条记录都 `f_sync()` 会增加写放大和延迟；长期不同步则扩大掉电时可能丢失的数据范围。同步周期属于项目策略，需要通过断电测试决定。
 
-1. 只实现 M1，并把数据格式固定下来；
-2. 为每个任务打印一次启动日志和高水位栈余量；
-3. 让 MQTT 断线时把数据暂存到 SD 卡；
-4. 写一个 Python 小脚本读取日志文件并画温度曲线。
+SD 卡拔出、文件系统错误或写超时只改变存储状态和计数器。LogTask 不能持有样本队列的生产端，也不能让 SensorTask 阻塞等待卡恢复。
 
-## 25.8 参考任务契约：先固定数据，再写驱动
+如果日志承担断网补传，还要额外记录“哪些记录已被云端确认”。仅凭 MQTT 发送函数返回成功就删除离线记录，会把传输层成功误当成业务持久化成功。
 
-综合项目最有价值的产物不是某一个传感器函数，而是一份在各任务之间稳定流动的数据契约：
+## 25.7 NetworkTask 独占无线模块
 
-~~~c
-typedef enum {
-    ENV_OK            = 0,
-    ENV_SENSOR_ERROR  = 1u << 0,
-    ENV_STORAGE_ERROR = 1u << 1,
-    ENV_NETWORK_ERROR = 1u << 2
-} EnvFlags;
+NetworkTask 沿用第 17–21 章的通信边界：只有它操作 WiFi UART、AT 状态机、TCP 和 MQTT。
 
-typedef struct {
-    uint32_t seq;
-    uint32_t tick;
-    int16_t temperature_centi;
-    uint16_t humidity_centi;
-    uint16_t light_lux;
-    uint16_t flags;
-} EnvSample;
-~~~
+```text
+RADIO_INIT
+    ↓
+WIFI_JOIN
+    ↓
+TCP_CONNECT
+    ↓
+MQTT_CONNECT
+    ↓
+ONLINE ── cloud_q → PUBLISH
+    │
+    └─ 断线/超时 → BACKOFF → WIFI/TCP/MQTT 恢复
+```
 
-| 任务 | 输入 | 输出 | 最大阻塞时间 | 满/错时策略 |
-|---|---|---|---|---|
-| SensorTask | 定时 tick、设备驱动 | `EnvSample` | 单次采样超时 | 带状态发布，不永久等待 |
-| DisplayTask | 最新 sample | OLED | 一次 I2C 超时 | 保留旧值并显示错误标识 |
-| LogTask | 顺序 sample | SD/Flash | 单次写入超时 | 批量、CRC、失败计数 |
-| NetworkTask | sample/缓存 | MQTT/HTTP | 网络超时 | 退避、重连、不阻塞采样 |
-| HealthTask | 各计数器 | UART/OLED | 很短 | 只观察不控制业务 |
+断网时 SensorTask 继续运行。`cloud_q` 满以后按项目规定丢弃并计数，或者把样本交给持久离线日志；不能靠无限增加 RAM Queue 解决长时间断网。
 
-显示只需要最新数据时，使用长度为 1 的覆盖队列；日志需要顺序时，使用有容量的队列并记录溢出。这两个需求不能用同一条“万能队列”含糊处理。
+恢复联网后也要限制补传速率，给实时数据和 MQTT Keep Alive 留出处理时间。若项目要求“每条样本最终到云端”，还需要业务 ACK 或服务端可查询的 `seq` 机制来定义何时可以删除本地副本。
 
-## 25.9 分层联调与故障注入
+## 25.8 启动顺序
 
-| 测试 | 操作 | 预期结果 |
-|---|---|---|
-| 采样连续性 | WiFi 断开 5 分钟 | `seq` 继续增长，网络错误计数增加 |
-| 存储边界 | 塞满日志队列或模拟写失败 | 采样任务仍按周期运行 |
-| I2C 错误 | 拔掉 OLED 或传感器 | 其他任务心跳和错误状态仍可见 |
-| 网络恢复 | 恢复 Broker/路由器 | 有限退避后恢复，不产生重连风暴 |
-| 内存稳定 | 连续运行 30 分钟 | heap、栈高水位无持续恶化 |
-| 冷启动 | 断电重启 | 配置、日志扫描和传感器初始化可重复 |
+先建立调试通道，再创建 RTOS 对象。外设初始化失败要留下明确状态，但 WiFi、SD 卡或某个传感器不可用不必直接阻止调度器启动。
 
-建议每次只引入一个外设：LED/UART → 一个传感器 → OLED → 存储 → 网络。每一阶段提交一次可运行版本，并保存接线图和串口日志。
-
-练习：实现一个 HealthTask，每 10 秒打印任务栈余量、采样序号、队列满计数、存储错误和网络重连次数。它是你后面排查“项目偶尔死掉”时最有价值的证据。
-
-## 25.10 启动顺序与最小主程序骨架
-
-综合工程要把“板级初始化成功”与“某项业务成功”分开。推荐启动顺序：
-
-~~~c
+```c
 int main(void)
 {
-    SystemClock_Config();     /* 已在第 5 章独立验证 */
-    Board_SafeOutputs();      /* 默认让执行器/CS 处于安全状态 */
-    UART_DebugInit();         /* 先建立观察口 */
+    SystemClock_Config();
+    Board_SafeOutputs();
+    UART_DebugInit();
     HealthCounters_Init();
 
-    SensorBus_Init();         /* 每个驱动返回明确成功/失败 */
-    Storage_Init();
-    Radio_Init();
+    Board_PeripheralsInit();
 
-    sample_q = xQueueCreate(8, sizeof(EnvSample));
-    latest_q = xQueueCreate(1, sizeof(EnvSample));
-    if (sample_q == NULL || latest_q == NULL)
+    latest_display_q = xQueueCreate(1U, sizeof(EnvSample));
+    log_q = xQueueCreate(LOG_QUEUE_LEN, sizeof(EnvSample));
+    cloud_q = xQueueCreate(CLOUD_QUEUE_LEN, sizeof(EnvSample));
+
+    if (latest_display_q == NULL || log_q == NULL || cloud_q == NULL)
         App_Fatal("queue-init");
 
-    xTaskCreate(SensorTask,  "sensor",  STACK_SENSOR,  NULL, PRIO_SENSOR,  NULL);
-    xTaskCreate(DisplayTask, "display", STACK_DISPLAY, NULL, PRIO_DISPLAY, NULL);
-    xTaskCreate(LogTask,     "log",     STACK_LOG,     NULL, PRIO_LOG,     NULL);
-    xTaskCreate(NetworkTask, "net",     STACK_NETWORK, NULL, PRIO_NETWORK, NULL);
-    xTaskCreate(HealthTask,  "health",  STACK_HEALTH,  NULL, PRIO_HEALTH,  NULL);
+    if (xTaskCreate(SensorTask, "sensor", STACK_SENSOR,
+                    NULL, PRIO_SENSOR, NULL) != pdPASS)
+        App_Fatal("sensor-task");
+
+    if (xTaskCreate(DisplayTask, "display", STACK_DISPLAY,
+                    NULL, PRIO_DISPLAY, NULL) != pdPASS)
+        App_Fatal("display-task");
+
+    if (xTaskCreate(LogTask, "log", STACK_LOG,
+                    NULL, PRIO_LOG, NULL) != pdPASS)
+        App_Fatal("log-task");
+
+    if (xTaskCreate(NetworkTask, "net", STACK_NETWORK,
+                    NULL, PRIO_NETWORK, NULL) != pdPASS)
+        App_Fatal("net-task");
+
+    if (xTaskCreate(HealthTask, "health", STACK_HEALTH,
+                    NULL, PRIO_HEALTH, NULL) != pdPASS)
+        App_Fatal("health-task");
 
     vTaskStartScheduler();
-    for (;;); /* 只有调度器无法启动时才会走到这里 */
+    App_Fatal("scheduler-returned");
 }
-~~~
+```
 
-骨架中的函数名不是现成库。它们的意义是让每一步都有名字、返回值和日志。不要在 `main()` 中默默初始化 20 个设备，然后在第一个错误上继续运行。
+`STACK_*` 的单位是 `StackType_t` 元素，不能把数值直接当字节。初值根据各任务实际调用链给出，再用 stack high-water mark 和压力测试调整。
 
-### 硬件联调表
+## 25.9 HealthTask 留下能定位问题的数字
 
-| 接口 | 最小验证 | 不通过时先回退 |
-|---|---|---|
-| ADC 传感器 | UART 打印原始值 + 万用表趋势 | 第 9 章 |
-| I2C OLED/传感器 | 单设备 ACK、固定显示 | 第 10 章 |
-| SPI 存储 | 写入/读回固定记录 | 第 11/13 章 |
-| USART WiFi | `AT` → `OK`、错误计数 | 第 17 章 |
-| MQTT/HTTP | PC 教学 Broker/服务回包 | 第 21/23 章 |
-| FreeRTOS | 栈高水位、Queue 满计数 | 第 15/16 章 |
+HealthTask 不控制业务，只汇总状态。每隔一段时间输出一次即可，避免调试串口本身成为系统负载。
 
-练习：为每个 `*_Init()` 规定一个错误码和一条脱敏 UART 日志。冷启动失败时，你应该能从第一条错误直接知道回退到哪一章。
+建议至少保留：
 
-## 25.11 把“接口规划”变成 ZET6 资源表、数据格式和验收映射
+```text
+sample_seq=...
+sensor_timeout=...
+i2c_error=...
+log_drop=...
+storage_error=...
+cloud_drop=...
+radio_rx_overflow=...
+mqtt_reconnect=...
+mqtt_publish_fail=...
+heap_free=...
+stack_sensor_min=...
+stack_log_min=...
+stack_net_min=...
+```
 
-前面的接口表只说明“想接什么”；真正接线前还要把每个资源唯一地分配到 ZET6，并用开发板原理图确认没有被板载外设占用。以下是本书的**默认教学映射**，不是对所有 ZET6 开发板的承诺：
+队列还应记录历史最大占用量。只看“当前剩几个位置”可能错过之前发生过的突发积压。
 
-| 功能 | 默认引脚/资源 | 同类冲突 | 接线前必须确认 |
-|---|---|---|---|
-| 调试 UART | USART1：PA9/PA10 | 不能与 WiFi 共用一根 UART | USB-TTL 是 3.3V、TX/RX 交叉、已共地 |
-| WiFi AT | USART2：PA2/PA3 | 接收缓冲/DMA/中断优先级 | 模块供电峰值、固件 AT 能力 |
-| I2C 传感器 + OLED | I2C1：PB6/PB7 | 同一总线地址/上拉/总线占用 | 每个地址唯一、上拉存在、拔设备可恢复 |
-| SD 卡 | SPI1：PA4/PA5/PA6/PA7 | OLED 若也走 SPI 必须独立 CS | CS 默认高、初始化低速、卡供电稳定 |
-| 电池/模拟采样 | ADC1：例如 PA1 | 模拟源阻抗与量程 | 分压不超过参考电压、采样时间足够 |
-| 板载提示 | 常见 PC13 | 板卡 LED 可能低电平点亮 | 实际丝印/原理图 |
+这些计数器的更新方式要符合并发模型。多个任务同时修改同一个复合结构时，不要因为成员加了 `volatile` 就认为读写已经同步；可以让每个任务维护自己的计数器，再由 HealthTask 读取快照，或用短临界区保护需要一致性的字段。
 
-### 离线日志必须有格式与上限
+## 25.10 按 M1–M4 联调
 
-WiFi 断开时不能无限往 RAM 或 SD 卡堆数据。先定义一条日志记录的版本、长度、状态和 CRC，再决定保留策略：
+**M1：采样。** 先只启动 SensorTask 和调试输出。连续检查 `seq`、单位、状态位和周期；断开传感器后，任务仍应继续产生带错误状态的样本。
 
-~~~c
-typedef struct {
-    uint16_t magic;
-    uint8_t  version;
-    uint8_t  length;
-    uint32_t seq;
-    uint32_t tick;
-    uint16_t flags;
-    /* EnvSample payload + crc */
-} EnvLogHeader;
-~~~
+**M2：显示。** 加入 OLED 和 `latest_display_q`。拔掉 OLED 或让 I2C 超时，SensorTask 的 `seq` 仍继续增长。显示恢复后直接显示最新样本，不补画旧页面。
 
-写入失败、SD 卡缺失、文件满和重启扫描都应该产生 `ENV_STORAGE_ERROR`，但不得让 `SensorTask` 停止采样。项目 README 要说明：离线最多保存多少条、满时丢旧还是丢新、恢复联网后如何限速回传。
+**M3：存储。** 加入 LogTask 和 SD 卡。测试正常写入、拔卡、重新插卡、写失败和重启扫描。确认日志 Queue 满时有明确计数，SensorTask 周期不被拖慢。
 
-### 用 M1–M4 逐项验收，不跳关
+**M4：网络。** 最后加入 WiFi/MQTT。测试 Broker 停止、路由器断开和模块复位。恢复后应经过统一状态机重新连接；如果实现离线补传，再验证补传期间实时样本仍能处理。
 
-| 里程碑 | 只新增的能力 | 通过证据 | 故障注入 |
-|---|---|---|---|
-| M1 | 一种传感器 + UART | 60 秒连续样本、单位/状态正确 | 断开传感器，采样仍有心跳 |
-| M2 | I2C OLED | 固定页面与错误标记 | 拔 OLED，采样不停止 |
-| M3 | SPI/SD 日志 | 写入、读回、重启后扫描 | 拔卡/写失败，错误可见 |
-| M4 | WiFi + MQTT | seq、重连、上报限制可见 | 断网 5 分钟，缓存与采样策略符合文档 |
+每完成一个里程碑，保存接线图、固件 commit SHA、关键串口日志和当前资源映射。后续出现回归时，可以确定是哪一次集成开始出问题。
 
-每完成一关，就保存一次接线图、固件 SHA、串口日志和资源使用记录。它们是下一章排查“综合项目偶发失败”时最有用的回归证据。
+## 25.11 故障测试按机制验收
 
-## 25.12 本章要点
+综合项目不使用“连续运行 8 小时就算稳定”这种单一标准。运行时间只能覆盖时间维度，不能替代具体故障路径。
 
-- 综合项目靠里程碑推进，而不是一次性拼接所有模块；
-- 采样数据要有统一结构，任务之间使用 Queue 交接；
-- 网络和存储都可能失败，不能拖垮本地采样；
-- ISR、驱动、协议和应用逻辑需要分层；
-- 可验证的故障测试与功能测试同样重要。
+至少测试这些情况：
 
----
+- WiFi 断开期间，`sample_seq` 继续递增，`cloud_drop` 或离线缓存按设计变化；
+- SD 卡拔出期间，显示和网络继续工作，`storage_error` 增加；
+- I2C 设备无响应时，驱动在规定超时内返回，其他任务仍有心跳；
+- `log_q` / `cloud_q` 人为缩短后，满队列计数能稳定复现；
+- Broker 恢复后只有 NetworkTask 执行重连，没有多个任务同时刷 AT 命令；
+- 连续注入错误 JSON、MQTT 断线和存储失败后，heap 与各任务栈水位没有持续恶化；
+- 断电重启后，日志扫描和配置加载能回到文档规定的状态。
 
-[上一章：第 24 章 · 网关架构与 UART 接收通路](./24-chapter.md)
+测试时间要覆盖项目预期的最长周期事件，例如日志轮换、网络退避上限和缓存回放。若这些事件需要更长时间，就针对它们单独做加速或故障注入测试。
 
-[下一章：第 26 章 · 综合项目二：BLE 智能门锁](./26-chapter.md)
+## 25.12 本章完成标准
+
+项目完成时，代码和 README 至少能回答下面这些问题：
+
+- 每个硬件资源由哪个驱动和任务拥有；
+- `EnvSample` 每个字段的单位和错误状态是什么；
+- 显示、日志、网络各自的 Queue 满策略是什么；
+- WiFi 或 SD 卡故障时哪些功能继续运行；
+- 离线数据最多保存多少，满后怎么处理；
+- MQTT 恢复后是否补传，何时认为一条记录可以删除；
+- 每个任务的栈水位、队列满次数和关键驱动错误从哪里查看。
+
+这些边界都能通过故障测试复现后，第一个综合项目才算完成。下一章会把同样的任务和协议边界用到带执行器的 BLE 门锁上，那里还要增加权限、重复命令和安全输出状态的处理。
+
+> **上一章**：[第 24 章 · 网关架构与 UART 接收通路](./24-chapter.md)
+>
+> **下一章**：[第 26 章 · 综合项目二：BLE 智能门锁](./26-chapter.md)
