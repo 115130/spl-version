@@ -1,230 +1,16 @@
-# 第 16 章 · FreeRTOS 实战（SPL版）
+# 第 16 章 · FreeRTOS 实战：任务间的数据流（SPL 版）
 
-> **本章产出**：把上一章的 API 拼成一个可观察的四任务系统，并能在传感器、队列、按键和日志任一环节失败时定位责任边界。
->
-> **前置知识**：第 15 章的最小 FreeRTOS 工程；第 8 章 UART 作为日志通道。
->
-> **硬件建议**：先只用 LED + UART 跑通任务，再逐个接入传感器、OLED、SD 卡或无线模块。
+上一章已经把 FreeRTOS 移植进工程。本章用一个传感器节点练习任务之间的边界：采样任务产生数据，显示和日志任务消费数据，按键 ISR 唤醒按键任务，同时记录队列满、设备超时和栈余量。
 
-> 用 FreeRTOS 搭建一个四任务传感器采集系统：SensorTask → Queue → DisplayTask + LogTask，外加按键 ISR → 信号量 → ButtonTask。本章给出教学级的四任务骨架，用来说明任务契约、数据流和失败边界。仓库尚未附带第三方 SPL/FreeRTOS 源码、板卡专属驱动与完整构建文件；不要把本章片段当成“复制后即可编译”的成品工程。
+先用 LED、UART 和模拟传感器值跑通整个数据流，再逐个接入 OLED、SD 卡和真实传感器。这样某个外设失败时，可以确认调度器和任务通信本身仍然正常。
 
----
+## 16.1 先定义消息，再拆任务
 
-## 16.1 四任务架构
-
-## 16.2 教学级实现骨架
-
-```
-SensorTask(prio 3, 256w)  ──Queue──→ DisplayTask(prio 2, 256w)
-                                      更新 OLED（SPL I2C）
-
-SensorTask ──Queue──→ LogTask(prio 2, 512w)
-                      写 SD 卡（SPL SPI）
-
-Button ISR ──Sem──→ ButtonTask(prio 4, 128w)
-                    处理按键
-```
-
-### 任务与接口骨架
+传感器数据需要带序号和状态。消费者拿到一条消息后，可以判断这是有效样本、超时还是坏数据，也能通过 `seq` 发现中间是否漏过消息。
 
 ```c
-#include "FreeRTOS.h"
-#include "task.h"
-#include "queue.h"
-#include "semphr.h"
+#include <stdint.h>
 
-#include "stm32f10x.h"
-#include "stm32f10x_gpio.h"
-#include "stm32f10x_rcc.h"
-#include "stm32f10x_usart.h"
-#include "stm32f10x_adc.h"
-
-// ===== 数据结构 =====
-typedef struct {
-    float temperature;
-    float humidity;
-    uint16_t lux;
-    float battery_v;
-} SensorData_t;
-
-// ===== IPC 对象 =====
-QueueHandle_t sensor_queue;
-QueueHandle_t log_queue;
-SemaphoreHandle_t button_sem;
-SemaphoreHandle_t i2c_mutex;
-
-// ===== 外设初始化（SPL）=====
-void Periph_Init(void) {
-    // LED
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
-    GPIO_InitTypeDef g;
-    GPIO_StructInit(&g);
-    g.GPIO_Pin = GPIO_Pin_13; g.GPIO_Speed = GPIO_Speed_50MHz;
-    g.GPIO_Mode = GPIO_Mode_Out_PP;
-    GPIO_Init(GPIOC, &g);
-
-    // USART1 (printf)
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1 | RCC_APB2Periph_GPIOA, ENABLE);
-    g.GPIO_Pin = GPIO_Pin_9; g.GPIO_Mode = GPIO_Mode_AF_PP; GPIO_Init(GPIOA, &g);
-    g.GPIO_Pin = GPIO_Pin_10; g.GPIO_Mode = GPIO_Mode_IN_FLOATING; GPIO_Init(GPIOA, &g);
-    USART_InitTypeDef u;
-    USART_StructInit(&u);
-    u.USART_BaudRate = 115200; u.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
-    USART_Init(USART1, &u);
-    USART_Cmd(USART1, ENABLE);
-
-    // 按键 PA0
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_AFIO, ENABLE);
-    g.GPIO_Pin = GPIO_Pin_0; g.GPIO_Mode = GPIO_Mode_IPU; GPIO_Init(GPIOA, &g);
-    GPIO_EXTILineConfig(GPIO_PortSourceGPIOA, GPIO_PinSource0);
-    EXTI_InitTypeDef e;
-    e.EXTI_Line = EXTI_Line0; e.EXTI_Mode = EXTI_Mode_Interrupt;
-    e.EXTI_Trigger = EXTI_Trigger_Falling; e.EXTI_LineCmd = ENABLE;
-    EXTI_Init(&e);
-    NVIC_InitTypeDef n;
-    n.NVIC_IRQChannel = EXTI0_IRQn;
-    n.NVIC_IRQChannelPreemptionPriority = 1; n.NVIC_IRQChannelSubPriority = 0;
-    n.NVIC_IRQChannelCmd = ENABLE;
-    NVIC_Init(&n);
-}
-
-// ===== 任务实现 =====
-
-void Task_Sensor(void *arg) {
-    SensorData_t data;
-    for (;;) {
-        // 模拟采集（实际项目用 SPL I2C + ADC）
-        data.temperature = 25.3f;
-        data.humidity = 64.2f;
-        data.lux = 450;
-        data.battery_v = 3.85f;
-
-        xQueueSend(sensor_queue, &data, 0);
-        xQueueSend(log_queue, &data, 0);
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-}
-
-void Task_Display(void *arg) {
-    SensorData_t data;
-    char buf[64];
-    for (;;) {
-        if (xQueueReceive(sensor_queue, &data, pdMS_TO_TICKS(10000)) == pdPASS) {
-            xSemaphoreTake(i2c_mutex, portMAX_DELAY);
-            snprintf(buf, sizeof(buf),
-                "T:%.1fC H:%.1f%%\r\nLux:%u Bat:%.1fV\r\n",
-                data.temperature, data.humidity, data.lux, data.battery_v);
-            // 实际项目：SSD1306_Print(0, 0, buf); ← SPL I2C 驱动
-            printf("%s", buf);  // 调试用串口输出
-            xSemaphoreGive(i2c_mutex);
-        }
-    }
-}
-
-void Task_Log(void *arg) {
-    SensorData_t data;
-    for (;;) {
-        if (xQueueReceive(log_queue, &data, portMAX_DELAY) == pdPASS) {
-            // 实际项目：写 SD 卡（SPL SPI + FatFs）
-            printf("LOG: %.1fC, %.1f%%, %ulx\r\n",
-                   data.temperature, data.humidity, data.lux);
-            GPIOC->ODR ^= GPIO_Pin_13;  // 存盘指示
-        }
-    }
-}
-
-void Task_Button(void *arg) {
-    for (;;) {
-        if (xSemaphoreTake(button_sem, portMAX_DELAY) == pdTRUE) {
-            vTaskDelay(pdMS_TO_TICKS(30));
-            if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_RESET) {
-                printf("Button pressed!\r\n");
-            }
-        }
-    }
-}
-
-// ISR
-void EXTI0_IRQHandler(void) {
-    if (EXTI_GetITStatus(EXTI_Line0) != RESET) {
-        EXTI_ClearITPendingBit(EXTI_Line0);
-        BaseType_t wake = pdFALSE;
-        xSemaphoreGiveFromISR(button_sem, &wake);
-        portYIELD_FROM_ISR(wake);
-    }
-}
-
-// printf 重定向（SPL）
-int __io_putchar(int ch) {
-    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
-    USART_SendData(USART1, (uint8_t)ch);
-    return ch;
-}
-
-// 栈溢出钩子
-void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
-    printf("STACK OVERFLOW: %s\r\n", pcTaskName);
-    while (1);
-}
-
-// ===== main =====
-int main(void) {
-    SystemClock_Config();
-    Periph_Init();
-
-    sensor_queue = xQueueCreate(5, sizeof(SensorData_t));
-    log_queue    = xQueueCreate(5, sizeof(SensorData_t));
-    button_sem   = xSemaphoreCreateBinary();
-    i2c_mutex    = xSemaphoreCreateMutex();
-
-    xTaskCreate(Task_Sensor,  "Sensor",  256, NULL, 3, NULL);
-    xTaskCreate(Task_Display, "Display", 256, NULL, 2, NULL);
-    xTaskCreate(Task_Log,     "Log",     512, NULL, 2, NULL);
-    xTaskCreate(Task_Button,  "Button",  128, NULL, 4, NULL);
-
-    vTaskStartScheduler();
-    while (1);
-}
-```
-
-## 16.3 编译运行
-
-```bash
-make
-make flash
-# 串口输出：
-# T:25.3C H:64.2%
-# Lux:450 Bat:3.85V
-# LOG: 25.3C, 64.2%, 450lx
-```## 16.4 把“能跑”变成“可验证”
-
-四任务架构完成后，至少增加三类健康指标：
-
-| 指标 | 为什么需要 |
-|---|---|
-| 每个任务的栈高水位 | 发现栈太小，避免随机 HardFault |
-| 每个 Queue 的满/丢弃计数 | 判断生产速度是否超过消费速度 |
-| 每个外设的错误/重连计数 | 区分硬件故障、协议错误和网络故障 |
-
-建议用一次故障演练验证架构：拔掉传感器、让 WiFi 断线、塞满队列、延长某任务的运行时间。系统不必“毫无错误”，但错误必须被记录、超时并恢复。
-
-## 16.4 从启动到稳定运行的验证
-
-完整代码不能直接等同于完整实验。请拆成以下五个可独立证明的阶段：
-
-| 阶段 | 只验证什么 | 通过证据 |
-|---|---|---|
-| A | 调度器与两个空任务 | 两个不同周期的 UART 心跳 |
-| B | SensorTask → Queue | 消费者看到单调递增的 seq |
-| C | Display/Log 消费者 | 同一份样本被正确显示或记录 |
-| D | 按键 ISR → 通知 | 快速按键不阻塞采样 |
-| E | 故障路径 | 拔掉一个模块/断开网络后其他任务仍运行 |
-
-每增加一层，保留上一层的 UART 日志和计数器。这样出现问题时可以立即知道是“调度器没跑”“消息没到”“设备没响应”还是“业务处理错误”。
-
-推荐给每个模块定义最小状态，而不是用无意义的布尔变量：
-
-~~~c
 typedef enum {
     SENSOR_OK,
     SENSOR_TIMEOUT,
@@ -233,100 +19,324 @@ typedef enum {
 
 typedef struct {
     uint32_t seq;
+    uint32_t tick;
     SensorStatus status;
-    int16_t value;
-} SensorEvent;
-~~~
+    int16_t temperature_centi;
+    uint16_t humidity_permille;
+    uint16_t voltage_mv;
+} EnvSample;
+```
 
-消费者看到 `SENSOR_TIMEOUT` 时应记录并继续运行，而不是永久等待一个永远不会到的数据。
+这里用定点整数保存温度、湿度和电压，日志或显示时再格式化。这样消息结构的大小和数值精度都比较明确，也避免为了几个传感器值把浮点格式化带进每个任务。
 
-## 16.5 故障演练与资源预算
+本章使用四个任务：
 
-在真实传感器稳定前，先做“主动破坏”：
+```text
+SensorTask
+    ├── display_queue ──→ DisplayTask
+    └── log_queue ──────→ LogTask
 
-1. 把 Queue 长度改成 1，故意让消费者慢于生产者，观察满计数；
-2. 把某个任务栈调小，在调试构建中确认 overflow hook 能停住；
-3. 暂时让 I2C 设备 NACK 或断开 WiFi，确认超时后能恢复；
-4. 连续快速触发按键，确认 ISR 不做耗时工作；
-5. 运行 30 分钟，记录堆余量、栈高水位、队列深度和错误计数。
+EXTI0 ISR ──notification──→ ButtonTask
+```
 
-| 指标 | 合理的阅读方式 |
-|---|---|
-| 栈高水位 | 不是“越大越好”；要留下安全余量并说明最坏路径 |
-| 剩余 heap | 持续下降通常意味着泄漏或反复分配；不要只看启动瞬间 |
-| Queue 满计数 | 说明生产/消费速度或容量设计不匹配 |
-| 超时/重连计数 | 区分正常环境波动和持续故障 |
-| CPU 忙等比例 | 高优先级任务忙等会掩盖所有其他问题 |
+显示和日志需要独立 Queue。FreeRTOS Queue 的一条消息只能被一次 `xQueueReceive()` 取走；两个消费者如果共用同一个 Queue，会竞争消息，无法保证两边都得到每份样本。
 
-## 16.6 完成检查
+## 16.2 创建 RTOS 对象时检查失败
 
-- [ ] 每个任务有明确职责和周期；
-- [ ] 共享数据通过 Queue、Semaphore 或受保护的接口交接；
-- [ ] 任务、队列和缓冲区都有容量说明；
-- [ ] 串口能显示栈高水位和关键错误计数；
-- [ ] 单个模块失败不会让全部任务永久阻塞。
+Queue 和 Task 都可能因为 heap 不足而创建失败。启动阶段应检查返回值，不要带着 NULL 句柄进入调度器。
 
-## 16.7 把教学骨架落成可构建工程：先缩小，再扩展
+```c
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
 
-本节代码刻意把 OLED、SD、I2C、按键等接口留成教学占位。真正工程应先实现一个**只有 LED + UART 的四任务最小版本**，再按文件和里程碑增加外设。推荐的目录不是一份巨大的 `main.c`：
+#define SAMPLE_QUEUE_LEN  4U
 
-~~~text
-16-rtos-pipeline-zet6/
-├── README.md                 # 板型、接线、状态：仅骨架/已编译/已烧录
-├── Makefile + link.ld
-├── platform/                 # 启动文件、SystemClock、SPL 与 FreeRTOS port
-├── app/
-│   ├── app_types.h           # EnvSample、状态码、容量常量
-│   ├── task_sensor.c         # 第一阶段可用模拟值
-│   ├── task_log.c            # UART 日志；后续才接 SD
-│   ├── task_display.c        # 第一阶段 LED/串口；后续才接 OLED
-│   └── task_health.c         # 堆、栈、队列与错误计数
-└── drivers/                  # 每个真实外设独立在前置章节验收
-~~~
+static QueueHandle_t display_queue;
+static QueueHandle_t log_queue;
+static TaskHandle_t button_task;
 
-每一阶段的“可运行”含义也应不同：
+static volatile uint32_t display_drop_count;
+static volatile uint32_t log_drop_count;
 
-| 阶段 | 允许依赖 | 最小证据 | 不能声称什么 |
-|---|---|---|---|
-| A | FreeRTOS + LED + UART | 四任务心跳、Queue 收发、栈高水位 | 传感器/OLED/SD 已经可用 |
-| B | 加一种已单独验证的传感器 | 60 秒稳定样本与超时计数 | 多外设长期稳定 |
-| C | 加显示或存储其一 | 断开该设备后其他任务继续 | 全系统硬件已验证 |
-| D | 加网络 | 断线退避且采样序号不断 | 已适合真实部署 |
+static void App_Fatal(void)
+{
+    taskDISABLE_INTERRUPTS();
+    for (;;) {
+        /* 调试构建可在这里停住，由 GDB 查看失败位置。 */
+    }
+}
 
-### 任务契约必须能落到容量预算
+static void App_CreateObjects(void)
+{
+    display_queue = xQueueCreate(SAMPLE_QUEUE_LEN, sizeof(EnvSample));
+    log_queue = xQueueCreate(SAMPLE_QUEUE_LEN, sizeof(EnvSample));
 
-在 ZET6 的 64KB SRAM 内，先写预算再调大常量。下表是记录模板，不是默认数值：
+    if (display_queue == NULL || log_queue == NULL)
+        App_Fatal();
+}
+```
 
-| 对象 | 数量/长度 | 单项字节数 | 预计 RAM | 满/错时行为 |
-|---|---:|---:|---:|---|
-| Task 栈 | … | … words | … | 高水位低于阈值即报警 |
-| `sensor_queue` | … | `sizeof(EnvSample)` | … | 丢新/覆盖/阻塞必须明确 |
-| `log_queue` | … | `sizeof(EnvSample)` | … | 记录丢失，不拖住采样 |
-| UART/RingBuffer | … | 1 | … | 统计溢出并重同步 |
-| FreeRTOS heap | 1 | `configTOTAL_HEAP_SIZE` | … | 分配失败 hook |
+`SAMPLE_QUEUE_LEN = 4` 是本章实验值。它是否够用取决于采样周期、消费者最长阻塞时间和允许丢多少历史数据。后面会主动让消费者变慢，观察这个容量什么时候被耗尽。
 
-完成 A 阶段后，才有资格把 README 标为“已编译”；完成与本书 ZET6 接线一致的板卡实验后，才标为“已烧录”。这两个状态都不应由本章文字替读者宣称。
+## 16.3 SensorTask：生产数据时不要被慢消费者拖住
 
-## 16.8 本章练习与要点
+采样任务每 1 秒产生一份消息。这里先使用模拟值，真实驱动接入时仍保持同一个 `EnvSample` 接口。
 
-练习：
+```c
+static EnvSample Sensor_Read(uint32_t seq)
+{
+    EnvSample sample;
 
-1. 为 `EnvSample` 增加 `seq` 和状态字段，验证消费者能发现漏包；
-2. 将日志任务替换为“只保留最新值”的长度 1 队列，比较它和历史日志队列的取舍；
-3. 拔掉一个传感器或让读取函数超时，确保系统仍能输出其他任务的心跳；
-4. 写下四个任务各自的输入、输出、最大阻塞时间、优先级和栈预算。
+    sample.seq = seq;
+    sample.tick = xTaskGetTickCount();
+    sample.status = SENSOR_OK;
+    sample.temperature_centi = 2530;
+    sample.humidity_permille = 642;
+    sample.voltage_mv = 3300;
+    return sample;
+}
 
-本章要点：
+static void SensorTask(void *argument)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t seq = 0U;
 
-- 完整系统要按任务间的契约验收，不按“有没有一份大代码”验收；
-- 数据消息应携带序号、状态与必要的时间信息；
-- 队列满、模块超时和断线是设计输入，不是意外；
-- 先跑 LED/UART，再逐个接入真实外设，是最有效的集成顺序。
+    (void)argument;
 
+    for (;;) {
+        EnvSample sample = Sensor_Read(seq++);
 
+        if (xQueueSend(display_queue, &sample, 0U) != pdPASS)
+            ++display_drop_count;
 
----
+        if (xQueueSend(log_queue, &sample, 0U) != pdPASS)
+            ++log_drop_count;
 
-> **下一章**：[第 17 章 · 无线通信基础（SPL版）](./17-chapter.md)
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
+    }
+}
+```
+
+这里发送 Queue 时不等待。设计目标是显示或日志暂时变慢时，采样任务仍按周期继续运行，并用 drop counter 留下证据。另一个合理设计是允许生产者等待一段时间；选择哪一种要根据业务能否接受漏样本决定。
+
+`vTaskDelayUntil()` 以固定的上次唤醒时间推进周期，比“执行完工作再延时 1 秒”更适合周期采样。如果一次采样本身已经超过周期，还需要额外记录 deadline miss，不能靠 `vTaskDelayUntil()` 消除超时。
+
+## 16.4 DisplayTask 和 LogTask：慢操作留在消费者
+
+显示任务阻塞等待新样本。OLED 驱动应保留第 10 章的 I2C 超时，设备 NACK 时返回错误，不能让任务永久卡在底层 `while`。
+
+```c
+static void DisplayTask(void *argument)
+{
+    EnvSample sample;
+
+    (void)argument;
+
+    for (;;) {
+        if (xQueueReceive(display_queue, &sample, portMAX_DELAY) == pdPASS) {
+            if (sample.status == SENSOR_OK) {
+                Display_ShowSample(&sample);
+            } else {
+                Display_ShowSensorError(sample.status);
+            }
+        }
+    }
+}
+```
+
+日志任务同样独立消费自己的 Queue：
+
+```c
+static volatile uint32_t log_error_count;
+
+static void LogTask(void *argument)
+{
+    EnvSample sample;
+
+    (void)argument;
+
+    for (;;) {
+        if (xQueueReceive(log_queue, &sample, portMAX_DELAY) == pdPASS) {
+            if (!Log_AppendSample(&sample))
+                ++log_error_count;
+        }
+    }
+}
+```
+
+`Log_AppendSample()` 可以先只写 UART。接入 SD/FatFs 后，再替换成第 13 章已经验证过的日志接口。文件系统和块设备访问集中在 `LogTask`，可以避免多个任务同时操作同一个 `FIL` 或 SDIO/SPI 数据通道。
+
+如果显示只关心最新状态，不需要每一份历史样本，可以把显示通道改成长度 1 的 Queue，并使用 `xQueueOverwrite()`。日志通常需要保留历史记录，因此它的满队列策略应单独设计。
+
+## 16.5 按键：ISR 只通知任务
+
+PA0 的 EXTI 配置沿用第 6 章，但中断优先级必须符合第 15 章的 FreeRTOS syscall priority 规则。这里假设启动代码已经完成正确的 NVIC 配置。
+
+一对一的按键事件可以直接使用 Task Notification：
+
+```c
+void EXTI0_IRQHandler(void)
+{
+    BaseType_t higher_priority_woken = pdFALSE;
+
+    if (EXTI_GetITStatus(EXTI_Line0) != RESET) {
+        EXTI_ClearITPendingBit(EXTI_Line0);
+
+        vTaskNotifyGiveFromISR(button_task, &higher_priority_woken);
+        portYIELD_FROM_ISR(higher_priority_woken);
+    }
+}
+```
+
+任务收到通知后再做消抖和业务处理：
+
+```c
+static void ButtonTask(void *argument)
+{
+    (void)argument;
+
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(30));
+
+        if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == Bit_RESET)
+            App_HandleButtonPress();
+    }
+}
+```
+
+30 ms 是实验消抖窗口，不是所有按键的固定参数。可以用示波器或逻辑分析仪观察实际抖动，再调整时间或改成状态机消抖。
+
+Notification 的计数可以记录任务处理前累计到来的多次通知，但这里延时后只检查一次 GPIO，因此它仍是“确认当前按下状态”的按键逻辑，不等于精确统计每个机械边沿。
+
+## 16.6 共享外设要有唯一访问规则
+
+如果只有 `DisplayTask` 使用 I2C，就不需要再加 Mutex。多任务共享同一个 I2C 控制器时，可以使用 Mutex 把一整个 I2C 事务保护起来：
+
+```c
+static SemaphoreHandle_t i2c_mutex;
+
+bool SharedI2C_Write(const uint8_t *data, size_t len)
+{
+    bool ok;
+
+    if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(50)) != pdTRUE)
+        return false;
+
+    ok = I2C_DeviceWrite(data, len);
+    xSemaphoreGive(i2c_mutex);
+    return ok;
+}
+```
+
+锁的范围覆盖一次完整事务，不能只保护单个寄存器写。底层 I2C 函数本身仍要有超时，否则持锁任务卡死后，所有等待这个 Mutex 的任务都会一起停住。
+
+另一个方案是创建专门的 I2C 服务任务，其他任务通过 Queue 提交请求。设备多、事务复杂时，这种方式能把总线所有权集中到一个地方；代价是请求结构和响应机制会更复杂。
+
+## 16.7 创建任务并启动
+
+先初始化时钟、UART、LED 和按键，再创建 RTOS 对象与任务。OLED、SD 和真实传感器暂时不接入。
+
+```c
+int main(void)
+{
+    BaseType_t ok;
+
+    SystemClock_Config();
+    Board_Init();
+    Console_Init();
+    ButtonExti_Init();
+
+    App_CreateObjects();
+
+    ok = xTaskCreate(SensorTask, "sensor", 256U, NULL, 3U, NULL);
+    if (ok != pdPASS)
+        App_Fatal();
+
+    ok = xTaskCreate(DisplayTask, "display", 256U, NULL, 2U, NULL);
+    if (ok != pdPASS)
+        App_Fatal();
+
+    ok = xTaskCreate(LogTask, "log", 384U, NULL, 2U, NULL);
+    if (ok != pdPASS)
+        App_Fatal();
+
+    ok = xTaskCreate(ButtonTask, "button", 192U, NULL, 4U, &button_task);
+    if (ok != pdPASS)
+        App_Fatal();
+
+    vTaskStartScheduler();
+    App_Fatal();
+}
+```
+
+这里的 `256U`、`384U`、`192U` 都是 stack depth，单位为 `StackType_t` 元素，不是字节。这些数值只是起始实验配置；接入 `printf`、FatFs 或较大的局部缓冲后，要重新测量高水位。
+
+`vTaskStartScheduler()` 正常启动后不会返回。如果返回，常见原因是内核启动所需内存分配失败；调试时应结合 malloc failed hook、剩余 heap 和链接 map 定位。
+
+## 16.8 日志本身也有并发边界
+
+原型阶段常让多个任务直接 `printf()`。这样很快会遇到两个问题：C 库格式化是否可重入，以及多个任务的字符输出是否会交错。
+
+本章建议让普通任务把日志消息交给单独的日志通道，最终由一个任务写 USART。最简单的教学版本也至少要保证一次完整日志记录不会被另一个任务插入一半。
+
+ISR 中不要调用 `printf()`。栈溢出和 malloc failed hook 也不应依赖可能持锁、分配内存或阻塞的日志路径。调试 hook 可以关中断后点亮固定错误 LED，并由 GDB 查看现场。
+
+## 16.9 给系统留下可观察状态
+
+运行时至少记录：
+
+```c
+typedef struct {
+    uint32_t display_drops;
+    uint32_t log_drops;
+    uint32_t log_errors;
+    uint32_t sensor_timeouts;
+} AppHealth;
+```
+
+任务栈使用 `uxTaskGetStackHighWaterMark()` 观察；heap 可以用 `xPortGetFreeHeapSize()`，如果所选 heap 实现支持，还可以记录历史最小剩余量。Queue 当前深度可用 `uxQueueMessagesWaiting()` 作为调试信息。
+
+这些指标要结合故障演练看。Queue drop 一直增加说明生产速度、消费速度或容量不匹配；传感器 timeout 增长说明设备或驱动路径有问题；栈高水位过低则需要检查局部数组、格式化函数和最深调用路径。
+
+## 16.10 分阶段接入真实外设
+
+不要一次把四个任务和所有驱动一起打开。按下面顺序验证：
+
+1. **调度器**：两个不同周期的 LED/UART 心跳持续运行。
+2. **Queue**：SensorTask 产生递增 `seq`，消费者确认没有异常跳号。
+3. **四任务骨架**：显示和日志仍使用 UART/LED 占位，按键 ISR 能唤醒 ButtonTask。
+4. **真实传感器**：拔掉传感器后返回 `SENSOR_TIMEOUT`，其他任务继续运行。
+5. **OLED**：断开 I2C 设备后 DisplayTask 超时返回，SensorTask 和 LogTask 不停。
+6. **SD/FatFs**：让写入失败或拔卡，LogTask 记录错误，采样仍继续。
+
+每加一个设备，只替换一个已经有明确输入输出的接口。这样故障范围不会从一个驱动突然扩大到整个系统。
+
+## 16.11 压力测试
+
+把 `SAMPLE_QUEUE_LEN` 暂时改成 1，并在 `LogTask` 中加入明显长于采样周期的测试延时。`log_drop_count` 应开始增加，而 SensorTask 的 `seq` 仍继续递增。这能直接验证“日志变慢不会拖住采样”这个设计。
+
+随后恢复正常配置，连续运行一段时间，记录：
+
+- 每个任务的栈高水位；
+- 当前和历史最小剩余 heap；
+- 两个 Queue 的深度和 drop counter；
+- 传感器、I2C、SD 的 timeout/error counter；
+- SensorTask 的周期和最大执行时间。
+
+运行时长应根据系统用途决定。本章不把“运行 10 分钟”或“30 分钟没死机”当成稳定性的固定证明；压力测试需要覆盖预期的最坏负载和故障路径。
+
+## 16.12 练习
+
+1. 给 `EnvSample` 增加 ADC 原始值，在 DisplayTask 中显示换算后的电压，同时让 LogTask 保存原始值和换算值。
+2. 把 `display_queue` 改成长度 1，并使用 `xQueueOverwrite()`；让 DisplayTask 故意变慢，验证它最终显示最新样本。
+3. 给 SensorTask 增加执行时间统计，构造一次超过 1 秒周期的读取，记录 deadline miss。
+4. 给 UART 日志增加单独的 LogConsoleTask，其他任务只提交完整日志消息，验证多任务日志不会交错。
+5. 写出四个任务的输入、输出、最大允许阻塞时间、优先级依据和栈高水位，并放进项目 README。
+
+完成本章后，四任务系统应能回答几个具体问题：哪条 Queue 满了、哪个设备超时、哪个任务栈接近上限，以及一个慢消费者是否影响采样周期。第 17 章加入无线模块时，网络断线和 AT 命令超时也沿用同样的任务边界处理。
+
+> **上一章**：[第 15 章 · FreeRTOS 核心 API 与手动移植](./15-chapter.md)
 >
-> FreeRTOS 框架搭好了。接下来加无线——用 SPL 的 UART 和 DX-WF24/ESP8266 通信，进入物联网的世界。
+> **下一章**：[第 17 章 · 无线通信基础](./17-chapter.md)
