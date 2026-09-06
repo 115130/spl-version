@@ -1,396 +1,340 @@
 # 第 20 章 · TCP/IP 协议栈与温度记录仪
 
-> **前置知识**：第 8 章 UART、第 17 章 AT 模块、第 18 章的二进制温度包。
->
-> **实验环境**：ZET6 + 可工作的 WiFi AT 模块 + 同一网络中的 PC；先用局域网地址和明文教学 TCP 服务，不把公网 HTTPS 问题混进本章。
->
-> **通过标准**：设备能断线后退避重连，PC 网关能从任意分段的 `read()` 结果恢复完整业务帧。
+第 18 章已经把 18 字节温度帧通过 WiFi 模块发送到 PC。本章继续沿这条链路往下看：STM32 交给 AT 模块的是什么，TCP/IP 各层分别负责什么，PC 上的 `socket`、`accept` 和 `read` 又对应链路里的哪一步。
 
-> **本章产出**：从温度记录仪项目出发，理解 TCP/IP 各层在代码中的对应关系、AT 模块内部发生了什么、网关 socket 编程的原理
->
-> **用在哪**：项目⑤⑥⑦——MQTT、HTTP、网关的通信基础
+实验先放在同一局域网中，使用明文 TCP 教学服务。公网、TLS 和证书验证留到后面的协议章节；本章只把 TCP 字节流、连接状态和应用帧边界讲清楚。
 
----
+## 20.1 一份温度样本经过了哪些层
 
-## 20.1 温度记录仪的 TCP 链路，逐层拆解
+第 18 章的链路可以拆成：
 
-你在第 18 章做成的温度记录仪，数据链路是这样的（从传感器到电脑屏幕）：
-
-```
-温度值 (int16)
-    ↓
-二进制协议打包 (TempPacket, 15 字节)
-    ↓
-发送函数 WiFi_SendBinary()
-    ↓
-AT 指令 "AT+CIPSEND=15\r\n"
-    ↓
-UART TX (PA2) ──→ DX-WF24 RXD
-                    ↓
-                模块内部：
-                解析 AT → 取 15 字节数据
-                → 加上 TCP 头部
-                → 加上 IP 头部
-                → 加上 WiFi 帧头
-                    ↓
-                WiFi 射频发送
-                    ↓
-                路由器 → 互联网
-                    ↓
-PC 网关 (gateway.c)
-    收 TCP 数据 → 校验 Magic+CRC
-    → 拆解 TempPacket → 显示 + 写 JSON
+```text
+TempSample
+   ↓
+TempPacket_Encode()：18 字节业务帧
+   ↓
+WiFiTxTask / Radio_Send()
+   ↓ UART
+AT 模块
+   ↓
+TCP
+   ↓
+IP
+   ↓
+WiFi MAC / 射频
+   ↓
+路由器
+   ↓
+PC TCP socket
+   ↓
+TempReassembler
+   ↓
+JSON Lines / 显示
 ```
 
-这条链路上的每一步，对应 TCP/IP 协议栈的一层：
+STM32 直接负责的是应用协议、UART 和 AT 控制。TCP、IP、WiFi MAC 和射频通常由无线模块固件处理；PC 端的操作系统负责另一端 TCP/IP 协议栈，网关程序只通过 socket API 收发字节。
 
-| 层 | 温度记录仪中的对应 | 代码 |
-|----|-----------------|------|
-| **应用层** | 温度数据打包为 TempPacket | `protocol.c` |
-| **传输层** | TCP 连接 + 可靠传输 | AT 模块内部处理 |
-| **网络层** | IP 寻址（你的电脑 IP） | `AT+CIPSTART="TCP","192.168.1.100",8888` |
-| **链路层** | WiFi 帧、MAC 地址 | 模块固件自动处理 |
-| **物理层** | 2.4GHz 射频 | 模块硬件 |
+这几个层次不要混在一起。业务 CRC 错误属于端到端数据检查；TCP 重传属于传输层；WiFi 重新关联 AP 属于更下面的无线链路。日志里把它们分别计数，才能知道问题发生在哪里。
 
-## 20.2 TCP 连接的三次握手
+## 20.2 `connect()` 背后发生了什么
 
-当 STM32 执行 `WiFi_TCPConnect("192.168.1.100", 8888)` 时，AT 命令只是 `AT+CIPSTART="TCP","192.168.1.100",8888`。但模块内部为你做了：
+设备发出类似下面的 AT 命令时：
 
-```
-STM32                          DX-WF24                     PC Gateway (8888)
-  │                              │                              │
-  │─ AT+CIPSTART ──────────────→│                              │
-  │                              │── SYN ─────────────────────→│
-  │                              │←─ SYN+ACK ──────────────────│
-  │                              │── ACK ─────────────────────→│
-  │←─ CONNECT ──────────────────│                              │
-  │                              │                              │
-  │←─── 现在 TCP 连接已建立 ────→│←─── 可以收发数据 ──────────→│
+```text
+AT+CIPSTART="TCP","192.168.1.100",8888
 ```
 
-三次握手发生在模块和网关之间，STM32 只需要等 AT 返回 `CONNECT`。**如果你从 Java/Python 写 socket 编程**，三次握手是 `socket.connect()` 内部发生的——和你现在用 AT 指令一样，都是等结果。
+模块会尝试向目标 IP 和端口建立 TCP 连接。典型 TCP 三次握手是：
 
-> 计网课上学过的 SYN、SYN+ACK、ACK——现在你亲眼看到了它被触发（`AT+CIPSTART`）和完成（`CONNECT`）。
-
-### 温故知新：Java Socket 代码
-
-```java
-Socket socket = new Socket("192.168.1.100", 8888);
-//  ↑ 这个构造函数内部完成了三次握手
-//  等价于 STM32 的 AT+CIPSTART
-OutputStream out = socket.getOutputStream();
-out.write(packet);   // 等价于 AT+CIPSEND
+```text
+模块                         PC
+  ───────── SYN ───────────→
+  ←────── SYN + ACK ────────
+  ───────── ACK ───────────→
 ```
 
-### STM32 版
+应用代码通常看不到这三个报文，只会得到“连接成功”或错误/超时。Linux、Java、Python 的 `connect()` 也是类似边界：内核完成 TCP 握手，应用等待结果。
 
-```c
-WiFi_TCPConnect("192.168.1.100", 8888);  // Java: new Socket()
-WiFi_SendBinary(data, 15);               // Java: out.write()
+连接成功只说明传输通道建立。服务器是否会接受你的业务协议、数据是否最终写进文件，是后续应用层的事情。
+
+## 20.3 TCP 提供的是有序字节流
+
+TCP 在一个正常连接中负责排序、确认和必要的重传。应用写入：
+
+```text
+18 字节帧 A
+18 字节帧 B
 ```
 
-两种写法下，网络上传送的 TCP 包**一模一样**。区别只在于 Java 里三次握手是 JDK 帮你做的，STM32 里是模块固件帮你做的——你的代码都在等待结果。
+PC 端的 `read()` 可能得到：
 
-## 20.3 TCP 的可靠性机制（在项目中的应用）
-
-### 重传
-
-`WiFi_SendBinary` 发送后等 `AT_WaitResponse("SEND OK", 10000)`——如果 10 秒没收到 SEND OK，说明模块没确认 TCP 发送成功，代码返回 -1：
-
-```c
-int WiFi_SendBinary(const uint8_t *data, uint16_t len) {
-    AT_SendCmd("AT+CIPSEND=%d", len);
-    if (!AT_WaitResponse(">", 5000)) return -1;
-    // 发 15 字节原始数据...
-    return AT_WaitResponse("SEND OK", 10000) ? 0 : -1;
-}
+```text
+5 字节
+13 字节
+36 字节
 ```
 
-在 WiFiTxTask 中，发送失败后会重新连接 TCP：
+也可能先得到 20 字节，再得到 16 字节。TCP 不保留应用每次 `write()` 或 AT 发送操作的边界。
 
-```c
-if (WiFi_SendBinary(...) != 0) {
-    WiFi_TCPConnect("192.168.1.100", 8888);  // 重连
-    break;
-}
+这意味着业务协议必须自己定义帧边界。第 18 章使用 magic、固定版本、固定 18 字节长度和 CRC；变长协议还需要可信的长度字段和上限检查。
+
+TCP 也不能保证“每个温度样本最终一定进入 PC 日志”。连接可能在应用确认前断开，设备 Queue 可能已满，AT UART 可能丢字节，PC 也可能在收到数据后写文件失败。第 18 章保留 `seq`、重复检测和错误计数，就是为了观察这些端到端问题。
+
+## 20.4 `SEND OK` 到底说明什么
+
+不同 AT 固件对 `SEND OK` 的具体语义可能不同，必须查模块手册。通常它说明模块接受并完成了一次发送流程，但不能把它解释成“PC 应用已经持久化这条记录”。
+
+业务层若需要确认 PC 已经处理某个 `seq`，需要额外定义 ACK：
+
+```text
+device → TempPacket(seq=42)
+pc     → ACK(seq=42)
 ```
 
-### 序列号
+只有收到应用 ACK 后，设备才能确认“对端应用已经接受了 42”。如果 ACK 丢失，设备可能重发 42，PC 端就需要按 `seq` 幂等处理。
 
-每个温度包有个 4 字节 `seq` 字段。PC 网关收到后可以检查序列号是否连续。如果网关发现 `seq` 从 42 跳到了 45，就知道序号 43 和 44 的包丢了——虽然温度记录仪不处理丢包（丢了就丢了），但至少能发现。
+对于普通实时遥测，也可以接受少量丢失，不增加 ACK。这里的选择属于产品语义，不由 TCP 自动决定。
 
-```bash
-# 从 JSON Lines 日志检查丢包
-cat temps.jsonl | python3 -c "
-import sys,json
-seqs = [json.loads(l)['seq'] for l in sys.stdin]
-for i in range(len(seqs)-1):
-    if seqs[i+1] - seqs[i] != 1:
-        print(f'可能丢包: {seqs[i]} → {seqs[i+1]}')
-"
-```
+## 20.5 PC 网关的 socket 生命周期
 
-## 20.4 网关的 socket 编程解释
-
-`gateway.c` 的核心是这三行：
-
-```c
-int srv = socket(AF_INET, SOCK_STREAM, 0);    // 创建 TCP socket
-bind(srv, ..., 8888);                           // 绑定端口 8888
-listen(srv, 5);                                 // 开始监听
-```
-
-### socket
+一个最小 Linux TCP 服务端通常按下面顺序工作：
 
 ```c
 int srv = socket(AF_INET, SOCK_STREAM, 0);
-// AF_INET     = IPv4
-// SOCK_STREAM = TCP（不是 UDP）
-// 0           = 默认协议（TCP）
-```
 
-操作系统返回一个**文件描述符**——在 Linux 中，socket 就是一个文件。你可以 `read()` 它收数据，`write()` 它发数据。
+/* 检查 srv < 0 */
 
-### bind
+if (bind(srv, (struct sockaddr *)&addr, sizeof addr) < 0) {
+    /* 记录 errno，关闭 srv */
+}
 
-```c
-struct sockaddr_in addr = {
-    .sin_family = AF_INET,
-    .sin_port   = htons(8888),     // 端口号（网络字节序）
-    .sin_addr   = INADDR_ANY       // 接受来自任何 IP 的连接
-};
-bind(srv, (struct sockaddr*)&addr, sizeof(addr));
-```
+if (listen(srv, 5) < 0) {
+    /* 记录 errno，关闭 srv */
+}
 
-把 socket 和本地地址绑定。`htons` = Host TO Network Short——因为网络字节序是大端（Big Endian），而大部分电脑是小端。
-
-### listen 和 accept
-
-```c
-listen(srv, 5);   // 开始监听，最多 5 个待处理连接
-
-while (1) {
+for (;;) {
     int cli = accept(srv, NULL, NULL);
-    TempReassembler parser = {0};
-
-    /* read() 可以返回 1…N 字节；连接还可以在半帧处关闭。 */
-    for (;;) {
-        ssize_t n = read(cli, buf, sizeof(buf));
-        if (n == 0) break;            /* 对端正常关闭 */
-        if (n < 0) { /* 记录 errno 后结束本连接 */ break; }
-
-        TempReassembler_Push(&parser, (const uint8_t *)buf, (size_t)n);
-        /* Push 内部只在长度、magic、CRC 都成立时交付 TempPacket。 */
+    if (cli < 0) {
+        /* 记录 errno；根据错误决定继续还是退出 */
+        continue;
     }
+
+    HandleClient(cli);
     close(cli);
 }
 ```
 
-`listen` 让操作系统知道这个 socket 愿意接受外来连接。`accept` 取出一个已完成三次握手的连接——如果当前没有，就阻塞等。
+`socket()` 创建一个内核 socket，并返回文件描述符。`bind()` 把它绑定到本地地址和端口，`listen()` 进入监听状态，`accept()` 返回一个新的已连接 socket；监听 socket `srv` 继续保留，用来接受后续连接。
 
-### 和 temperature logger 的对应
+`listen(srv, 5)` 中的 `5` 是 backlog 提示值，不应简单解释为“最多同时 5 个客户端”。它主要影响待完成/待接受连接的排队，具体行为还受操作系统实现和内核参数影响。
 
-| 操作系统原理 | gateway.c | 温度记录仪 |
-|------------|-----------|----------|
-| socket 创建 | `socket(AF_INET, SOCK_STREAM, 0)` | 模块固件内部有 socket |
-| bind | `bind(srv, ..., 8888)` | 网关定好端口等连接 |
-| listen | `listen(srv, 5)` | - |
-| accept | `accept(srv, ...)` 阻塞等待 | 模块等 `AT+CIPSTART` |
-| connect | - | `AT+CIPSTART="TCP",ip,port` |
-| 三次握手 | 操作系统自动完成 | 模块固件自动完成 |
-| read/write | `read(cli, buf, 15)` | `AT+CIPSEND=15` + 发数据 |
+端口 8888 只是本章选的教学端口，没有特殊协议含义。开发 PC 的局域网 IP 也可能由 DHCP 改变，实验时应先用 `ip addr` 等工具确认当前地址，再写进设备配置。
 
-## 20.5 TCP vs UDP：为什么用 TCP
+## 20.6 网络字节序和业务字节序是两件事
 
-你可能想问：为什么不用 UDP？
-
-| | TCP | UDP |
-|---|---|---|
-| **可靠性** | 有确认+重传，保证顺序 | 发出去不管，可能丢包 |
-| **速度** | 稍慢（有确认延迟） | 快（无确认） |
-| **代码复杂度** | 简单（AT 模块封装了） | 简单（AT 也支持） |
-| **适合** | 文件、数据库、控制指令 | 视频、音频、实时游戏 |
-
-**温度记录仪用 TCP 的原因**：数据不能丢。一个温度点是 2 字节，但丢失意味着那 5 分钟没有记录。TCP 保证每个包都到达（或者你明确知道失败才能重试）。
-
-> 第 21-24 章的 MQTT 也跑在 TCP 之上。MQTT 本身是一个「在 TCP 之上的应用层协议」，所以你学会了 TCP 通信，MQTT 就是在此基础上定义报文格式。
-
-## 20.6 IP 地址与端口
-
-在温度记录仪中，你硬编码了：
+`sin_port` 使用网络字节序，因此常见写法是：
 
 ```c
-WiFi_TCPConnect("192.168.1.100", 8888);
+addr.sin_port = htons(8888);
 ```
 
-- **IP 地址 `192.168.1.100`**：你电脑在局域网中的门牌号。路由器通过 DHCP 分配给你的电脑。如果你的电脑 IP 变了，STM32 就连不上了。
-- **端口 `8888`**：你电脑上的门。操作系统通过端口区分不同的网络服务——8888 是温度记录仪网关，22 是 SSH，80 是 HTTP 服务器。
+这是 socket API 对端口字段的要求。第 18 章业务帧内部则明确使用 little-endian，例如 `seq` 由 `put_u32_le()` 编码。
 
-一个 IP 地址有 65536 个端口。`bind` 就是在其中一个端口上「挂一个监听器」——操作系统收到 TCP 包后，看目标端口是 8888，就把数据交给 `gateway.c`。
+业务协议可以选择大端或小端，只要编码和解码双方一致。不要因为 IP/TCP 头使用网络字节序，就自动把应用协议里的所有整数都改成大端。
 
-## 20.7 从温度记录仪看 TCP/IP 五层模型
+## 20.7 正确处理 `read()`
 
-```
-应用层                    温度数据 (TempPacket, 15 字节)
-                           ↓
-传输层                    TCP 头部 (20 字节) + 温度数据
-                           ↓
-网络层                    IP 头部 (20 字节) + TCP 段
-                           ↓
-链路层                    WiFi 帧头 (MAC 地址等)
-                           ↓
-物理层                    2.4GHz 射频信号
-```
+连接处理函数不能假设一次 `read()` 返回一帧：
 
-每个头部长度：
-
-| 头部 | 大约字节 | 包含什么 |
-|------|---------|---------|
-| TCP | 20 | 源端口、目标端口、序列号、确认号、窗口 |
-| IP | 20 | 源 IP、目标 IP、TTL、校验和 |
-| WiFi MAC | 24 | 源 MAC、目标 MAC、帧类型 |
-
-所以发一个 15 字节的温度包，实际空中传输约 **15 + 20 + 20 + 24 ≈ 79 字节**——5 倍多的开销。但这对 2.4GHz WiFi 来说可以忽略（54Mbps 速率下 79 字节 ≈ 12 微秒）。
-
-## 20.8 TCP 是字节流，不是业务消息队列
-
-TCP 保证字节按顺序到达，但不会替你保留 TempPacket、JSON 或 HTTP 的边界。一次 read 可能得到半包、一整包，或者多包连在一起。
-
-因此接收端必须自己定义边界，例如：
-
-- 固定长度帧：先收满 15 字节，再校验 Magic 和 CRC；
-- 长度字段帧：先收头部，再按 length 累积；
-- 文本协议：用换行或空行作为边界；
-- HTTP：按头部、Content-Length 或连接关闭判断 Body 是否完整。
-
-把 read 返回值当成“收到了一条消息”，是网络编程中最常见的初学错误。
-
-## 20.9 用重组器处理 TCP 字节流
-
-假设第 18 章的 `TempPacket` 是固定长度帧。PC 的 `read()` 可能一次返回 1 字节、15 字节或 30 字节，因此接收端必须把“读到的字节”与“完整数据包”分开：
-
-~~~c
-typedef struct {
-    uint8_t buf[TEMP_PACKET_SIZE];
-    size_t used;
-    uint32_t bad_frame_count;
-} TempReassembler;
-
-typedef void (*TempPacketSink)(const TempPacket *packet, void *ctx);
-
-/* 每来一小段字节就调用一次。一次 data 里可能有 0、1 或多帧；
-   因此通过回调逐帧交付，绝不能在第一帧时提前 return 丢掉剩余字节。 */
-void TempReassembler_Feed(TempReassembler *r,
-                          const uint8_t *data, size_t n,
-                          TempPacketSink sink, void *ctx)
+```c
+static void HandleClient(int cli)
 {
-    while (n--) {
-        TempPacket packet;
+    uint8_t buf[256];
+    TempReassembler parser = {0};
 
-        r->buf[r->used++] = *data++;
-        if (r->used != TEMP_PACKET_SIZE) continue;
+    for (;;) {
+        ssize_t n = read(cli, buf, sizeof buf);
 
-        memcpy(&packet, r->buf, sizeof(packet));
-        r->used = 0;
+        if (n > 0) {
+            TempReassembler_Feed(&parser, buf, (size_t)n);
+            continue;
+        }
 
-        if (TempPacket_IsValid(&packet))
-            sink(&packet, ctx);
-        else
-            r->bad_frame_count++;
+        if (n == 0) {
+            /* 对端正常关闭连接 */
+            break;
+        }
+
+        if (errno == EINTR)
+            continue;
+
+        /* 其他错误：记录 errno */
+        break;
     }
 }
-~~~
+```
 
-这段代码的重点不是固定长度本身，而是接口：**任何网络层回调只喂字节；只有验证通过后才向业务层交付 Packet。**
+阻塞 socket 上的 `read()` 可能被信号中断，因此常见代码会特别处理 `EINTR`。生产服务还要考虑连接超时、并发客户端和资源上限，本章先做单连接教学服务器。
 
-### 连接状态机和退避
+## 20.8 固定长度协议也要能重新同步
 
-AT 模块会把 TCP 细节藏在固件里，但应用仍要管理自己的连接状态：
+如果连接从 magic 开始，并且中间从不丢失或插入字节，那么每 18 字节切一帧可以工作。但第 18 章保留 magic 和 CRC 的意义之一，就是在 UART/AT 外层或应用缓存出现异常后能够重新找到帧边界。
 
-~~~text
-INIT → WIFI_JOIN → TCP_OPEN → ONLINE
-               ↑                 │
-               └── BACKOFF ← ERROR/TIMEOUT
-~~~
+重组器更适合显式寻找 magic：
 
-- 每个状态有超时；
-- 每次失败记录原因和次数；
-- 退避时间逐步增加并设置上限；
-- ONLINE 只在连接已确认、发送路径可用时成立；
-- 采样任务不等待连接；它只把数据交给缓冲区或 Queue。
+```c
+#define TEMP_PACKET_SIZE 18U
 
-### 局域网实验与排错
+typedef enum {
+    RX_FIND_MAGIC0,
+    RX_FIND_MAGIC1,
+    RX_COLLECT
+} TempRxState;
 
-1. 在 PC 启动一个只收固定长度 TempPacket 的教学服务器；
-2. 让设备每秒发一帧，PC 故意把读取缓冲区改小；
-3. 断开 WiFi 或停止服务器，观察设备进入退避而不是忙等；
-4. 重启服务器，确认设备能恢复并报告重连次数。
+typedef struct {
+    TempRxState state;
+    uint8_t buf[TEMP_PACKET_SIZE];
+    size_t used;
+    uint32_t bad_crc;
+    uint32_t bad_version;
+    uint32_t resync_count;
+} TempReassembler;
 
-| 现象 | 优先检查 |
-|---|---|
-| TCP “已连接”但 PC 没有完整包 | UART/AT 外层接收、`+IPD` 解析、业务帧边界 |
-| PC 偶发 CRC 错 | 把多次 read 当成一帧、发送缓冲区复用、字节序 |
-| 重连风暴 | 无退避、多个任务同时重连、旧连接未清理 |
-| 断网拖慢采样 | 采样路径直接等待 AT/TCP，而不是异步交给网络任务 |
+static void TempReassembler_Reset(TempReassembler *r)
+{
+    r->state = RX_FIND_MAGIC0;
+    r->used = 0U;
+}
 
-## 20.10 发送所有权、半包和 TCP 关闭
+void TempReassembler_PushByte(TempReassembler *r, uint8_t ch)
+{
+    switch (r->state) {
+    case RX_FIND_MAGIC0:
+        if (ch == 0xA5U) {
+            r->buf[0] = ch;
+            r->state = RX_FIND_MAGIC1;
+        }
+        break;
 
-接收端要重组，发送端同样需要边界。任何交给网络任务的 buffer 都必须在发送完成前保持有效：
+    case RX_FIND_MAGIC1:
+        if (ch == 0x5AU) {
+            r->buf[1] = ch;
+            r->used = 2U;
+            r->state = RX_COLLECT;
+        } else if (ch == 0xA5U) {
+            r->buf[0] = ch;
+        } else {
+            r->state = RX_FIND_MAGIC0;
+        }
+        break;
 
-| 做法 | 为什么危险/安全 |
-|---|---|
-| 把局部数组地址放进 Queue | 函数返回后地址仍在，但内容已不可靠 |
-| 复用同一全局 TX buffer | 上一条 AT/TCP 发送未完成时会被下一条覆盖 |
-| Queue 传递完整小结构体 | 简单、安全，但占更多 RAM |
-| 固定缓冲池 + 所有权状态 | 适合较大消息，但必须有申请/释放/超时规则 |
+    case RX_COLLECT:
+        r->buf[r->used++] = ch;
 
-TCP 连接关闭也不是“下一次写失败再说”。设备应区分：
+        if (r->used == TEMP_PACKET_SIZE) {
+            if (TempPacket_ValidateAndDeliver(r->buf)) {
+                TempReassembler_Reset(r);
+            } else {
+                ++r->resync_count;
+                TempReassembler_Reset(r);
 
-~~~text
-ONLINE → SEND_PENDING → ONLINE
-ONLINE → PEER_CLOSED / AT_ERROR → BACKOFF
-ONLINE → KEEPALIVE_TIMEOUT → BACKOFF
-~~~
+                /* 简化实现从下一个输入字节重新找 magic。
+                   更严格的实现可检查失败帧内部是否含候选 magic。 */
+            }
+        }
+        break;
+    }
+}
+```
 
-每次进入 BACKOFF 都清理未完成事务、记录失败原因和最后一个 seq；重连后按照业务语义决定哪些消息需要重发。遥测可以丢旧保新，命令确认必须幂等。
+这里省略了 `TempPacket_ValidateAndDeliver()` 的 version/CRC 统计细节。重点是 CRC 失败后回到“找 magic”，不能简单假定下一个 18 字节边界仍然正确。
 
-### 练习
+测试时把同一组帧按 1 字节、随机大小和整块输入，结果必须一致；再在中间插入一个噪声字节，确认后续合法帧仍能恢复。
 
-1. 修改 PC 网关，使一次 `read()` 合并两帧，再把一帧拆成三个 `write()`；重组结果应完全相同；
-2. 让设备每秒入队一帧、网络任务每三秒取一帧，说明队列满时保留哪个数据；
-3. 服务器主动关闭连接，记录设备从检测到错误到下一次成功发送的状态时间线。
+## 20.9 设备端连接状态机
 
-## 20.11 不要把 TCP 的可靠性和整条设备链路的可靠性混为一谈
+AT 模块隐藏了 TCP 报文细节，但设备仍需要管理连接状态：
 
-TCP 在**已经建立且未断开的连接**中提供有序字节流；它不承诺一次 `read()` 对应一条业务消息，也无法替你修复 UART、AT 解析、内存覆盖、模块复位或应用缓冲区满造成的问题。第 18 章的 `seq + magic + length + CRC` 仍有价值：它检查的是端到端业务数据，而不是重复实现 TCP。
+```text
+PROBE
+  ↓
+JOIN_AP
+  ↓
+OPEN_TCP
+  ↓
+ONLINE
+  ↓ error / disconnect / timeout
+BACKOFF
+  └────────────→ PROBE
+```
 
-| 现象 | 首先归属到哪一层 |
-|---|---|
-| TCP `read()` 只给了半帧 | 正常字节流分段；继续喂重组器 |
-| CRC 错或 magic 丢失 | UART/AT 外层、发送缓冲复用或应用协议边界 |
-| `SEND OK` 后 PC 没记录 | TCP 连接稍后失败、PC 写入失败或业务确认未定义 |
-| 重连后 seq 跳变 | 应用层缓存/丢弃策略，需要明确记录 |
-| 收到旧帧或重复帧 | 重连、上层重发或缓存回放；按 seq 做幂等处理 |
+每个状态都有独立超时和错误码。进入 `BACKOFF` 时清理当前 AT 事务和连接状态，记录失败原因，再等待一段时间后重新探测模块。
 
-### 失败后如何重新同步
+退避可以从较短间隔开始，连续失败后逐步增加，并设置上限。这样 AP 长时间关闭时不会每几毫秒重连一次。具体初值和上限属于系统策略，应根据网络环境和功耗要求确定。
 
-固定长度帧的重组器在 CRC 或长度失败时不能直接“再读 15 字节”。它应回到“寻找 magic”的状态，逐字节扫描下一个候选帧头，并给候选长度设置上限。对变长协议则必须先检查长度字段，再分配/拷贝 payload；永远不要让网络输入决定一个无上限数组长度。
+SensorTask 不参与这些状态转换。它继续产生样本，并按照第 18 章定义的 Queue/持久化策略处理网络积压。
 
-### 发送缓冲区的所有权
+## 20.10 发送缓冲区的所有权
 
-定义发送接口时写清楚一件事：调用后数据还能否被调用者改写。最简单的入门约定是“发送函数在返回前完成复制或发送，调用者才可复用缓冲区”。若使用异步 Queue，则 Queue 必须复制消息，或由明确定义的内存池管理所有权；绝不能把即将返回的栈数组指针交给网络任务。
+网络任务异步发送数据时，缓冲区必须在发送完成前保持有效。下面这种做法有生命周期问题：
 
-## 20.12 本章要点
+```c
+void Produce(void)
+{
+    uint8_t packet[TEMP_PACKET_SIZE];
+    TempPacket_Encode(packet, &sample);
+    NetworkQueue_SendPointer(packet);  /* 错误示例 */
+}
+```
 
-- AT 模块帮你实现了 TCP/IP 协议栈——三次握手、重传、打包全在固件里
-- TCP 保证可靠传输，适合温度记录数据
-- socket 编程三要素：`socket` → `bind` → `listen/accept`（网关）或 `connect`（设备）
-- IP 地址找机器，端口找程序
-- 一个温度包的 TCP/IP 头部开销约 64 字节，数据 15 字节——可以接受
-- 本章的 TCP 知识是第 21-24 章 MQTT/HTTP 通信的基础
+函数返回后 `packet` 的生命周期结束。安全的简单做法是让 Queue 复制完整的小消息：
 
----
+```c
+xQueueSend(network_queue, &packet_struct, 0U);
+```
 
-> **下一章**：[第 21 章 · MQTT：让设备持续发布数据（SPL版）](./21-chapter.md)
+较大的消息可以使用固定缓冲池，但要定义申请者、网络任务和释放者之间的所有权状态。无论哪种实现，都不能在上一笔发送尚未完成时直接覆盖同一 TX buffer。
+
+## 20.11 TCP 和 UDP 怎么选
+
+TCP 提供连接、有序字节流、拥塞控制和重传；UDP 是无连接的数据报服务，应用可以保留一报一报的边界，但需要自己决定丢包、乱序、重试和拥塞策略。
+
+温度记录仪使用 TCP 的实际理由是实现简单：AT 模块和操作系统已经提供了连接与有序传输，PC 网关只需要在字节流上恢复业务帧。它并不意味着每一个温度点都必须可靠保存。
+
+某些遥测场景允许丢少量数据，希望更低延迟或更简单的单报发送，也可以用 UDP；重要命令或日志则通常需要更明确的确认和重试语义。协议选择要根据业务损失模型决定。
+
+## 20.12 协议开销不要用一个固定数字概括
+
+IPv4 和 TCP 在都没有可选项时，头部最小分别是 20 字节和 20 字节。但实际链路还可能有 TCP options、WiFi MAC/LLC、安全封装、聚合、重传和 PHY 前导等开销。
+
+因此不能用 `18 + 20 + 20 + 24` 就得到“空中实际传输了多少字节”，更不能直接拿某个标称 PHY 速率换算一次业务消息的真实 airtime。要研究带宽和功耗时，应抓包或使用模块/无线侧测量工具获得实际数据。
+
+对本书这个每秒一帧、18 字节左右的教学遥测，带宽显然不是主要瓶颈。更值得关注的是连接恢复、供电和缓冲策略。
+
+## 20.13 验证
+
+先在 PC 上完成不依赖硬件的重组测试：半帧、两帧合并、随机分段、CRC 错误、未知版本、插入噪声后重新同步。随后再启动 TCP server，让设备每秒发送一帧。
+
+故障测试至少覆盖：
+
+- PC server 停止后，设备进入退避，采样继续；
+- server 恢复后，设备重新连接；
+- server 在半帧处主动关闭连接，PC 不交付残缺业务帧；
+- 网络任务故意变慢，Queue 满策略和 `seq` 缺口符合第 18 章定义；
+- PC 写日志失败时单独记录文件错误，不误报成 TCP 错误。
+
+PC 端至少统计 `accepted_connections`、`read_errors`、`bad_crc`、`bad_version`、`resync_count`、`seq_gap` 和 `duplicate_seq`。设备端继续保留 radio timeout、reconnect、send error 和 Queue drop 计数。
+
+## 20.14 练习
+
+1. 修改 PC 测试程序，把一帧拆成 18 次单字节 `write()`，再一次发送两帧，验证解析结果相同。
+2. 在两个合法帧中间插入一个字节，确认重组器能在后续 magic 处恢复，并增加 `resync_count`。
+3. 给应用协议增加 ACK：PC 只有在日志写入成功后才回复 `ACK(seq)`，设备据此决定是否释放 pending。
+4. 把设备网络退避改成逐步增长并设上限，关闭 AP 一段时间，记录每次重试的时间点。
+5. 用 Wireshark 抓取局域网 TCP 会话，找到 SYN、SYN/ACK、ACK 和包含业务数据的 TCP segment，并和设备日志时间对应。
+
+完成本章后，网络路径应该能明确区分三件事：TCP 连接是否存在、字节流是否完整恢复成业务帧、业务样本是否最终被应用接受。第 21 章开始在 TCP 之上加入 MQTT。
+
+> **上一章**：[第 19 章 · 温度记录仪 BLE 版](./19-chapter.md)
 >
-> 从已经建立的 TCP 通道出发，先学习 MQTT 的 Broker、Topic 和发布流程。
+> **下一章**：[第 21 章 · MQTT：让设备持续发布数据](./21-chapter.md)
