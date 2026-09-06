@@ -1,293 +1,272 @@
-# 第 30 章 · 从原型到产品：结构、测试与升级（SPL版）
+# 第 30 章 · 从原型到产品：结构、测试与升级（SPL 版）
 
-> **本章产出**：把“能跑的实验”整理为可维护工程；理解版本、配置、日志、升级和验收为什么是产品的一部分。
->
-> **前置知识**：完成至少一个综合项目，并掌握第 28–29 章的调试与低功耗方法。
->
-> **提醒**：本章讲工程方法与教学级 Bootloader 骨架，不构成量产安全方案。
+前面的综合项目证明了功能可以运行。这一章整理交付边界：别人能从干净环境构建同一个固件，设备能识别自己的配置和版本，现场故障有证据可查，升级失败有恢复路径，发布物能对应到具体源码和硬件。
 
----
+这里的 Bootloader 代码用于解释 Cortex-M3 应用跳转顺序。量产升级还需要镜像认证、密钥保护、掉电恢复、防回滚等设计，本章不提供完整安全方案。
 
-## 30.1 原型与产品的区别
+## 30.1 先整理工程依赖
 
-原型回答“这个想法能不能实现”；产品还必须回答：
+一个可维护的目录可以是：
 
-- 断电、断网、复位后会怎样？
-- 不同设备如何配置身份和密钥？
-- 有问题时如何定位？
-- 如何升级，升级失败如何恢复？
-- 谁验证过它在边界条件下仍能工作？
-
-把这些问题提前写进目录、接口和测试计划，后面会省下大量返工。
-
-## 30.2 推荐目录结构
-
-~~~text
+```text
 stm32-project/
 ├── Makefile
-├── FreeRTOSConfig.h
-├── app/                 应用任务和业务状态机
-├── drivers/             led、uart、i2c、sensor 等硬件驱动
-├── middleware/          mqtt、fatfs、json 等通用组件
-├── platform/            启动文件、链接脚本、时钟、SPL 适配
-├── config/              可提交的默认配置与 example 配置
-├── tests/               主机侧协议和数据模型测试
-├── tools/               烧录、日志解析、打包脚本
-└── docs/                接线、版本、故障与发布说明
-~~~
+├── app/          任务、业务状态机
+├── drivers/      UART、I2C、SPI、传感器等硬件驱动
+├── middleware/   MQTT、FatFs、JSON 等组件
+├── platform/     启动文件、链接脚本、时钟、SPL 适配
+├── config/       默认配置和公开模板
+├── tests/        主机侧协议、状态机、配置迁移测试
+├── tools/        烧录、打包、日志解析脚本
+└── docs/         接线、调试、发布和已知限制
+```
 
-依赖方向应尽量单向：app 可以调用 drivers 和 middleware；drivers 不应反过来知道 MQTT Topic 或产品页面。
+`app` 可以依赖驱动和中间件，底层驱动不读取 MQTT Topic、云端账号或产品业务状态。这样更换传感器、网络协议或业务规则时，不需要把整个依赖图一起改掉。
 
-## 30.3 构建可重复
+第三方源码也要记录来源和版本。FreeRTOS、FatFs、cJSON、SPL 等组件升级以后，行为和内存占用都可能变化，不能只把一份源码复制进仓库后长期不知道来自哪个版本。
 
-至少支持下面几个目标：
+## 30.2 干净环境必须能重复构建
 
-~~~makefile
+Makefile 至少提供构建、大小检查、烧录和清理入口：
+
+```makefile
 all: app.elf app.bin
 
+size: app.elf
+	arm-none-eabi-size $<
+
 flash: app.elf
-	@openocd -f interface/stlink.cfg -f target/stm32f1x.cfg \
+	openocd -f interface/stlink.cfg -f target/stm32f1x.cfg \
 	    -c "program $< verify reset exit"
 
-size: app.elf
-	@arm-none-eabi-size $<
-
 clean:
-	@rm -rf build
-~~~
+	rm -rf build
+```
 
-每次发布记录：
+实际文件名和 OpenOCD 配置以项目为准。发布演练要在新 clone 或干净工作目录中完成，不读取开发者机器上未记录的头文件、环境变量或私有配置。
 
-| 项目 | 示例 |
-|---|---|
-| 固件版本 | v0.3.0 |
-| Git 提交 | 8 位短 SHA |
-| 目标板 | STM32F103ZET6 |
-| 编译器 | arm-none-eabi-gcc 版本 |
-| 配置模板版本 | config-v2 |
+每个构建保存固件版本、完整 Git commit、目标 MCU/硬件版本、编译器版本和构建参数。短 SHA 可以显示给人看，发布 manifest 中保留完整 commit，避免仓库增长后出现歧义。
 
-这能避免“我这里能编译，你那里不能”的问题。
+## 30.3 配置格式要能识别旧版本
 
-## 30.4 配置与密钥
+现场设备升级固件时，Flash 中可能仍保存旧配置。持久配置至少带 magic、版本、长度和完整性校验：
 
-提交到仓库的应是 device_config.h.example；真实 WiFi 密码、Device Secret 和服务器令牌必须在本地或产线配置中注入。
+```c
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t length;
+    uint32_t sequence;
+    /* payload ... */
+    /* crc ... */
+} PersistentConfigHeader;
+```
 
-量产设备至少需要：
+启动时先验证 header 和 CRC，再按 `version` 选择当前解析器、迁移函数或安全默认配置。未知版本不能直接强转成当前 C 结构体继续运行，因为字段布局、长度和含义都可能已经变化。
 
-- 唯一 device_id；
-- 独立密钥；
-- 固件版本；
-- 校准参数；
-- 恢复出厂设置的机制。
+配置更新也要定义原子性。常见做法是写入新的完整记录，验证成功后再把它选为当前版本；具体双槽、append log 或页级方案根据 Flash 布局和掉电要求选择。
 
-不要让所有设备共享一个管理员密码或同一份 Secret。
+## 30.4 设备身份和 Secret 不进入仓库
 
-## 30.5 教学级 Bootloader 跳转骨架
+仓库提交公开模板，例如：
 
-Bootloader 的第一步不是跳转，而是验证应用向量表是否看起来合理。下面是帮助理解顺序的骨架，地址和验证规则必须按你的芯片、分区与链接脚本调整。
+```text
+config/device.example
+```
 
-~~~c
+真实 WiFi 密码、Device Secret、私钥和服务器令牌由本地或产线流程注入。设备身份、密钥、校准数据和硬件版本分别管理，不要让所有设备共享一个管理员凭据。
+
+Secret 如果曾经提交到 Git 历史，处理动作是撤销或轮换对应凭据，再清理历史降低继续泄露的机会。只删除当前文件不能让已经泄露的 Secret 重新变安全。
+
+量产流程还要能回答谁生成凭据、怎样写入、怎样验证、怎样吊销和怎样替换。调试日志不输出 Secret、Authorization 字段或可直接重放的认证材料。
+
+## 30.5 Bootloader 先固定 Flash 分区
+
+STM32F103ZET6 的 Flash 从 `0x08000000` 开始，具体应用起始地址由项目的 Bootloader 分区决定。这个地址必须同时出现在 Bootloader、应用链接脚本、烧录/升级工具和发布 manifest 中。
+
+```text
+0x08000000 ─ Bootloader
+             ─ 项目定义的边界
+APP_BASE   ─ Application 向量表
+             ─ Application image
+```
+
+分区还要符合目标器件的 Flash 擦除边界，并给 Bootloader 自身、应用和可能的下载/回滚区域留下实际需要的空间。不要从其他工程复制一个 `0x0800xxxx` 偏移就开始链接应用。
+
+链接以后检查 map 文件和向量表地址，确认应用确实从 `APP_BASE` 开始。升级包中的目标硬件版本也要与设备实际硬件匹配。
+
+## 30.6 应用跳转要验证向量表范围
+
+只检查地址高字节过于宽松。项目已经知道 SRAM 和应用 Flash 的实际边界，就直接做范围检查，并确认 Reset Handler 地址带 Thumb bit：
+
+```c
+#define SRAM_BASE_ADDR  0x20000000UL
+#define SRAM_END_ADDR   0x20010000UL   /* F103ZET6: 64 KB SRAM */
+
+#define APP_BASE_ADDR   APP_BASE       /* 由链接/分区配置提供 */
+#define APP_END_ADDR    APP_FLASH_END  /* 项目定义的应用区域末尾 */
+
 static bool AppVectorLooksValid(uint32_t app_addr)
 {
     uint32_t sp = *(const uint32_t *)app_addr;
-    uint32_t reset = *(const uint32_t *)(app_addr + 4);
+    uint32_t reset = *(const uint32_t *)(app_addr + 4U);
+    uint32_t reset_addr = reset & ~1UL;
 
-    bool sp_in_sram = (sp & 0x2FFE0000U) == 0x20000000U;
-    bool reset_in_flash = (reset & 0xFF000000U) == 0x08000000U;
-    return sp_in_sram && reset_in_flash;
+    bool sp_ok = (sp >= SRAM_BASE_ADDR) &&
+                 (sp <= SRAM_END_ADDR) &&
+                 ((sp & 0x7U) == 0U);
+
+    bool reset_ok = ((reset & 1U) != 0U) &&
+                    (reset_addr >= APP_BASE_ADDR) &&
+                    (reset_addr < APP_END_ADDR);
+
+    return sp_ok && reset_ok;
 }
+```
+
+这里仍只是在检查向量表“看起来合理”。它不能替代镜像长度、完整性和真实性验证。
+
+MSP 初始值允许等于 SRAM 顶端，因此示例对 `SRAM_END_ADDR` 使用 `<=`。具体栈对齐要求还要与所用 ABI、启动代码和项目约束一致。
+
+## 30.7 跳转前清理 Bootloader 留下的运行状态
+
+教学骨架：
+
+```c
+typedef void (*AppEntry)(void);
 
 void JumpToApp(uint32_t app_addr)
 {
-    if (!AppVectorLooksValid(app_addr)) {
-        return;
-    }
+    uint32_t app_sp;
+    uint32_t app_reset;
 
-    uint32_t app_sp = *(const uint32_t *)app_addr;
-    uint32_t app_reset = *(const uint32_t *)(app_addr + 4);
+    if (!AppVectorLooksValid(app_addr))
+        return;
+
+    app_sp = *(const uint32_t *)app_addr;
+    app_reset = *(const uint32_t *)(app_addr + 4U);
 
     __disable_irq();
-    SysTick->CTRL = 0;
-    SysTick->LOAD = 0;
-    SysTick->VAL = 0;
+
+    SysTick->CTRL = 0U;
+    SysTick->LOAD = 0U;
+    SysTick->VAL  = 0U;
+
+    Boot_PeripheralsDeinit();
+    Boot_ClearPendingInterrupts();
 
     SCB->VTOR = app_addr;
     __DSB();
     __ISB();
 
     __set_MSP(app_sp);
-    ((void (*)(void))app_reset)();
+    ((AppEntry)app_reset)();
+
+    for (;;) {
+    }
 }
-~~~
+```
 
-真实 OTA 还需要镜像长度、CRC 或签名、掉电保护、回滚、外设去初始化和失败恢复。没有这些，不能称为安全升级。
+`Boot_PeripheralsDeinit()` 和 `Boot_ClearPendingInterrupts()` 必须由项目实现，清理 Bootloader 实际启用过的 DMA、UART、定时器、外部中断和 NVIC pending 状态。只调用 `__disable_irq()` 会屏蔽中断响应，但不会自动清除外设 pending 标志。
 
-## 30.6 发布前测试清单
+应用启动代码也要建立自己的中断和外设状态。Bootloader 与 Application 的契约写进文档，避免双方都假定对方已经完成某项初始化。
 
-- [ ] 全新克隆后能按文档构建；
-- [ ] 烧录、复位和首次配置可重复；
-- [ ] 断网、断电、传感器缺失、SD 卡缺失均有预期行为；
-- [ ] 栈、堆、队列和环形缓冲区在长时间运行中稳定；
-- [ ] 真实密钥没有出现在仓库、日志或截图中；
-- [ ] 每个硬件版本都有接线表和已知限制；
-- [ ] 固件二进制、版本号和变更说明一起发布。
+## 30.8 镜像验证分成完整性和真实性
 
-## 30.7 持续集成、许可证与发布边界
+CRC 或 SHA-256 可以发现传输损坏并标识镜像内容，但不能单独证明镜像来自可信发布者。需要防止未授权固件时，Bootloader 要验证数字签名或等价的认证机制，并保护验证所依赖的信任根。
 
-即使暂时没有完整的自动化测试，也应为项目留下可验证的入口：
+一个升级 manifest 至少包含目标硬件、版本、镜像长度、镜像摘要和格式版本。是否允许降级、怎样处理配置迁移、签名算法和密钥轮换都属于升级协议的一部分。
 
-- 文档链接检查：避免章节导航和附录失效；
-- 构建检查：在固定工具链版本下生成 ELF/BIN；
-- 静态检查：把编译警告保持为零或明确记录；
-- 发布说明：列出目标板、已验证功能、已知限制和升级方式。
+掉电恢复也要有明确状态。设备在擦除旧应用、写新镜像、验证镜像和切换启动目标的任一步骤掉电后，都应有定义好的下一次启动行为。单应用区直接覆盖时尤其要评估失败后是否还存在可启动代码。
 
-许可证属于项目所有者的法律与发布决定，不能随意从别的仓库复制。确定开源方式前，应选择并明确写入 LICENSE；在此之前，不要声称代码可以被任意复用。
+## 30.9 Watchdog 要检查系统是否真的在前进
 
-## 30.8 给这本书的下一步
+IWDG 可以帮助系统从死锁或失控状态恢复，但喂狗点放错以后也可能掩盖故障。不要只在高优先级定时器或 idle hook 中无条件喂狗。
 
-完成本书后，你已经能从命令行建立 SPL 工程、读懂寄存器、调试中断、组织 FreeRTOS 任务，并完成一条从传感器到云端的数据链路。
+可以由各关键任务更新自己的 progress counter 或 heartbeat，HealthTask 检查 SensorTask、NetworkTask、LogTask 等是否在允许时间内继续推进。只有满足项目定义的健康条件时才喂 IWDG。
 
-接下来可以选择：
+Watchdog timeout 要大于经过验证的最长合法阻塞时间，并覆盖 Flash 擦写、SD 同步、网络退避等项目实际路径。具体数值由测量和故障策略决定。
 
-1. 把同一项目迁移到 HAL/CubeIDE，比较两种抽象；
-2. 为一个综合项目补齐真实源码、构建脚本和 CI；
-3. 选择一项通信协议做更深的可靠性与安全设计；
-4. 阅读参考手册，验证每一项时钟和低功耗行为。
+复位启动时尽早读取 RCC reset flags，记录上一次是 POR、外部复位、软件复位还是 watchdog 等原因，再按参考手册要求清除标志。这样现场连续重启时能留下基本证据。
 
-## 30.9 一次发布演练：把“别人也能复现”当作验收
+## 30.10 CI 只声明它实际验证过的内容
 
-发布前用一份干净环境或新目录做演练，不复用你本机的私有文件：
+CI 适合自动执行：
 
-| 项目 | 通过标准 |
-|---|---|
-| 工具链 | 文档中的版本或最小版本可安装 |
-| 构建 | 一条命令生成 ELF、BIN、MAP 和大小报告 |
-| 配置 | 示例配置能编译；真实配置不在仓库 |
-| 烧录 | 板型、启动文件、链接脚本均为 ZET6/HD |
-| 日志 | 启动时打印固件版本、构建标识和关键配置摘要 |
-| 回滚 | 已知上一个版本可重新烧录并识别 |
-| 文档 | 接线、预期现象、错误恢复和限制完整 |
+- 固定工具链下的干净构建；
+- 编译警告和静态检查；
+- 主机侧 Parser、CRC、状态机和配置迁移测试；
+- Markdown 链接和章节导航检查；
+- Secret 扫描；
+- ELF/BIN/MAP、size 报告和发布 manifest 生成。
 
-建议给固件定义可读版本，而不是只依赖 Git 提交号：
+没有真实板卡的 CI 不能证明 I2C 时序、WiFi 峰值供电、Stop 电流或执行器动作正确。硬件测试保留板型、模块固件、接线、测量工具、固件 commit 和结果，作为发布记录的一部分。
 
-~~~c
-#define FW_VERSION "0.3.0"
-#define FW_TARGET  "STM32F103ZET6/SPL"
+如果以后接入硬件在环测试，也要把“跑了哪些板、哪些故障注入、通过条件是什么”写清楚，不能只用一个绿色状态代替测试范围。
 
-void App_PrintBanner(void)
-{
-    printf("\r\nfw=%s target=%s\r\n", FW_VERSION, FW_TARGET);
-}
-~~~
+## 30.11 发布物必须能回到源码和测试证据
 
-### CI 和升级的边界
+每个版本生成一个 manifest，例如：
 
-CI 至少应验证“干净构建、静态检查、文档链接和没有提交密钥”。没有真实板卡的 CI 不能证明外设或低功耗真的正确；硬件验收仍需要记录板卡、接线、测量工具和固件版本。
-
-Bootloader/OTA 也不是“跳到新地址”就结束：镜像来源、长度、CRC/签名、掉电恢复、向量表、回滚和版本兼容性必须共同设计。本书只保留教学骨架，不把它描述为量产方案。
-
-练习：让一位没有参与开发的人，严格按 README、附录 A 和项目章节从零构建并完成 LED/UART 健康检查；把其遇到的每一步摩擦都当作文档缺陷修复。
-
-## 30.10 配置版本、接口演进与发布物清单
-
-能维护的嵌入式项目必须允许“代码升级了，但现场配置还在”。给配置和协议明确版本：
-
-~~~c
-typedef struct {
-    uint16_t magic;
-    uint16_t version;
-    uint32_t sequence;
-    uint16_t length;
-    /* payload + crc */
-} PersistentConfigHeader;
-~~~
-
-启动时检查 magic、version、length 和 CRC；未知版本要进入明确的迁移或安全默认路径，不能把旧字节强转成新结构体后继续运行。
-
-### 一次发布应产出什么
-
-| 产物 | 用途 |
-|---|---|
-| `.elf` | GDB/addr2line 调试符号 |
-| `.bin/.hex` | 烧录或升级镜像 |
-| `.map` 与 size 报告 | 追踪 Flash/SRAM 变化 |
-| 版本说明 | 改动、已知限制、迁移/回滚条件 |
-| 硬件验收记录 | 板型、接线、工具、测量、日志 |
-| 配置模板 | 可公开、可构建、无真实 Secret |
-| 校验值 | 确认拿到的镜像确实是该版本 |
-
-### 变更的最小审查问题
-
-1. 这个改动是否改变了硬件引脚、时钟、内存、协议或配置格式？
-2. 是否有把正常故障变成断言/死循环，或反过来吞掉了错误？
-3. 是否能在没有开发者私有文件的环境重新构建？
-4. 是否有测试了断电、断网、复位、队列满和错误帧？
-5. 是否更新了版本、迁移说明和已知限制？
-
-练习：模拟把 `EnvSample` 加一个字段的版本升级。写出旧固件、旧日志、PC 网关和新固件各自如何识别或拒绝不兼容数据。
-
-## 30.11 用发布清单、内存地图和分层 CI 收束工程边界
-
-“可以烧录”不是发布物。每个版本都应有一个可机器检查、可人工复查的 manifest：
-
-~~~text
+```text
 firmware:
-  version: v…
+  version: v0.3.0
   target: STM32F103ZET6 / STM32F10X_HD
-  git_commit: …
-  toolchain: arm-none-eabi-gcc …
-  app.bin.sha256: …
-  app.elf.sha256: …
+  git_commit: <full commit>
+  toolchain: arm-none-eabi-gcc <version>
+artifacts:
+  app.bin.sha256: <...>
+  app.elf.sha256: <...>
 memory:
-  flash_used: … / 512KB
-  sram_used: … / 64KB
+  flash_used: <...>
+  sram_used: <...>
 validation:
-  docs_check: pass/fail
-  host_protocol_tests: pass/fail
-  build: pass/fail
-  hardware_matrix: <board / adapter / sensor / result>
+  build: pass
+  host_tests: pass
+  docs_check: pass
+  hardware_record: <id/path>
 known_limits:
-  - …
-~~~
+  - <...>
+```
 
-### Bootloader 的地址必须由分区和链接脚本共同决定
+发布目录保留 `.elf`、`.bin`/`.hex`、`.map`、size 报告、manifest、配置模板、版本说明和硬件验收记录。ELF 用于 GDB/addr2line，map 和 size 用于追踪 Flash/SRAM 变化，二进制摘要用于确认拿到的是同一份发布物。
 
-教学代码中的 `app_addr` 不能被写死成网上常见的某个地址。先选定并记录 bootloader 长度、擦除页边界和应用起始地址；然后让三处始终一致：
+发布说明写清配置是否需要迁移、能否回滚、支持哪些硬件版本和已知限制。版本号本身不包含这些信息。
 
-1. bootloader 的镜像检查与 `SCB->VTOR`；
-2. 应用链接脚本的 `FLASH ORIGIN`；
-3. 应用向量表、烧录/升级工具和发布 manifest。
+## 30.12 发布前做一次干净演练
 
-示意关系如下，不给出一个假装适用于所有工程的固定偏移：
+让一个没有参与当前修改的人或一套新的环境按 README 完成：
 
-~~~text
-0x08000000 ─ Bootloader（项目定义的长度）
-             ─ 应用起始地址 = 0x08000000 + bootloader_length
-             ─ Application Flash（链接脚本 ORIGIN 与 VTOR 一致）
-0x08080000 ─ ZET6 Flash 末尾
-~~~
+```text
+clone
+  → 安装记录的工具链
+  → 使用公开 example 配置构建
+  → 检查 ELF/BIN/MAP/size
+  → 烧录指定硬件
+  → 完成 LED/UART 健康检查
+  → 执行该版本要求的硬件故障测试
+```
 
-应用镜像还应带版本、长度、CRC/签名、兼容的硬件版本和升级前后配置迁移策略。教学章节只解释跳转顺序，不把它宣传为生产 OTA 实现。
+至少覆盖断电、复位、网络不可用、传感器缺失、存储故障、Queue 压力和协议错误中与当前产品有关的路径。升级功能还要测试镜像损坏、版本不兼容、升级中掉电和恢复路径。
 
-### CI 先自动验证能验证的，硬件保留人工证据
+演练中发现“只有开发者电脑上才有的文件”“必须手工改一个没写进 README 的宏”或“发布包找不到对应 ELF”，都直接作为发布缺陷修复。
 
-| 层 | 自动化检查 | 不能替代 |
-|---|---|---|
-| 文档 | Markdown 链接、代码围栏、章节导航 | 接线是否真实正确 |
-| 主机逻辑 | 帧解析、CRC、状态机、配置迁移回放 | 外设时序/供电/射频 |
-| 构建 | 固定工具链下生成 ELF/BIN/MAP、size 阈值 | 实际板卡烧录与调试 |
-| 发布 | manifest、SHA-256、无 Secret 扫描 | 断电、低功耗、长期运行 |
-| 硬件矩阵 | 人工记录板型、模块固件、接线、日志/测量 | 不能由 CI 伪造为“已验证” |
+## 30.13 本章完成标准
 
-配置迁移要保存旧版本的回放样本，并测试升级失败/断电后的恢复策略。这样第 30 章的“产品化”才是一个可执行的发布流程，而不是一份愿望清单。
+项目准备发布时，应能回答：
 
-## 30.12 本章要点
+- 一个干净环境怎样构建同一份固件；
+- 发布二进制对应哪个完整 Git commit、工具链和硬件版本；
+- 旧配置如何验证、迁移或拒绝；
+- 每台设备的身份和 Secret 从哪里注入、怎样轮换；
+- Bootloader、链接脚本和升级工具怎样共享同一个应用分区；
+- 镜像损坏和未授权镜像分别由什么机制发现；
+- 升级中断电以后设备从哪里恢复；
+- watchdog 根据哪些任务进度决定喂狗；
+- CI 验证了什么，哪些结论来自真实硬件测试；
+- 发布包中的 ELF、map、manifest 和验收记录怎样互相对应。
 
-- 产品化的核心是可重复构建、可观测、可恢复和可验证；
-- 目录与依赖方向决定项目后期是否还能维护；
-- 密钥、版本和配置必须被当作产品资产管理；
-- Bootloader 需要验证、清理中断和设置向量表；
-- 发布前的故障测试比“正常运行演示”更重要。
+这些信息能从仓库和发布记录中直接找到，项目才具备继续维护、升级和排查现场问题的基础。
 
 ## 延伸资料
 
@@ -296,10 +275,6 @@ known_limits:
 - [附录 C · 调试工具与最小测量方法](./appendix-c-tools-and-measurement.md)
 - [附录 D · 全书逐章实验验收路线](./appendix-d-lab-validation.md)
 
-
-
----
-
-[上一章：第 29 章 · 低功耗设计](./29-chapter.md)
-
-[返回目录](./README.md)
+> **上一章**：[第 29 章 · 低功耗设计](./29-chapter.md)
+>
+> **返回目录**：[README](./README.md)
